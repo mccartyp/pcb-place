@@ -1327,7 +1327,7 @@ def validate_safe_placements(engine: PlacementEngine, *, allow_large_move: bool 
 def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
                      allow_suffix_match: bool = True, validate: bool = False, safe: bool = False,
                      allow_large_move: bool = False, allow_outside_board: bool = False,
-                     cardinal_rotations: bool = False) -> Tuple[str, List[Message], Dict[str, Any]]:
+                     cardinal_rotations: bool = False, safety_fatal: bool = True) -> Tuple[str, List[Message], Dict[str, Any]]:
     """Apply placement rules and return rewritten KiCad text plus diagnostics."""
 
     footprints = parse_footprints(text)
@@ -1340,8 +1340,10 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
     safety_messages = validate_safe_placements(engine, allow_large_move=allow_large_move,
                                                allow_outside_board=allow_outside_board) if safe else []
     engine.messages.extend(validation_messages)
+    if strict and any(m.level == "error" for m in engine.messages):
+        raise PlacementError("validation failed: " + "; ".join(m.text for m in engine.messages if m.level == "error"))
     engine.messages.extend(safety_messages)
-    if (strict or safe) and any(m.level == "error" for m in engine.messages):
+    if safe and safety_fatal and any(m.level == "error" for m in engine.messages):
         raise PlacementError("validation failed: " + "; ".join(m.text for m in engine.messages if m.level == "error"))
     rewritten = text
     for ref, update in sorted(engine.updates.items(), key=lambda kv: footprints[kv[0]].start, reverse=True):
@@ -1534,7 +1536,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                                   validate=run_validation, safe=bool(args.safe),
                                                   allow_large_move=bool(args.allow_large_move),
                                                   allow_outside_board=bool(args.allow_outside_board),
-                                                  cardinal_rotations=bool(args.cardinal_rotations))
+                                                  cardinal_rotations=bool(args.cardinal_rotations),
+                                                  safety_fatal=not bool(args.dry_run))
     for message in messages:
         print(message)
     if args.report_json:

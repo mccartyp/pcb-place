@@ -385,3 +385,25 @@ Anchor("U1", x=10, y=20)
     assert "wrote:" in result.stdout
     assert out.exists()
     assert len(parse_footprints(out.read_text())) == len(parse_footprints(pcb.read_text()))
+
+
+def test_cli_dry_run_reports_unsafe_placement_without_failing(tmp_path):
+    pcb = tmp_path / "unsafe.kicad_pcb"
+    ppl = tmp_path / "unsafe.ppl"
+    report = tmp_path / "unsafe-report.json"
+    pcb.write_text(_pcb_with_at("(at 0 0)"))
+    ppl.write_text('''
+Board(width=10, height=10)
+Anchor("U1", x=20, y=0)
+''')
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--dry-run", "--report-json", str(report)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "outside_board=yes" in result.stdout
+    assert "would be outside Board bounds" in result.stdout
+    payload = json.loads(report.read_text())
+    assert payload["validation_errors"] >= 1
+    assert payload["placements"][0]["outside_board"] is True
