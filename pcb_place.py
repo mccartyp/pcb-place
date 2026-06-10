@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 Number = float | int
 Point = Tuple[float, float]
@@ -123,6 +123,50 @@ class PlacementUpdate:
     delta_y: float
 
 
+@dataclasses.dataclass(frozen=True)
+class BoardGeometry:
+    """Authoritative rectangular board geometry used for validation and reporting."""
+
+    origin_x: float
+    origin_y: float
+    width: float
+    height: float
+    source: str = "unknown"
+
+    @property
+    def min_x(self) -> float:
+        return self.origin_x
+
+    @property
+    def min_y(self) -> float:
+        return self.origin_y
+
+    @property
+    def max_x(self) -> float:
+        return self.origin_x + self.width
+
+    @property
+    def max_y(self) -> float:
+        return self.origin_y + self.height
+
+    def contains(self, x: float, y: float, *, eps: float = 1e-9) -> bool:
+        return self.min_x - eps <= x <= self.max_x + eps and self.min_y - eps <= y <= self.max_y + eps
+
+    def bounds(self) -> Dict[str, float]:
+        return {"min_x": self.min_x, "min_y": self.min_y, "max_x": self.max_x, "max_y": self.max_y}
+
+    def as_report(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self) | self.bounds()
+
+    def nearly_equals(self, other: "BoardGeometry", *, eps: float = 1e-6) -> bool:
+        return (abs(self.origin_x - other.origin_x) <= eps and abs(self.origin_y - other.origin_y) <= eps
+                and abs(self.width - other.width) <= eps and abs(self.height - other.height) <= eps)
+
+    @classmethod
+    def from_edge_cuts(cls, text: str) -> Optional["BoardGeometry"]:
+        return parse_edge_cuts_geometry(text)
+
+
 @dataclasses.dataclass
 class BoardInfo:
     """Board metadata declared in placement.ppl."""
@@ -132,6 +176,7 @@ class BoardInfo:
     units: str = "mm"
     origin: Point = (0.0, 0.0)
     name: Optional[str] = None
+    emit_outline: bool = False
 
     @property
     def origin_x(self) -> float:
@@ -231,11 +276,22 @@ def _board_to_abs(model: PlacementModel, x: float, y: float) -> Point:
     return ox + float(x), oy + float(y)
 
 
-def board_bounds(board: BoardInfo) -> Optional[Dict[str, float]]:
+def board_geometry_from_definition(board: BoardInfo) -> Optional[BoardGeometry]:
     if board.width is None or board.height is None:
         return None
-    ox, oy = board.origin
-    return {"min_x": ox, "min_y": oy, "max_x": ox + board.width, "max_y": oy + board.height}
+    return BoardGeometry(board.origin_x, board.origin_y, float(board.width), float(board.height), "placement_file")
+
+
+def board_bounds(board: BoardInfo) -> Optional[Dict[str, float]]:
+    geometry = board_geometry_from_definition(board)
+    return None if geometry is None else geometry.bounds()
+
+
+def infer_geometry_from_footprints(footprints: Mapping[str, Footprint]) -> BoardGeometry:
+    bounds = footprint_bounds(footprints)
+    return BoardGeometry(bounds["min_x"], bounds["min_y"],
+                         bounds["max_x"] - bounds["min_x"], bounds["max_y"] - bounds["min_y"],
+                         "inferred_from_footprints")
 
 
 def _normalize_ref(ref: str) -> str:
@@ -534,11 +590,13 @@ def load_ppl(path: Path) -> PlacementModel:
 
     def Board(*, width: Number, height: Number, units: str = "mm", origin: Point = (0, 0),
               origin_x: Optional[Number] = None, origin_y: Optional[Number] = None,
-              name: Optional[str] = None, **kwargs: Any) -> None:
+              name: Optional[str] = None, emit_outline: bool = False, **kwargs: Any) -> None:
         if units != "mm":
             raise PlacementError("Only units='mm' is currently supported")
         if kwargs:
             raise PlacementError(f"Board() unknown parameter(s): {', '.join(sorted(kwargs))}")
+        if float(width) <= 0 or float(height) <= 0:
+            raise PlacementError("Board(width=..., height=...) dimensions must be positive")
         if origin_x is not None or origin_y is not None:
             base_x, base_y = _as_point(origin, field="origin")
             origin = (base_x if origin_x is None else float(origin_x),
@@ -549,6 +607,7 @@ def load_ppl(path: Path) -> PlacementModel:
             units=units,
             origin=_as_point(origin, field="origin"),
             name=name,
+            emit_outline=bool(emit_outline),
         )
 
     def Alias(name: str, ref: str) -> None:
@@ -898,6 +957,130 @@ def parse_footprints(text: str) -> Dict[str, Footprint]:
     return footprints
 
 
+
+
+def _edge_cuts_primitives(text: str) -> Tuple[List[Tuple[Point, Point]], List[Tuple[Point, Point]]]:
+    """Return Edge.Cuts rectangles and line segments from supported KiCad drawings."""
+
+    rects: List[Tuple[Point, Point]] = []
+    lines: List[Tuple[Point, Point]] = []
+    for match in re.finditer(r'(?m)^\s*\((gr_rect|gr_line)\b', text):
+        block = text[match.start():_find_matching_paren(text, text.find("(", match.start()))]
+        if '(layer "Edge.Cuts")' not in block:
+            continue
+        point_match = re.search(
+            r'\(start\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\).*?\(end\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\)',
+            block,
+            flags=re.S,
+        )
+        if not point_match:
+            continue
+        x0, y0, x1, y1 = map(float, point_match.groups())
+        if match.group(1) == "gr_rect":
+            rects.append(((x0, y0), (x1, y1)))
+        else:
+            lines.append(((x0, y0), (x1, y1)))
+    return rects, lines
+
+
+def _geometry_from_corners(a: Point, b: Point, *, source: str = "edge_cuts") -> BoardGeometry:
+    origin_x, origin_y = min(a[0], b[0]), min(a[1], b[1])
+    width, height = max(a[0], b[0]) - origin_x, max(a[1], b[1]) - origin_y
+    if width <= 0 or height <= 0:
+        raise PlacementError("Edge.Cuts geometry has non-positive width or height")
+    return BoardGeometry(origin_x, origin_y, width, height, source)
+
+
+def _line_rectangle_geometry(lines: List[Tuple[Point, Point]], *, eps: float = 1e-6) -> Optional[BoardGeometry]:
+    """Return geometry only when four Edge.Cuts lines form one axis-aligned rectangle."""
+
+    if not lines:
+        return None
+    if len(lines) != 4:
+        raise PlacementError("Unsupported Edge.Cuts geometry: rectangular gr_line boards must have exactly four line segments")
+
+    points = [point for line in lines for point in line]
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    if x1 - x0 <= eps or y1 - y0 <= eps:
+        raise PlacementError("Edge.Cuts geometry has non-positive width or height")
+
+    def point_key(point: Point) -> Tuple[int, int]:
+        return (round(point[0] / eps), round(point[1] / eps))
+
+    def segment_key(a: Point, b: Point) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        ka, kb = point_key(a), point_key(b)
+        return (ka, kb) if ka <= kb else (kb, ka)
+
+    expected = {
+        segment_key((x0, y0), (x1, y0)),
+        segment_key((x1, y0), (x1, y1)),
+        segment_key((x1, y1), (x0, y1)),
+        segment_key((x0, y1), (x0, y0)),
+    }
+    actual: Set[Tuple[Tuple[int, int], Tuple[int, int]]] = set()
+    for a, b in lines:
+        horizontal = abs(a[1] - b[1]) <= eps and abs(a[0] - b[0]) > eps
+        vertical = abs(a[0] - b[0]) <= eps and abs(a[1] - b[1]) > eps
+        if not (horizontal or vertical):
+            raise PlacementError("Unsupported Edge.Cuts geometry: only axis-aligned rectangular gr_line outlines are supported")
+        actual.add(segment_key(a, b))
+    if actual != expected:
+        raise PlacementError("Unsupported Edge.Cuts geometry: gr_line segments do not form a single rectangle")
+    return BoardGeometry(x0, y0, x1 - x0, y1 - y0, "edge_cuts")
+
+
+def parse_edge_cuts_geometry(text: str) -> Optional[BoardGeometry]:
+    rects, lines = _edge_cuts_primitives(text)
+    if not rects and not lines:
+        return None
+    if rects:
+        if len(rects) != 1 or lines:
+            raise PlacementError("Unsupported Edge.Cuts geometry: expected one gr_rect or one four-line rectangle")
+        return _geometry_from_corners(rects[0][0], rects[0][1])
+    return _line_rectangle_geometry(lines)
+
+def resolve_board_geometry(text: str, model: Optional[PlacementModel], footprints: Mapping[str, Footprint],
+                           *, allow_footprint_fallback: bool = True) -> Optional[BoardGeometry]:
+    edge = BoardGeometry.from_edge_cuts(text)
+    if edge is not None:
+        return edge
+    if model is not None:
+        defined = board_geometry_from_definition(model.board)
+        if defined is not None:
+            return defined
+    return infer_geometry_from_footprints(footprints) if allow_footprint_fallback else None
+
+
+def _outline_text(geometry: BoardGeometry) -> str:
+    x0, y0, x1, y1 = geometry.min_x, geometry.min_y, geometry.max_x, geometry.max_y
+    return (
+        f'  (gr_line (start {_fmt_num(x0)} {_fmt_num(y0)}) (end {_fmt_num(x1)} {_fmt_num(y0)}) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "pcb-place-edge-1"))\n'
+        f'  (gr_line (start {_fmt_num(x1)} {_fmt_num(y0)}) (end {_fmt_num(x1)} {_fmt_num(y1)}) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "pcb-place-edge-2"))\n'
+        f'  (gr_line (start {_fmt_num(x1)} {_fmt_num(y1)}) (end {_fmt_num(x0)} {_fmt_num(y1)}) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "pcb-place-edge-3"))\n'
+        f'  (gr_line (start {_fmt_num(x0)} {_fmt_num(y1)}) (end {_fmt_num(x0)} {_fmt_num(y0)}) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "pcb-place-edge-4"))\n'
+    )
+
+
+def emit_board_outline(text: str, geometry: BoardGeometry) -> str:
+    existing = BoardGeometry.from_edge_cuts(text)
+    if existing is not None:
+        if not existing.nearly_equals(geometry):
+            raise PlacementError(
+                "Board emit_outline=True conflicts with existing Edge.Cuts geometry: "
+                f"existing origin=({_fmt_num(existing.origin_x)}, {_fmt_num(existing.origin_y)}) "
+                f"size={_fmt_num(existing.width)}x{_fmt_num(existing.height)}, "
+                f"requested origin=({_fmt_num(geometry.origin_x)}, {_fmt_num(geometry.origin_y)}) "
+                f"size={_fmt_num(geometry.width)}x{_fmt_num(geometry.height)}"
+            )
+        return text
+    insert_at = text.rfind(")")
+    if insert_at < 0:
+        raise PlacementError("Cannot emit board outline: PCB file is not a KiCad S-expression")
+    return text[:insert_at] + _outline_text(geometry) + text[insert_at:]
+
 def _replace_at(block: str, x: float, y: float, rot: Optional[float]) -> str:
     """Replace only the footprint-level (at ...) field, preserving indentation and rotation form."""
 
@@ -930,12 +1113,13 @@ class PlacementEngine:
 
     def __init__(self, footprints: Mapping[str, Footprint], model: PlacementModel,
                  *, strict: bool = False, allow_suffix_match: bool = True,
-                 cardinal_rotations: bool = False) -> None:
+                 cardinal_rotations: bool = False, board_geometry: Optional[BoardGeometry] = None) -> None:
         self.footprints = dict(footprints)
         self.model = model
         self.strict = strict
         self.allow_suffix_match = allow_suffix_match
         self.cardinal_rotations = cardinal_rotations
+        self.board_geometry = board_geometry
         self.messages: List[Message] = []
         self.positions: Dict[str, Tuple[float, float, float]] = {
             ref: (fp.x, fp.y, fp.rot) for ref, fp in self.footprints.items()
@@ -1023,9 +1207,8 @@ class PlacementEngine:
                 return
         fp = self.footprints[actual_ref]
         outside = False
-        bounds = board_bounds(self.model.board)
-        if bounds is not None:
-            outside = x < bounds["min_x"] or y < bounds["min_y"] or x > bounds["max_x"] or y > bounds["max_y"]
+        if self.board_geometry is not None:
+            outside = not self.board_geometry.contains(x, y)
         update = PlacementUpdate(
             ref=actual_ref, x=float(x), y=float(y), final_rot=float(new_rot), write_rot=write_rot, why=why, note=note,
             original_x=fp.x, original_y=fp.y, original_rot=fp.rot,
@@ -1258,13 +1441,14 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25) -
     """
 
     messages: List[Message] = []
-    board = engine.model.board
-    if board.width is not None and board.height is not None:
-        ox, oy = board.origin
+    geometry = engine.board_geometry
+    if geometry is not None and geometry.source != "inferred_from_footprints":
+        if geometry.width <= 0 or geometry.height <= 0:
+            messages.append(Message("error", "Board geometry dimensions must be positive"))
         for ref in sorted(engine.updates):
             x, y, _rot = engine.positions[ref]
-            if x < ox or y < oy or x > ox + board.width or y > oy + board.height:
-                messages.append(Message("error", f"{ref!r} is outside Board bounds: x={_fmt_num(x)} y={_fmt_num(y)}"))
+            if not geometry.contains(x, y):
+                messages.append(Message("error", f"{ref!r} is outside Board geometry ({geometry.source}): x={_fmt_num(x)} y={_fmt_num(y)}"))
 
     # Near-coincident origins are usually accidental overlaps in generated placements.
     # Limit this initial check to footprints touched by this run; otherwise an
@@ -1296,10 +1480,11 @@ def validate_safe_placements(engine: PlacementEngine, *, allow_large_move: bool 
     """Pre-write safety checks intended to prevent dangerous KiCad output."""
 
     messages: List[Message] = []
-    board = engine.model.board
     original_bounds = footprint_bounds(engine.footprints)
-    board_w = board.width if board.width is not None else max(1.0, original_bounds["max_x"] - original_bounds["min_x"])
-    board_h = board.height if board.height is not None else max(1.0, original_bounds["max_y"] - original_bounds["min_y"])
+    geometry = engine.board_geometry
+    safe_bounds = geometry.bounds() if geometry is not None else original_bounds
+    board_w = geometry.width if geometry is not None else max(1.0, original_bounds["max_x"] - original_bounds["min_x"])
+    board_h = geometry.height if geometry is not None else max(1.0, original_bounds["max_y"] - original_bounds["min_y"])
     margin_x = max(1.0, 5.0 * float(board_w))
     margin_y = max(1.0, 5.0 * float(board_h))
 
@@ -1317,10 +1502,10 @@ def validate_safe_placements(engine: PlacementEngine, *, allow_large_move: bool 
             messages.append(Message("error", f"{update.ref!r} has non-finite placement coordinate or rotation"))
         if update.outside_board and not allow_outside_board:
             messages.append(Message("error", f"{update.ref!r} would be outside Board bounds at x={_fmt_num(update.x)} y={_fmt_num(update.y)}; use --allow-outside-board to override"))
-        far_x = update.x < original_bounds["min_x"] - margin_x or update.x > original_bounds["max_x"] + margin_x
-        far_y = update.y < original_bounds["min_y"] - margin_y or update.y > original_bounds["max_y"] + margin_y
+        far_x = update.x < safe_bounds["min_x"] - margin_x or update.x > safe_bounds["max_x"] + margin_x
+        far_y = update.y < safe_bounds["min_y"] - margin_y or update.y > safe_bounds["max_y"] + margin_y
         if (far_x or far_y) and not allow_large_move:
-            messages.append(Message("error", f"{update.ref!r} would move far outside original footprint bounds; use --allow-large-move to override"))
+            messages.append(Message("error", f"{update.ref!r} would move far outside BoardGeometry bounds; use --allow-large-move to override"))
     return messages
 
 
@@ -1333,8 +1518,16 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
     footprints = parse_footprints(text)
     if not footprints:
         raise PlacementError("No footprints found in PCB file")
+    board_geometry = resolve_board_geometry(text, model, footprints, allow_footprint_fallback=True)
+    defined_geometry = board_geometry_from_definition(model.board)
+    if model.board.emit_outline:
+        if defined_geometry is None:
+            raise PlacementError("Board(emit_outline=True) requires width and height")
+        existing_geometry = BoardGeometry.from_edge_cuts(text)
+        if existing_geometry is not None and not existing_geometry.nearly_equals(defined_geometry):
+            raise PlacementError("Board emit_outline=True conflicts with existing Edge.Cuts geometry")
     engine = PlacementEngine(footprints, model, strict=strict, allow_suffix_match=allow_suffix_match,
-                             cardinal_rotations=cardinal_rotations)
+                             cardinal_rotations=cardinal_rotations, board_geometry=board_geometry)
     engine.apply()
     validation_messages = validate_placements(engine) if validate else []
     safety_messages = validate_safe_placements(engine, allow_large_move=allow_large_move,
@@ -1346,6 +1539,8 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
     if safe and safety_fatal and any(m.level == "error" for m in engine.messages):
         raise PlacementError("validation failed: " + "; ".join(m.text for m in engine.messages if m.level == "error"))
     rewritten = text
+    if model.board.emit_outline and defined_geometry is not None:
+        rewritten = emit_board_outline(rewritten, defined_geometry)
     for ref, update in sorted(engine.updates.items(), key=lambda kv: footprints[kv[0]].start, reverse=True):
         fp = footprints[ref]
         rewritten = rewritten[:fp.start] + _replace_at(fp.text, update.x, update.y, update.write_rot) + rewritten[fp.end:]
@@ -1363,7 +1558,11 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "validation_errors": sum(1 for m in engine.messages if m.level == "error"),
         "board": dataclasses.asdict(model.board) | {"origin_x": model.board.origin_x, "origin_y": model.board.origin_y},
         "bounds": footprint_bounds(footprints),
-        "board_bounds": board_bounds(model.board),
+        "footprint_bounds": footprint_bounds(footprints),
+        "placement_bounds": footprint_bounds({ref: dataclasses.replace(footprints[ref], x=engine.updates[ref].x, y=engine.updates[ref].y) for ref in engine.updates}) if engine.updates else footprint_bounds(footprints),
+        "board_bounds": None if board_geometry is None else board_geometry.bounds(),
+        "board_geometry": None if board_geometry is None else board_geometry.as_report(),
+        "geometry_source": None if board_geometry is None else board_geometry.source,
         "updated_refs": sorted(engine.updates),
         "placements": [dataclasses.asdict(engine.updates[ref]) for ref in sorted(engine.updates)],
         "messages": [dataclasses.asdict(m) for m in engine.messages],
@@ -1417,15 +1616,65 @@ def default_output_path(pcb_path: Path) -> Path:
     return pcb_path.with_suffix(pcb_path.suffix + ".placed")
 
 
+def _print_geometry(geometry: Optional[BoardGeometry], *, unavailable: bool = True) -> None:
+    if geometry is None:
+        if unavailable:
+            print("board_bounds:")
+            print("  unavailable")
+        return
+    print("board_bounds:")
+    print(f"  source={geometry.source}")
+    print(f"  origin_x={_fmt_num(geometry.origin_x)}")
+    print(f"  origin_y={_fmt_num(geometry.origin_y)}")
+    print(f"  width={_fmt_num(geometry.width)}")
+    print(f"  height={_fmt_num(geometry.height)}")
+
+
 def print_bounds(pcb_path: Path, *, fmt: str = "text") -> int:
-    footprints = parse_footprints(pcb_path.read_text(encoding="utf-8"))
+    text = pcb_path.read_text(encoding="utf-8")
+    footprints = parse_footprints(text)
     bounds = footprint_bounds(footprints)
+    geometry = BoardGeometry.from_edge_cuts(text)
     if fmt == "json":
-        print(json.dumps({"footprints_total": len(footprints), "bounds": bounds}, indent=2, sort_keys=True))
+        print(json.dumps({"footprints_total": len(footprints), "footprint_bounds": bounds,
+                          "board_bounds": None if geometry is None else geometry.as_report()}, indent=2, sort_keys=True))
     else:
-        print(f"bounds: min_x={_fmt_num(bounds['min_x'])} min_y={_fmt_num(bounds['min_y'])} "
-              f"max_x={_fmt_num(bounds['max_x'])} max_y={_fmt_num(bounds['max_y'])}")
+        print("footprint_bounds:")
+        print(f"  min_x={_fmt_num(bounds['min_x'])}")
+        print(f"  min_y={_fmt_num(bounds['min_y'])}")
+        print(f"  max_x={_fmt_num(bounds['max_x'])}")
+        print(f"  max_y={_fmt_num(bounds['max_y'])}")
+        _print_geometry(geometry)
         print(f"{len(footprints)} footprint(s)")
+    return 0
+
+
+def print_board(pcb_path: Path, model: Optional[PlacementModel] = None, *, fmt: str = "text") -> int:
+    text = pcb_path.read_text(encoding="utf-8")
+    footprints = parse_footprints(text)
+    geometry = resolve_board_geometry(text, model, footprints, allow_footprint_fallback=False)
+    if fmt == "json":
+        print(json.dumps({"board_geometry": None if geometry is None else geometry.as_report()}, indent=2, sort_keys=True))
+    else:
+        if geometry is None:
+            print("board: unavailable")
+        else:
+            print(f"source={geometry.source}")
+            print(f"origin_x={_fmt_num(geometry.origin_x)}")
+            print(f"origin_y={_fmt_num(geometry.origin_y)}")
+            print(f"width={_fmt_num(geometry.width)}")
+            print(f"height={_fmt_num(geometry.height)}")
+    return 0
+
+
+def emit_outline_only(pcb_path: Path, model: PlacementModel, output_path: Path) -> int:
+    geometry = board_geometry_from_definition(model.board)
+    if geometry is None:
+        raise PlacementError("--emit-outline-only requires Board(width=..., height=...) in the placement file")
+    text = pcb_path.read_text(encoding="utf-8")
+    out = emit_board_outline(text, geometry)
+    atomic_write_text(output_path, out)
+    print(f"wrote outline: {output_path}")
     return 0
 
 
@@ -1475,7 +1724,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output", type=Path, help="Output .kicad_pcb path. Defaults to <input>.placed.kicad_pcb")
     parser.add_argument("--in-place", action="store_true", help="Edit the input PCB in place")
     parser.add_argument("--dry-run", action="store_true", help="Report placements without writing output")
-    parser.add_argument("--print-bounds", action="store_true", help="Print input footprint coordinate bounds and exit")
+    parser.add_argument("--print-bounds", action="store_true", help="Print input footprint coordinate bounds and board geometry and exit")
+    parser.add_argument("--print-board", action="store_true", help="Print authoritative board geometry and exit")
+    parser.add_argument("--emit-outline-only", type=Path, metavar="OUTPUT", help="Write only the rectangular Board outline to OUTPUT and exit")
     parser.add_argument("--infer-origin", action="store_true", help="Infer Board origin from input footprint minimum x/y before applying rules")
     parser.add_argument("--validate", action="store_true", help="Run placement validation without writing output")
     parser.add_argument("--check", action="store_true", help="Fail if applying placement would change the input file")
@@ -1513,14 +1764,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         return list_refs(args.pcb, fmt=args.format)
     if args.print_bounds:
         return print_bounds(args.pcb, fmt=args.format)
+    if args.print_board and args.ppl is None:
+        return print_board(args.pcb, None, fmt=args.format)
     if args.ppl is None:
-        parser.error("ppl file is required unless --list-refs, --print-bounds, or --list-aliases is used")
+        parser.error("ppl file is required unless --list-refs, --print-bounds, --print-board, or --list-aliases is used")
     if not args.ppl.exists():
         raise SystemExit(f"PPL file not found: {args.ppl}")
     if args.output and args.in_place:
         parser.error("--output and --in-place are mutually exclusive")
 
     model = load_ppl(args.ppl)
+    if args.print_board:
+        return print_board(args.pcb, model, fmt=args.format)
+    if args.emit_outline_only is not None:
+        return emit_outline_only(args.pcb, model, args.emit_outline_only)
     if args.netlist is not None:
         if not args.netlist.exists():
             raise SystemExit(f"Netlist file not found: {args.netlist}")
@@ -1528,7 +1785,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     source_text = args.pcb.read_text(encoding="utf-8")
     source_footprints = parse_footprints(source_text)
     if args.infer_origin:
-        model.board.origin = infer_origin_from_footprints(source_footprints)
+        inferred_geometry = resolve_board_geometry(source_text, model, source_footprints, allow_footprint_fallback=True)
+        if inferred_geometry is None:
+            raise PlacementError("Could not infer origin: no Edge.Cuts, Board(...), or footprint bounds available")
+        model.board.origin = (inferred_geometry.origin_x, inferred_geometry.origin_y)
+        source_label = {"edge_cuts": "edge_cuts", "placement_file": "board_definition",
+                        "inferred_from_footprints": "footprint_bounds_fallback"}.get(inferred_geometry.source, inferred_geometry.source)
+        print(f"origin source: {source_label}")
         print(f"origin: inferred origin_x={_fmt_num(model.board.origin_x)} origin_y={_fmt_num(model.board.origin_y)}")
     run_validation = bool(args.validate or args.check)
     new_text, messages, report = apply_placements(source_text, model, strict=args.strict,

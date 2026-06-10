@@ -29,9 +29,9 @@ A recommended conservative workflow is:
 ```bash
 pcb build board.zen
 pcb layout board.zen
-pcb-place layout.kicad_pcb placement.ppl --print-bounds
-pcb-place layout.kicad_pcb placement.ppl --infer-origin --dry-run
-pcb-place layout.kicad_pcb placement.ppl --infer-origin -o layout.placed.kicad_pcb
+pcb-place layout.kicad_pcb --print-board
+pcb-place layout.kicad_pcb placement.ppl --dry-run
+pcb-place layout.kicad_pcb placement.ppl -o layout.placed.kicad_pcb
 # then open layout.placed.kicad_pcb in KiCad
 ```
 
@@ -93,8 +93,8 @@ Implemented today:
 - Python/Starlark-like `.ppl` placement DSL
 - Exact and hierarchical suffix reference matching
 - Optional Zener/pcb netlist alias imports for semantic instance paths
-- JSON reports with board origin, input bounds, and per-placement delta information
-- Dry-run, check, validation, print-bounds, and list-refs modes
+- JSON reports with board geometry, geometry source, footprint bounds, placement bounds, and per-placement delta information
+- Dry-run, check, validation, print-bounds, print-board, emit-outline-only, and list-refs modes
 - Conservative KiCad rewriting that only changes matched footprint-level `(at ...)` expressions
 - Rotation preservation by default, with explicit opt-in for path-aligned/computed rotations
 - Safe-by-default pre-write validation for non-finite coordinates, large moves, outside-board placement, duplicate targets, unresolved aliases, and locked footprint movement
@@ -140,10 +140,17 @@ Edit the input board in place, writing a `.bak` backup:
 pcb-place board.kicad_pcb placement.ppl --in-place
 ```
 
-Print existing footprint coordinate bounds. This is useful for generated KiCad/Zener boards whose useful placement origin is not at `(0, 0)`:
+Print existing footprint coordinate bounds and any Edge.Cuts-derived board bounds. Footprint bounds are reported separately because they are not board bounds:
 
 ```bash
-pcb-place board.kicad_pcb placement.ppl --print-bounds
+pcb-place board.kicad_pcb --print-bounds
+```
+
+Print the authoritative board geometry that `pcb-place` can see:
+
+```bash
+pcb-place board.kicad_pcb --print-board
+pcb-place board.kicad_pcb placement.ppl --print-board
 ```
 
 Preview placement without writing. Dry-run output lists each changed footprint, original and new x/y/rotation, x/y delta, rotation-change status, and whether the new point is outside the declared board:
@@ -152,7 +159,7 @@ Preview placement without writing. Dry-run output lists each changed footprint, 
 pcb-place board.kicad_pcb placement.ppl --dry-run
 ```
 
-Infer the board origin from the current minimum footprint x/y before applying board-local placement rules:
+Infer the board origin before applying board-local placement rules. The source is printed explicitly. `pcb-place` prefers Edge.Cuts, then the `Board(...)` definition, then a footprint-bounds fallback:
 
 ```bash
 pcb-place board.kicad_pcb placement.ppl --infer-origin --dry-run
@@ -205,6 +212,44 @@ pcb-place board.kicad_pcb placement.ppl --no-safe
 ```
 
 If you want mechanically simple rotations, `--cardinal-rotations` rounds explicit rotations to the nearest `0`, `90`, `180`, or `270` degrees unless an individual rule sets `allow_arbitrary_rotation=True`.
+
+## Board Geometry
+
+`pcb-place` treats board geometry as a first-class model rather than assuming that footprint extents define the PCB. This matters for generated boards: a 70 mm × 70 mm board may have footprints occupying only a 54 mm × 61 mm area, so footprint bounds are useful diagnostics but are not the board outline.
+
+Board geometry is resolved in this priority order:
+
+1. KiCad `Edge.Cuts` geometry (`gr_rect` or a rectangular outline made from `gr_line` segments).
+2. The placement file `Board(width=..., height=..., origin_x=..., origin_y=...)` definition.
+3. Footprint bounds as an explicit fallback when no board geometry is available.
+
+Use `--print-board` after generating a board to confirm what source will be used:
+
+```bash
+pcb build board.zen
+pcb layout board.zen
+pcb-place layout.kicad_pcb --print-board
+pcb-place layout.kicad_pcb placement.ppl --dry-run
+pcb-place layout.kicad_pcb placement.ppl -o placed.kicad_pcb
+```
+
+If the source generator emits the `Edge.Cuts` layer but not an actual outline, declare the board in the placement DSL and request outline emission:
+
+```python
+Board(
+    width=70,
+    height=70,
+    origin_x=140,
+    origin_y=52,
+    emit_outline=True,
+)
+```
+
+When `emit_outline=True`, `pcb-place` writes a rectangular `Edge.Cuts` outline only if no outline already exists. If an existing outline conflicts with the declared board, the run fails with a clear error instead of duplicating or silently replacing geometry. For debugging, you can emit just the outline without applying placements:
+
+```bash
+pcb-place board.kicad_pcb placement.ppl --emit-outline-only outline.kicad_pcb
+```
 
 ## Placement DSL example
 
