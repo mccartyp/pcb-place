@@ -192,3 +192,19 @@ Anchor("MCU.U_MCU", x=25, y=15, rot=0)
     payload = json.loads(report.read_text())
     assert payload["imported_aliases"]["MCU.U_MCU"] == "U1"
     assert payload["alias_diagnostics"]["parser"] == "json"
+
+
+def test_suffix_alias_target_missing_fails_cleanly(tmp_path):
+    netlist = tmp_path / "missing-target.json"
+    netlist.write_text(json.dumps({"components": [
+        {"path": "MCU.U_MISSING", "ref": "U99"},
+    ]}))
+    ppl = tmp_path / "missing-target.ppl"
+    ppl.write_text('''
+Board(width=50, height=30)
+Anchor("U_MISSING", x=1, y=2)
+''')
+    model = load_ppl(ppl)
+    import_netlist_aliases(model, netlist)
+    with pytest.raises(PlacementError, match="missing footprint"):
+        apply_placements((ROOT / "tests/fixtures/simple.kicad_pcb").read_text(), model, strict=True)

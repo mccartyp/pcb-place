@@ -870,6 +870,8 @@ class PlacementEngine:
                 if alias == original_ref:
                     continue
                 normalized_alias = normalize_alias_path(alias)
+                if candidate_ref not in self.footprints:
+                    continue
                 if normalized_alias.endswith(f".{normalized_query}") or normalized_alias.endswith(f":{original_ref}"):
                     matches.add(candidate_ref)
             suffixes = [f".{original_ref}", f"/{original_ref}", f":{original_ref}"]
