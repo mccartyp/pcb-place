@@ -42,14 +42,16 @@ import argparse
 import dataclasses
 import json
 import math
+import os
 import re
 import shutil
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"
 
 Number = float | int
 Point = Tuple[float, float]
@@ -96,7 +98,29 @@ class Footprint:
     x: float
     y: float
     rot: float
+    at_has_rot: bool = False
+    at_rot_text: Optional[str] = None
     layer: Optional[str] = None
+
+
+@dataclasses.dataclass
+class PlacementUpdate:
+    """A requested footprint placement and how its rotation should be written."""
+
+    ref: str
+    x: float
+    y: float
+    final_rot: float
+    write_rot: Optional[float]
+    why: str
+    note: Optional[str]
+    original_x: float
+    original_y: float
+    original_rot: float
+    rotation_changed: bool
+    outside_board: bool
+    delta_x: float
+    delta_y: float
 
 
 @dataclasses.dataclass
@@ -108,6 +132,14 @@ class BoardInfo:
     units: str = "mm"
     origin: Point = (0.0, 0.0)
     name: Optional[str] = None
+
+    @property
+    def origin_x(self) -> float:
+        return self.origin[0]
+
+    @property
+    def origin_y(self) -> float:
+        return self.origin[1]
 
 
 @dataclasses.dataclass
@@ -172,6 +204,8 @@ def _as_point(value: Any, *, field: str = "point") -> Point:
 def _fmt_num(value: float) -> str:
     """Format a KiCad numeric field deterministically."""
 
+    if not math.isfinite(value):
+        return str(value)
     if abs(value - round(value)) < 1e-9:
         return str(int(round(value)))
     return f"{value:.4f}".rstrip("0").rstrip(".")
@@ -179,6 +213,29 @@ def _fmt_num(value: float) -> str:
 
 def _angle_between(a: Point, b: Point) -> float:
     return math.degrees(math.atan2(b[1] - a[1], b[0] - a[0]))
+
+
+def _normalize_rotation(value: float) -> float:
+    """Normalize KiCad rotation values into [0, 360)."""
+
+    value = float(value) % 360.0
+    return 0.0 if abs(value) < 1e-9 or abs(value - 360.0) < 1e-9 else value
+
+
+def _cardinal_rotation(value: float) -> float:
+    return _normalize_rotation(round(_normalize_rotation(value) / 90.0) * 90.0)
+
+
+def _board_to_abs(model: PlacementModel, x: float, y: float) -> Point:
+    ox, oy = model.board.origin
+    return ox + float(x), oy + float(y)
+
+
+def board_bounds(board: BoardInfo) -> Optional[Dict[str, float]]:
+    if board.width is None or board.height is None:
+        return None
+    ox, oy = board.origin
+    return {"min_x": ox, "min_y": oy, "max_x": ox + board.width, "max_y": oy + board.height}
 
 
 def _normalize_ref(ref: str) -> str:
@@ -194,6 +251,43 @@ def _require_board_size(model: PlacementModel, rule_name: str) -> Tuple[float, f
 
 def _rot_or_none(rot: Optional[Number | str]) -> Optional[Number | str]:
     return None if rot is None else rot
+
+
+def footprint_bounds(footprints: Mapping[str, Footprint]) -> Dict[str, float]:
+    if not footprints:
+        return {"min_x": 0.0, "min_y": 0.0, "max_x": 0.0, "max_y": 0.0}
+    xs = [fp.x for fp in footprints.values()]
+    ys = [fp.y for fp in footprints.values()]
+    return {"min_x": min(xs), "min_y": min(ys), "max_x": max(xs), "max_y": max(ys)}
+
+
+def infer_origin_from_footprints(footprints: Mapping[str, Footprint]) -> Point:
+    bounds = footprint_bounds(footprints)
+    return bounds["min_x"], bounds["min_y"]
+
+
+def parentheses_balanced(text: str) -> bool:
+    depth = 0
+    in_str = False
+    escape = False
+    for ch in text:
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not in_str
 
 
 def normalize_alias_path(value: Any) -> str:
@@ -439,11 +533,16 @@ def load_ppl(path: Path) -> PlacementModel:
     model = PlacementModel()
 
     def Board(*, width: Number, height: Number, units: str = "mm", origin: Point = (0, 0),
+              origin_x: Optional[Number] = None, origin_y: Optional[Number] = None,
               name: Optional[str] = None, **kwargs: Any) -> None:
         if units != "mm":
             raise PlacementError("Only units='mm' is currently supported")
         if kwargs:
             raise PlacementError(f"Board() unknown parameter(s): {', '.join(sorted(kwargs))}")
+        if origin_x is not None or origin_y is not None:
+            base_x, base_y = _as_point(origin, field="origin")
+            origin = (base_x if origin_x is None else float(origin_x),
+                      base_y if origin_y is None else float(origin_y))
         model.board = BoardInfo(
             width=float(width),
             height=float(height),
@@ -505,9 +604,9 @@ def load_ppl(path: Path) -> PlacementModel:
         model.rules[-1]["type"] = "fixed"
 
     def Corner(ref: str, *, corner: str, inset: Number | Point = 3,
-               rot: Optional[Number | str] = 0, role: Optional[str] = "mounting_hole",
+               rot: Optional[Number | str] = None, role: Optional[str] = "mounting_hole",
                lock: bool = True, note: Optional[str] = None, **kwargs: Any) -> None:
-        w, h, ox, oy = _require_board_size(model, "Corner")
+        w, h, _ox, _oy = _require_board_size(model, "Corner")
         if isinstance(inset, (tuple, list)):
             ix, iy = _as_point(inset, field="inset")
         else:
@@ -520,13 +619,13 @@ def load_ppl(path: Path) -> PlacementModel:
         }
         c = aliases.get(c, c)
         if c == "top_left":
-            x, y = ox + ix, oy + iy
+            x, y = ix, iy
         elif c == "top_right":
-            x, y = ox + w - ix, oy + iy
+            x, y = w - ix, iy
         elif c == "bottom_left":
-            x, y = ox + ix, oy + h - iy
+            x, y = ix, h - iy
         elif c == "bottom_right":
-            x, y = ox + w - ix, oy + h - iy
+            x, y = w - ix, h - iy
         else:
             raise PlacementError(f"Unknown corner {corner!r}")
         model.add("corner", ref=_normalize_ref(ref), x=x, y=y, rot=_rot_or_none(rot),
@@ -536,34 +635,36 @@ def load_ppl(path: Path) -> PlacementModel:
              x: Optional[Number] = None, y: Optional[Number] = None,
              rot: Optional[Number | str] = None, role: Optional[str] = None,
              lock: bool = False, note: Optional[str] = None, **kwargs: Any) -> None:
-        w, h, ox, oy = _require_board_size(model, "Edge")
+        w, h, _ox, _oy = _require_board_size(model, "Edge")
         e = edge.lower().replace("-", "_")
         if e in ("left", "right"):
-            px = ox + (float(inset) if e == "left" else w - float(inset))
-            py = oy + (float(y) if y is not None else float(offset if offset is not None else h / 2.0))
-            default_rot = 270 if e == "left" else 90
+            px = float(inset) if e == "left" else w - float(inset)
+            py = float(y) if y is not None else float(offset if offset is not None else h / 2.0)
         elif e in ("top", "bottom"):
-            px = ox + (float(x) if x is not None else float(offset if offset is not None else w / 2.0))
-            py = oy + (float(inset) if e == "top" else h - float(inset))
-            default_rot = 0 if e == "top" else 180
+            px = float(x) if x is not None else float(offset if offset is not None else w / 2.0)
+            py = float(inset) if e == "top" else h - float(inset)
         else:
             raise PlacementError(f"Unknown edge {edge!r}")
         model.add("edge", ref=_normalize_ref(ref), x=px, y=py,
-                  rot=_rot_or_none(default_rot if rot is None else rot), role=role,
+                  rot=_rot_or_none(rot), role=role,
                   lock=bool(lock), edge=e, note=note, extra=dict(kwargs))
 
     def Between(ref: str, *, a: str, b: str, t: Number = 0.5,
                 dx: Number = 0, dy: Number = 0, offset: Optional[Number] = None,
-                rot: Optional[Number | str] = None, role: Optional[str] = None,
-                note: Optional[str] = None, **kwargs: Any) -> None:
+                rot: Optional[Number | str] = None, align: Optional[str] = None,
+                role: Optional[str] = None, note: Optional[str] = None, **kwargs: Any) -> None:
+        if align is not None and rot is None:
+            rot = align
         model.add("between", ref=_normalize_ref(ref), a=_normalize_ref(a), b=_normalize_ref(b),
                   t=float(t), dx=float(dx), dy=float(dy),
                   offset=None if offset is None else float(offset), rot=_rot_or_none(rot),
                   role=role, note=note, extra=dict(kwargs))
 
     def Inline(ref: str, *, a: str, b: str, t: Number = 0.5,
-               rot: Optional[Number | str] = "path", role: Optional[str] = None,
-               note: Optional[str] = None, **kwargs: Any) -> None:
+               rot: Optional[Number | str] = None, align: Optional[str] = None,
+               role: Optional[str] = None, note: Optional[str] = None, **kwargs: Any) -> None:
+        if align is not None and rot is None:
+            rot = align
         model.add("inline", ref=_normalize_ref(ref), a=_normalize_ref(a), b=_normalize_ref(b),
                   t=float(t), rot=_rot_or_none(rot), role=role, note=note, extra=dict(kwargs))
 
@@ -619,7 +720,7 @@ def load_ppl(path: Path) -> PlacementModel:
                   rot=_rot_or_none(rot), role=role, note=note, extra=dict(kwargs))
 
     def Mirror(ref: str, *, source: str, axis: str = "vertical", about: Optional[Number] = None,
-               rot: Optional[Number | str] = "mirror", role: Optional[str] = None,
+               rot: Optional[Number | str] = None, role: Optional[str] = None,
                note: Optional[str] = None, **kwargs: Any) -> None:
         """Place ref as a mirror of source across a board or explicit axis."""
         model.add("mirror", ref=_normalize_ref(ref), source=_normalize_ref(source), axis=axis,
@@ -790,22 +891,26 @@ def parse_footprints(text: str) -> Dict[str, Footprint]:
             x=float(at_match.group(2)),
             y=float(at_match.group(3)),
             rot=float(at_match.group(4)) if at_match.group(4) is not None else 0.0,
+            at_has_rot=at_match.group(4) is not None,
+            at_rot_text=at_match.group(4),
             layer=layer_match.group(1) if layer_match else None,
         )
     return footprints
 
 
 def _replace_at(block: str, x: float, y: float, rot: Optional[float]) -> str:
-    """Replace only the footprint-level (at ...) field, preserving indentation."""
+    """Replace only the footprint-level (at ...) field, preserving indentation and rotation form."""
 
     def repl(match: re.Match[str]) -> str:
         indent = match.group(1)
+        old_rot = match.group(4)
         if rot is None:
-            return f"{indent}(at {_fmt_num(x)} {_fmt_num(y)})"
+            suffix = f" {old_rot}" if old_rot is not None else ""
+            return f"{indent}(at {_fmt_num(x)} {_fmt_num(y)}{suffix})"
         return f"{indent}(at {_fmt_num(x)} {_fmt_num(y)} {_fmt_num(rot)})"
 
     new_block, count = re.subn(
-        r'(?m)^(\s*)\(at\s+[-+0-9.eE]+\s+[-+0-9.eE]+(?:\s+[-+0-9.eE]+)?\)',
+        r'(?m)^(\s*)\(at\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)(?:\s+([-+0-9.eE]+))?\)',
         repl,
         block,
         count=1,
@@ -824,16 +929,19 @@ class PlacementEngine:
     """Applies a PlacementModel to parsed KiCad footprint positions."""
 
     def __init__(self, footprints: Mapping[str, Footprint], model: PlacementModel,
-                 *, strict: bool = False, allow_suffix_match: bool = True) -> None:
+                 *, strict: bool = False, allow_suffix_match: bool = True,
+                 cardinal_rotations: bool = False) -> None:
         self.footprints = dict(footprints)
         self.model = model
         self.strict = strict
         self.allow_suffix_match = allow_suffix_match
+        self.cardinal_rotations = cardinal_rotations
         self.messages: List[Message] = []
         self.positions: Dict[str, Tuple[float, float, float]] = {
             ref: (fp.x, fp.y, fp.rot) for ref, fp in self.footprints.items()
         }
-        self.updates: Dict[str, Tuple[float, float, Optional[float]]] = {}
+        self.updates: Dict[str, PlacementUpdate] = {}
+        self.placement_attempts: Dict[str, int] = {}
         self.ref_cache: Dict[str, str] = {}
         self.locked: Dict[str, str] = {}
         for error in model.alias_diagnostics.errors:
@@ -893,24 +1001,44 @@ class PlacementEngine:
             raise PlacementError(msg)
         self.messages.append(Message("warn", msg))
 
-    def place(self, ref: str, x: float, y: float, rot: Optional[float], why: str, note: Optional[str] = None) -> None:
+    def place(self, ref: str, x: float, y: float, rot: Optional[float], why: str, note: Optional[str] = None,
+              *, allow_arbitrary_rotation: bool = False) -> None:
         actual_ref = self.resolve_ref(ref)
         if actual_ref is None:
             self._warn_or_raise(f"missing footprint {ref!r} for {why}")
             return
+        self.placement_attempts[actual_ref] = self.placement_attempts.get(actual_ref, 0) + 1
         old_x, old_y, old_rot = self.positions.get(actual_ref, (0.0, 0.0, self.footprints[actual_ref].rot))
-        new_rot = old_rot if rot is None else float(rot)
+        explicit_rot = rot is not None
+        write_rot: Optional[float] = None
+        if explicit_rot:
+            write_rot = _normalize_rotation(float(rot))
+            if self.cardinal_rotations and not allow_arbitrary_rotation:
+                write_rot = _cardinal_rotation(write_rot)
+        new_rot = old_rot if write_rot is None else write_rot
         if actual_ref in self.locked:
             changed = (abs(old_x - x) > 1e-9 or abs(old_y - y) > 1e-9 or abs(old_rot - new_rot) > 1e-9)
             if changed:
                 self._warn_or_raise(f"locked footprint {actual_ref!r} cannot be moved by {why}; locked by {self.locked[actual_ref]}")
                 return
-        self.updates[actual_ref] = (x, y, new_rot)
-        self.positions[actual_ref] = (x, y, new_rot)
+        fp = self.footprints[actual_ref]
+        outside = False
+        bounds = board_bounds(self.model.board)
+        if bounds is not None:
+            outside = x < bounds["min_x"] or y < bounds["min_y"] or x > bounds["max_x"] or y > bounds["max_y"]
+        update = PlacementUpdate(
+            ref=actual_ref, x=float(x), y=float(y), final_rot=float(new_rot), write_rot=write_rot, why=why, note=note,
+            original_x=fp.x, original_y=fp.y, original_rot=fp.rot,
+            rotation_changed=abs(fp.rot - new_rot) > 1e-9, outside_board=outside,
+            delta_x=float(x) - fp.x, delta_y=float(y) - fp.y,
+        )
+        self.updates[actual_ref] = update
+        self.positions[actual_ref] = (float(x), float(y), float(new_rot))
         suffix = f"  # {note}" if note else ""
+        rot_label = _fmt_num(new_rot) if explicit_rot else "preserve"
         self.messages.append(
             Message("place", f"place {actual_ref:>16s} -> x={_fmt_num(x):>8s} y={_fmt_num(y):>8s} "
-                             f"rot={_fmt_num(new_rot):>7s}  {why}{suffix}")
+                             f"rot={rot_label:>8s}  {why}{suffix}")
         )
 
     def lock(self, ref: str, why: str = "Lock") -> None:
@@ -958,11 +1086,16 @@ class PlacementEngine:
             raise PlacementError(f"Unknown rotation spec {rot_spec!r}")
         return float(rot_spec)
 
+    def _allow_arbitrary_rotation(self, rule: Dict[str, Any]) -> bool:
+        return bool(rule.get("allow_arbitrary_rotation") or rule.get("extra", {}).get("allow_arbitrary_rotation"))
+
     def _apply_linear_collection(self, rule: Dict[str, Any], why: str) -> None:
         sx, sy = rule["start"]
         px, py = rule["pitch"]
         for i, ref in enumerate(rule["refs"]):
-            self.place(ref, sx + px * i, sy + py * i, self.resolve_rot(rule.get("rot")), why, rule.get("note"))
+            x, y = _board_to_abs(self.model, sx + px * i, sy + py * i)
+            self.place(ref, x, y, self.resolve_rot(rule.get("rot")), why, rule.get("note"),
+                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
 
     def apply(self) -> None:
         """Apply rules in deterministic passes.
@@ -980,9 +1113,9 @@ class PlacementEngine:
                     x = bx + float(rule.get("dx", 0.0))
                     y = by + float(rule.get("dy", 0.0))
                 else:
-                    x = float(rule["x"])
-                    y = float(rule["y"])
-                self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot")), typ, rule.get("note"))
+                    x, y = _board_to_abs(self.model, float(rule["x"]), float(rule["y"]))
+                self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot")), typ, rule.get("note"),
+                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
                 if rule.get("lock"):
                     self.lock(rule["ref"], f"{typ} rule")
             elif typ == "lock":
@@ -996,8 +1129,10 @@ class PlacementEngine:
                 for i, ref in enumerate(rule["refs"]):
                     col = i % cols
                     row = i // cols
-                    self.place(ref, sx + col * px, sy + row * py,
-                               self.resolve_rot(rule.get("rot")), "grid", rule.get("note"))
+                    x, y = _board_to_abs(self.model, sx + col * px, sy + row * py)
+                    self.place(ref, x, y,
+                               self.resolve_rot(rule.get("rot")), "grid", rule.get("note"),
+                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
 
         # Relational pass.
         for rule in self.model.rules:
@@ -1013,7 +1148,8 @@ class PlacementEngine:
                     length = math.hypot(vx, vy) or 1.0
                     x += (-vy / length) * float(rule["offset"])
                     y += (vx / length) * float(rule["offset"])
-                self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot"), a, b), typ, rule.get("note"))
+                self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot"), a, b), typ, rule.get("note"),
+                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
 
             elif typ == "satellite":
                 px, py = self.get_pos(rule["parent"])
@@ -1033,7 +1169,8 @@ class PlacementEngine:
                     x, y = px + idx * pitch, py + dist
                 else:
                     raise PlacementError(f"Unknown satellite side {side!r}")
-                self.place(rule["ref"], x + dx, y + dy, self.resolve_rot(rule.get("rot")), typ, rule.get("note"))
+                self.place(rule["ref"], x + dx, y + dy, self.resolve_rot(rule.get("rot")), typ, rule.get("note"),
+                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
 
             elif typ == "orbit":
                 cx, cy = self.get_pos(rule["parent"])
@@ -1044,7 +1181,8 @@ class PlacementEngine:
                     theta = math.radians(start + step * i)
                     x = cx + radius * math.cos(theta)
                     y = cy + radius * math.sin(theta)
-                    self.place(ref, x, y, self.resolve_rot(rule.get("rot")), "orbit", rule.get("note"))
+                    self.place(ref, x, y, self.resolve_rot(rule.get("rot")), "orbit", rule.get("note"),
+                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
 
             elif typ == "mirror":
                 sx, sy = self.get_pos(rule["source"])
@@ -1065,7 +1203,8 @@ class PlacementEngine:
                     x, y = sx, about + (about - sy)
                 self.place(rule["ref"], x, y,
                            self.resolve_rot(rule.get("rot"), source_rot=source_rot, mirror_axis=axis),
-                           "mirror", rule.get("note"))
+                           "mirror", rule.get("note"),
+                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
 
             elif typ == "copy_placement":
                 source_prefix = rule["source_prefix"]
@@ -1091,7 +1230,8 @@ class PlacementEngine:
                     x, y = self.get_pos(src)
                     source_rot = self.get_rot(src)
                     rot = self.resolve_rot(rule.get("rot"), source_rot=source_rot)
-                    self.place(dst, x + dx, y + dy, rot, "copy_placement", rule.get("note"))
+                    self.place(dst, x + dx, y + dy, rot, "copy_placement", rule.get("note"),
+                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
 
         # Documentation/reporting pass.
         for rule in self.model.rules:
@@ -1151,23 +1291,62 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25) -
     return messages
 
 
+def validate_safe_placements(engine: PlacementEngine, *, allow_large_move: bool = False,
+                             allow_outside_board: bool = False) -> List[Message]:
+    """Pre-write safety checks intended to prevent dangerous KiCad output."""
+
+    messages: List[Message] = []
+    board = engine.model.board
+    original_bounds = footprint_bounds(engine.footprints)
+    board_w = board.width if board.width is not None else max(1.0, original_bounds["max_x"] - original_bounds["min_x"])
+    board_h = board.height if board.height is not None else max(1.0, original_bounds["max_y"] - original_bounds["min_y"])
+    margin_x = max(1.0, 5.0 * float(board_w))
+    margin_y = max(1.0, 5.0 * float(board_h))
+
+    for ref, count in sorted(engine.placement_attempts.items()):
+        if count > 1:
+            messages.append(Message("error", f"duplicate resolved placement for {ref!r}; {count} rules target the same footprint"))
+
+    for message in engine.messages:
+        lower = message.text.lower()
+        if message.level == "warn" and any(key in lower for key in ("missing footprint", "ambiguous", "locked footprint")):
+            messages.append(Message("error", message.text))
+
+    for update in engine.updates.values():
+        if not all(math.isfinite(v) for v in (update.x, update.y, update.final_rot)):
+            messages.append(Message("error", f"{update.ref!r} has non-finite placement coordinate or rotation"))
+        if update.outside_board and not allow_outside_board:
+            messages.append(Message("error", f"{update.ref!r} would be outside Board bounds at x={_fmt_num(update.x)} y={_fmt_num(update.y)}; use --allow-outside-board to override"))
+        far_x = update.x < original_bounds["min_x"] - margin_x or update.x > original_bounds["max_x"] + margin_x
+        far_y = update.y < original_bounds["min_y"] - margin_y or update.y > original_bounds["max_y"] + margin_y
+        if (far_x or far_y) and not allow_large_move:
+            messages.append(Message("error", f"{update.ref!r} would move far outside original footprint bounds; use --allow-large-move to override"))
+    return messages
+
+
 def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
-                     allow_suffix_match: bool = True, validate: bool = False) -> Tuple[str, List[Message], Dict[str, Any]]:
+                     allow_suffix_match: bool = True, validate: bool = False, safe: bool = False,
+                     allow_large_move: bool = False, allow_outside_board: bool = False,
+                     cardinal_rotations: bool = False) -> Tuple[str, List[Message], Dict[str, Any]]:
     """Apply placement rules and return rewritten KiCad text plus diagnostics."""
 
     footprints = parse_footprints(text)
     if not footprints:
         raise PlacementError("No footprints found in PCB file")
-    engine = PlacementEngine(footprints, model, strict=strict, allow_suffix_match=allow_suffix_match)
+    engine = PlacementEngine(footprints, model, strict=strict, allow_suffix_match=allow_suffix_match,
+                             cardinal_rotations=cardinal_rotations)
     engine.apply()
     validation_messages = validate_placements(engine) if validate else []
+    safety_messages = validate_safe_placements(engine, allow_large_move=allow_large_move,
+                                               allow_outside_board=allow_outside_board) if safe else []
     engine.messages.extend(validation_messages)
-    if strict and any(m.level == "error" for m in engine.messages):
+    engine.messages.extend(safety_messages)
+    if (strict or safe) and any(m.level == "error" for m in engine.messages):
         raise PlacementError("validation failed: " + "; ".join(m.text for m in engine.messages if m.level == "error"))
     rewritten = text
-    for ref, (x, y, rot) in sorted(engine.updates.items(), key=lambda kv: footprints[kv[0]].start, reverse=True):
+    for ref, update in sorted(engine.updates.items(), key=lambda kv: footprints[kv[0]].start, reverse=True):
         fp = footprints[ref]
-        rewritten = rewritten[:fp.start] + _replace_at(fp.text, x, y, rot) + rewritten[fp.end:]
+        rewritten = rewritten[:fp.start] + _replace_at(fp.text, update.x, update.y, update.write_rot) + rewritten[fp.end:]
     report = {
         "version": __version__,
         "footprints_total": len(footprints),
@@ -1180,8 +1359,11 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "regions": dict(model.regions),
         "locked_refs": sorted(engine.locked),
         "validation_errors": sum(1 for m in engine.messages if m.level == "error"),
-        "board": dataclasses.asdict(model.board),
+        "board": dataclasses.asdict(model.board) | {"origin_x": model.board.origin_x, "origin_y": model.board.origin_y},
+        "bounds": footprint_bounds(footprints),
+        "board_bounds": board_bounds(model.board),
         "updated_refs": sorted(engine.updates),
+        "placements": [dataclasses.asdict(engine.updates[ref]) for ref in sorted(engine.updates)],
         "messages": [dataclasses.asdict(m) for m in engine.messages],
     }
     return rewritten, engine.messages, report
@@ -1233,6 +1415,57 @@ def default_output_path(pcb_path: Path) -> Path:
     return pcb_path.with_suffix(pcb_path.suffix + ".placed")
 
 
+def print_bounds(pcb_path: Path, *, fmt: str = "text") -> int:
+    footprints = parse_footprints(pcb_path.read_text(encoding="utf-8"))
+    bounds = footprint_bounds(footprints)
+    if fmt == "json":
+        print(json.dumps({"footprints_total": len(footprints), "bounds": bounds}, indent=2, sort_keys=True))
+    else:
+        print(f"bounds: min_x={_fmt_num(bounds['min_x'])} min_y={_fmt_num(bounds['min_y'])} "
+              f"max_x={_fmt_num(bounds['max_x'])} max_y={_fmt_num(bounds['max_y'])}")
+        print(f"{len(footprints)} footprint(s)")
+    return 0
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_DIRECTORY)
+        except OSError:
+            dir_fd = None
+        if dir_fd is not None:
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def sanity_check_output(input_text: str, output_text: str) -> None:
+    if not parentheses_balanced(output_text):
+        raise PlacementError("sanity check failed: output parentheses are not balanced")
+    input_fps = parse_footprints(input_text)
+    output_fps = parse_footprints(output_text)
+    if len(output_fps) != len(input_fps):
+        raise PlacementError(f"sanity check failed: footprint count changed from {len(input_fps)} to {len(output_fps)}")
+    missing = sorted(set(input_fps) - set(output_fps))
+    if missing:
+        raise PlacementError("sanity check failed: missing footprint refs: " + ", ".join(missing))
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pcb-place", description="Apply placement.ppl rules to a KiCad .kicad_pcb file")
     parser.add_argument("pcb", type=Path, nargs="?", help="Path to input .kicad_pcb file")
@@ -1240,10 +1473,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output", type=Path, help="Output .kicad_pcb path. Defaults to <input>.placed.kicad_pcb")
     parser.add_argument("--in-place", action="store_true", help="Edit the input PCB in place")
     parser.add_argument("--dry-run", action="store_true", help="Report placements without writing output")
+    parser.add_argument("--print-bounds", action="store_true", help="Print input footprint coordinate bounds and exit")
+    parser.add_argument("--infer-origin", action="store_true", help="Infer Board origin from input footprint minimum x/y before applying rules")
     parser.add_argument("--validate", action="store_true", help="Run placement validation without writing output")
     parser.add_argument("--check", action="store_true", help="Fail if applying placement would change the input file")
     parser.add_argument("--no-backup", action="store_true", help="Do not write .bak when editing in-place")
     parser.add_argument("--strict", action="store_true", help="Treat missing/ambiguous refs as errors")
+    parser.add_argument("--safe", dest="safe", action="store_true", default=True, help="Run pre-write safety checks (default)")
+    parser.add_argument("--no-safe", dest="safe", action="store_false", help="Disable pre-write safety checks")
+    parser.add_argument("--allow-large-move", action="store_true", help="Allow placements far outside original footprint bounds")
+    parser.add_argument("--allow-outside-board", action="store_true", help="Allow placements outside declared Board bounds")
+    parser.add_argument("--cardinal-rotations", action="store_true", help="Round explicit rotations to nearest 0/90/180/270 unless a rule allows arbitrary rotation")
     parser.add_argument("--no-suffix-match", action="store_true", help="Disable hierarchical suffix reference matching")
     parser.add_argument("--netlist", type=Path, help="Optional Zener/pcb netlist artifact used to import semantic aliases")
     parser.add_argument("--list-refs", action="store_true", help="List footprint references in the PCB and exit")
@@ -1269,8 +1509,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit(f"PCB file not found: {args.pcb}")
     if args.list_refs:
         return list_refs(args.pcb, fmt=args.format)
+    if args.print_bounds:
+        return print_bounds(args.pcb, fmt=args.format)
     if args.ppl is None:
-        parser.error("ppl file is required unless --list-refs or --list-aliases is used")
+        parser.error("ppl file is required unless --list-refs, --print-bounds, or --list-aliases is used")
     if not args.ppl.exists():
         raise SystemExit(f"PPL file not found: {args.ppl}")
     if args.output and args.in_place:
@@ -1282,10 +1524,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise SystemExit(f"Netlist file not found: {args.netlist}")
         import_netlist_aliases(model, args.netlist)
     source_text = args.pcb.read_text(encoding="utf-8")
+    source_footprints = parse_footprints(source_text)
+    if args.infer_origin:
+        model.board.origin = infer_origin_from_footprints(source_footprints)
+        print(f"origin: inferred origin_x={_fmt_num(model.board.origin_x)} origin_y={_fmt_num(model.board.origin_y)}")
     run_validation = bool(args.validate or args.check)
     new_text, messages, report = apply_placements(source_text, model, strict=args.strict,
                                                   allow_suffix_match=not args.no_suffix_match,
-                                                  validate=run_validation)
+                                                  validate=run_validation, safe=bool(args.safe),
+                                                  allow_large_move=bool(args.allow_large_move),
+                                                  allow_outside_board=bool(args.allow_outside_board),
+                                                  cardinal_rotations=bool(args.cardinal_rotations))
     for message in messages:
         print(message)
     if args.report_json:
@@ -1306,14 +1555,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.dry_run:
         print(f"dry-run: {report['placements_applied']} placement(s) would be applied to "
               f"{report['footprints_total']} footprint(s); changed={changed}")
+        for item in report.get("placements", []):
+            rot_change = "yes" if item["rotation_changed"] else "no"
+            outside = "yes" if item["outside_board"] else "no"
+            print(f"  {item['ref']}: "
+                  f"old=({_fmt_num(item['original_x'])}, {_fmt_num(item['original_y'])}, {_fmt_num(item['original_rot'])}) "
+                  f"new=({_fmt_num(item['x'])}, {_fmt_num(item['y'])}, {_fmt_num(item['final_rot'])}) "
+                  f"delta=({_fmt_num(item['delta_x'])}, {_fmt_num(item['delta_y'])}) "
+                  f"rot_changed={rot_change} outside_board={outside}")
         return 0
 
     destination = args.pcb if args.in_place else (args.output or default_output_path(args.pcb))
+    sanity_check_output(source_text, new_text)
     if destination == args.pcb and not args.no_backup:
         backup = args.pcb.with_suffix(args.pcb.suffix + ".bak")
         shutil.copy2(args.pcb, backup)
         print(f"backup: {backup}")
-    destination.write_text(new_text, encoding="utf-8")
+    atomic_write_text(destination, new_text)
+    sanity_check_output(source_text, destination.read_text(encoding="utf-8"))
     print(f"wrote: {destination}")
     print(f"summary: {report['placements_applied']} placement(s), {report['rules_total']} rule(s), "
           f"{report['footprints_total']} footprint(s)")
