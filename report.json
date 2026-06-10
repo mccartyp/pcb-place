@@ -1,0 +1,75 @@
+{
+  "aliases": {},
+  "board": {
+    "height": 30.0,
+    "name": null,
+    "origin": [
+      0.0,
+      0.0
+    ],
+    "units": "mm",
+    "width": 50.0
+  },
+  "footprints_total": 8,
+  "locked_refs": [
+    "H1",
+    "H2"
+  ],
+  "messages": [
+    {
+      "level": "place",
+      "text": "place               H1 -> x=       3 y=       3 rot=      0  corner"
+    },
+    {
+      "level": "note",
+      "text": "locked 'H1': corner rule"
+    },
+    {
+      "level": "place",
+      "text": "place               H2 -> x=      47 y=       3 rot=      0  corner"
+    },
+    {
+      "level": "note",
+      "text": "locked 'H2': corner rule"
+    },
+    {
+      "level": "place",
+      "text": "place               J1 -> x=       0 y=      15 rot=    270  edge"
+    },
+    {
+      "level": "place",
+      "text": "place               J2 -> x=      50 y=      15 rot=     90  edge"
+    },
+    {
+      "level": "place",
+      "text": "place               U1 -> x=      25 y=      15 rot=      0  anchor"
+    },
+    {
+      "level": "place",
+      "text": "place               C1 -> x=      25 y=      13 rot=      0  satellite"
+    },
+    {
+      "level": "place",
+      "text": "place               D1 -> x=    12.5 y=      15 rot=      0  between"
+    },
+    {
+      "level": "place",
+      "text": "place               C2 -> x=      29 y=      15 rot=      0  orbit"
+    }
+  ],
+  "placements_applied": 8,
+  "regions": {},
+  "rules_total": 8,
+  "updated_refs": [
+    "C1",
+    "C2",
+    "D1",
+    "H1",
+    "H2",
+    "J1",
+    "J2",
+    "U1"
+  ],
+  "validation_errors": 0,
+  "version": "0.3.0"
+}
