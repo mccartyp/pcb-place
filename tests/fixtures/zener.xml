@@ -1,0 +1,6 @@
+<export>
+  <components>
+    <comp ref="U1"><property name="path" value="/MCU/U_MCU" /></comp>
+    <comp ref="C1"><property name="hierarchical_path" value="/MCU/C_VDD_1/C" /></comp>
+  </components>
+</export>

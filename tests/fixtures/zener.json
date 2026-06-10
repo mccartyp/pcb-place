@@ -1,0 +1,7 @@
+{
+  "components": [
+    {"path": "/MCU/U_MCU", "ref": "U1"},
+    {"hierarchical_path": "MCU.C_VDD_1.C", "reference": "C1"},
+    {"instance": "HDMI_IN.J1", "designator": "J1"}
+  ]
+}
