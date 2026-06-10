@@ -11,25 +11,46 @@ It bridges the gap between generated electrical design and physical PCB layout b
 `pcb-place` is designed to complement hardware-as-code flows such as [`pcb`](https://github.com/diodeinc/pcb) and Zener:
 
 ```text
-Zener design
-     ↓
+Zener
+  ↓
 pcb build
-     ↓
+  ↓
 pcb layout
-     ↓
-pcb-place placement.ppl
-     ↓
-KiCad PCB
-     ↓
-Routing / DRC / review
+  ↓
+pcb-place --netlist .pcb/build/default.net
+  ↓
+KiCad
+  ↓
+routing / review
+```
+
+A typical command is:
+
+```bash
+pcb build board.zen
+pcb layout board.zen
+pcb-place layout/SomeBoard/layout.kicad_pcb placement.ppl \
+  --netlist .pcb/build/default.net \
+  -o layout/SomeBoard/layout.placed.kicad_pcb
 ```
 
 In this workflow:
 
 - Zener expresses electrical intent: components, nets, hierarchy, interfaces, and constraints.
+- `pcb build` emits a netlist artifact that may preserve semantic instance paths such as `MCU.U_MCU` or `PWR.U_BUCK`.
 - `pcb layout` creates or updates the KiCad PCB artifact.
-- `pcb-place` applies explicit physical placement intent.
+- KiCad footprints may have generated raw references such as `U1`, `U2`, `C1`, and `C2`. Those references are valid, but they are not stable semantic placement names.
+- `pcb-place --netlist ...` imports a semantic alias map so placement intent can use names from the design hierarchy.
 - KiCad remains the editable board file and review environment.
+
+Netlist aliasing matters because physical intent often belongs to semantic instances, not generated references. For example, a placement file can now say:
+
+```python
+Anchor("MCU.U_MCU", x=35, y=20)
+Satellite("MCU.C_VDD_1.C", parent="MCU.U_MCU", side="top")
+```
+
+Raw KiCad references still work unchanged, so `Anchor("U6", x=35, y=20)` remains valid. Explicit `Alias("name", "ref")` rules in `placement.ppl` override imported netlist aliases when both define the same semantic name.
 
 `pcb-place` can also be used without `pcb`:
 
@@ -68,6 +89,7 @@ Implemented today:
 - Deterministic footprint placement
 - Python/Starlark-like `.ppl` placement DSL
 - Exact and hierarchical suffix reference matching
+- Optional Zener/pcb netlist alias imports for semantic instance paths
 - JSON reports
 - Dry-run, check, validation, and list-refs modes
 - Basic validation for board-boundary, keepout-origin, and near-coincident placed footprints
@@ -142,10 +164,17 @@ pcb-place board.kicad_pcb --list-refs
 pcb-place board.kicad_pcb --list-refs --format json
 ```
 
-Emit a machine-readable report:
+List semantic aliases imported from a netlist:
 
 ```bash
-pcb-place board.kicad_pcb placement.ppl --report-json report.json
+pcb-place --netlist .pcb/build/default.net --list-aliases
+pcb-place --netlist .pcb/build/default.net --list-aliases --format json
+```
+
+Emit a machine-readable report, including alias diagnostics when `--netlist` is used:
+
+```bash
+pcb-place board.kicad_pcb placement.ppl --netlist .pcb/build/default.net --report-json report.json
 ```
 
 ## Placement DSL example

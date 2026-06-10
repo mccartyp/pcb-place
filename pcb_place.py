@@ -45,8 +45,9 @@ import math
 import re
 import shutil
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 __version__ = "0.3.0"
 
@@ -110,6 +111,16 @@ class BoardInfo:
 
 
 @dataclasses.dataclass
+class AliasDiagnostics:
+    """Diagnostics and metadata for imported netlist aliases."""
+
+    warnings: List[str] = dataclasses.field(default_factory=list)
+    errors: List[str] = dataclasses.field(default_factory=list)
+    source: Optional[str] = None
+    parser: Optional[str] = None
+
+
+@dataclasses.dataclass
 class PlacementModel:
     """In-memory representation of all placement rules declared in .ppl.
 
@@ -123,6 +134,8 @@ class PlacementModel:
     board: BoardInfo = dataclasses.field(default_factory=BoardInfo)
     rules: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
     aliases: Dict[str, str] = dataclasses.field(default_factory=dict)
+    imported_aliases: Dict[str, str] = dataclasses.field(default_factory=dict)
+    alias_diagnostics: AliasDiagnostics = dataclasses.field(default_factory=AliasDiagnostics)
     regions: Dict[str, Dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     def add(self, rule_type: str, **kwargs: Any) -> None:
@@ -181,6 +194,233 @@ def _require_board_size(model: PlacementModel, rule_name: str) -> Tuple[float, f
 
 def _rot_or_none(rot: Optional[Number | str]) -> Optional[Number | str]:
     return None if rot is None else rot
+
+
+def normalize_alias_path(value: Any) -> str:
+    """Normalize a Zener/pcb semantic instance path into a DSL alias.
+
+    Normalization is intentionally conservative: it strips whitespace, removes
+    leading separators, converts slash-separated hierarchy to dot-separated
+    hierarchy, and collapses duplicate dots.  The result is suitable for
+    matching placement DSL references such as ``MCU.U_MCU``.
+    """
+
+    text = str(value).strip()
+    text = re.sub(r"\s+", "", text)
+    text = text.strip("/.")
+    text = text.replace("/", ".")
+    text = re.sub(r"\.+", ".", text)
+    return text
+
+
+def _looks_like_ref(value: Any) -> bool:
+    text = str(value).strip()
+    return bool(re.fullmatch(r"[A-Za-z]+[A-Za-z0-9_.:-]*\d+[A-Za-z0-9_.:-]*", text))
+
+
+# ---------------------------------------------------------------------------
+# Netlist alias parsing
+# ---------------------------------------------------------------------------
+
+
+_PATH_KEYS = {"path", "instance", "hierarchical_path", "hierarchicalPath", "instance_path", "instancePath"}
+_REF_KEYS = {"ref", "reference", "designator"}
+
+
+def _add_imported_alias(aliases: Dict[str, str], conflicts: Dict[str, Set[str]], semantic: Any, ref: Any) -> None:
+    alias = normalize_alias_path(semantic)
+    raw_ref = _normalize_ref(str(ref))
+    if not alias or not raw_ref or alias == raw_ref:
+        return
+    if alias in aliases and aliases[alias] != raw_ref:
+        conflicts.setdefault(alias, {aliases[alias]}).add(raw_ref)
+        return
+    aliases[alias] = raw_ref
+
+
+def _extract_aliases_from_obj(obj: Any, aliases: Dict[str, str], conflicts: Dict[str, Set[str]]) -> None:
+    """Recursively find likely semantic-path/reference pairs in JSON-like data."""
+
+    if isinstance(obj, dict):
+        found_ref: Optional[Any] = None
+        found_path: Optional[Any] = None
+        lower_to_key = {str(k).lower(): k for k in obj}
+        for key in _REF_KEYS:
+            actual = lower_to_key.get(key.lower())
+            if actual is not None and _looks_like_ref(obj[actual]):
+                found_ref = obj[actual]
+                break
+        for key in _PATH_KEYS:
+            actual = lower_to_key.get(key.lower())
+            if actual is not None:
+                candidate = normalize_alias_path(obj[actual])
+                if candidate:
+                    found_path = obj[actual]
+                    break
+        if found_path is not None and found_ref is not None:
+            _add_imported_alias(aliases, conflicts, found_path, found_ref)
+        # Some artifacts use arbitrary component IDs whose nested value contains
+        # either a reference or a path.  Recurse regardless of whether this level
+        # yielded a pair.
+        for value in obj.values():
+            _extract_aliases_from_obj(value, aliases, conflicts)
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract_aliases_from_obj(item, aliases, conflicts)
+
+
+def _parse_json_netlist(text: str) -> Tuple[Dict[str, str], List[str]]:
+    data = json.loads(text)
+    aliases: Dict[str, str] = {}
+    conflicts: Dict[str, Set[str]] = {}
+    _extract_aliases_from_obj(data, aliases, conflicts)
+    errors = [f"netlist alias {alias!r} maps to multiple refs: {', '.join(sorted(refs))}"
+              for alias, refs in sorted(conflicts.items())]
+    return aliases, errors
+
+
+def _parse_xml_netlist(text: str) -> Tuple[Dict[str, str], List[str]]:
+    root = ET.fromstring(text)
+    aliases: Dict[str, str] = {}
+    conflicts: Dict[str, Set[str]] = {}
+    for elem in root.iter():
+        values: Dict[str, str] = {k: v for k, v in elem.attrib.items()}
+        for child in list(elem):
+            tag = child.tag.split("}", 1)[-1]
+            if child.text and child.text.strip():
+                values.setdefault(tag, child.text.strip())
+        ref = None
+        semantic = None
+        for key, value in values.items():
+            if key.lower() in {k.lower() for k in _REF_KEYS} and _looks_like_ref(value):
+                ref = value
+                break
+        for key, value in values.items():
+            if key.lower() in {k.lower() for k in _PATH_KEYS}:
+                semantic = value
+                break
+        # KiCad XML commonly has <comp ref="U1"><property name="path" value="/MCU/U_MCU"/></comp>.
+        if elem.tag.split("}", 1)[-1] == "comp" and ref is None:
+            ref = elem.attrib.get("ref")
+        if semantic is None:
+            for child in elem:
+                tag = child.tag.split("}", 1)[-1].lower()
+                name = (child.attrib.get("name") or child.attrib.get("key") or "").lower()
+                if tag in {"property", "field"} and name in {k.lower() for k in _PATH_KEYS}:
+                    semantic = child.attrib.get("value") or child.text
+                    break
+        if semantic is not None and ref is not None:
+            _add_imported_alias(aliases, conflicts, semantic, ref)
+    errors = [f"netlist alias {alias!r} maps to multiple refs: {', '.join(sorted(refs))}"
+              for alias, refs in sorted(conflicts.items())]
+    return aliases, errors
+
+
+def _sexp_tokens(text: str) -> List[str]:
+    return re.findall(r'"(?:\\.|[^"\\])*"|\(|\)|[^\s()]+', text)
+
+
+def _parse_sexp(tokens: List[str]) -> Any:
+    def parse_at(index: int) -> Tuple[Any, int]:
+        if index >= len(tokens):
+            raise ValueError("unexpected end of S-expression")
+        token = tokens[index]
+        if token == "(":
+            result = []
+            index += 1
+            while index < len(tokens) and tokens[index] != ")":
+                item, index = parse_at(index)
+                result.append(item)
+            if index >= len(tokens):
+                raise ValueError("unbalanced S-expression")
+            return result, index + 1
+        if token == ")":
+            raise ValueError("unexpected ')' in S-expression")
+        if token.startswith('"') and token.endswith('"'):
+            return bytes(token[1:-1], "utf-8").decode("unicode_escape"), index + 1
+        return token, index + 1
+
+    parsed, next_index = parse_at(0)
+    if next_index != len(tokens):
+        # Multiple top-level forms: keep them all under one synthetic root.
+        items = [parsed]
+        while next_index < len(tokens):
+            item, next_index = parse_at(next_index)
+            items.append(item)
+        return items
+    return parsed
+
+
+def _walk_sexp(node: Any) -> Iterable[List[Any]]:
+    if isinstance(node, list):
+        yield node
+        for item in node:
+            yield from _walk_sexp(item)
+
+
+def _parse_sexp_netlist(text: str) -> Tuple[Dict[str, str], List[str]]:
+    tree = _parse_sexp(_sexp_tokens(text))
+    aliases: Dict[str, str] = {}
+    conflicts: Dict[str, Set[str]] = {}
+    path_names = {k.lower() for k in _PATH_KEYS}
+    ref_names = {k.lower() for k in _REF_KEYS}
+    for form in _walk_sexp(tree):
+        values: Dict[str, str] = {}
+        for item in form[1:]:
+            if isinstance(item, list) and len(item) >= 2 and isinstance(item[0], str):
+                key = item[0].lower()
+                if key in path_names | ref_names and not isinstance(item[1], list):
+                    values[key] = str(item[1])
+        ref = next((values[k] for k in ref_names if k in values and _looks_like_ref(values[k])), None)
+        semantic = next((values[k] for k in path_names if k in values), None)
+        if ref is not None and semantic is not None:
+            _add_imported_alias(aliases, conflicts, semantic, ref)
+    errors = [f"netlist alias {alias!r} maps to multiple refs: {', '.join(sorted(refs))}"
+              for alias, refs in sorted(conflicts.items())]
+    return aliases, errors
+
+
+def parse_netlist_aliases(path: Path) -> Tuple[Dict[str, str], AliasDiagnostics]:
+    """Parse a Zener/pcb netlist artifact and return semantic aliases.
+
+    The parser is deliberately dependency-free and defensive.  It first tries
+    JSON, then KiCad-style XML, then an S-expression-like fallback.  Only clear
+    ``semantic_path -> raw_ref`` pairs are imported; raw-reference identity
+    aliases are added later by the resolver so existing placement files remain
+    unchanged.
+    """
+
+    text = path.read_text(encoding="utf-8")
+    stripped = text.lstrip()
+    attempts: List[Tuple[str, Any]] = []
+    if stripped.startswith("{") or stripped.startswith("["):
+        attempts.append(("json", _parse_json_netlist))
+    if stripped.startswith("<"):
+        attempts.append(("xml", _parse_xml_netlist))
+    if stripped.startswith("("):
+        attempts.append(("sexp", _parse_sexp_netlist))
+    for name, func in (("json", _parse_json_netlist), ("xml", _parse_xml_netlist), ("sexp", _parse_sexp_netlist)):
+        if name not in {attempt[0] for attempt in attempts}:
+            attempts.append((name, func))
+
+    failures: List[str] = []
+    for name, func in attempts:
+        try:
+            aliases, errors = func(text)
+        except Exception as exc:  # defensive format probing
+            failures.append(f"{name}: {exc}")
+            continue
+        diagnostics = AliasDiagnostics(source=str(path), parser=name, errors=errors)
+        if aliases or errors:
+            return aliases, diagnostics
+    return {}, AliasDiagnostics(source=str(path), parser=None,
+                                warnings=["no semantic aliases found in netlist; tried " + "; ".join(failures)])
+
+
+def import_netlist_aliases(model: PlacementModel, path: Path) -> None:
+    aliases, diagnostics = parse_netlist_aliases(path)
+    model.imported_aliases = aliases
+    model.alias_diagnostics = diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -596,25 +836,53 @@ class PlacementEngine:
         self.updates: Dict[str, Tuple[float, float, Optional[float]]] = {}
         self.ref_cache: Dict[str, str] = {}
         self.locked: Dict[str, str] = {}
+        for error in model.alias_diagnostics.errors:
+            self.messages.append(Message("error", error))
+        for warning in model.alias_diagnostics.warnings:
+            self.messages.append(Message("warn", warning))
+        if self.strict and model.alias_diagnostics.errors:
+            raise PlacementError("netlist alias validation failed: " + "; ".join(model.alias_diagnostics.errors))
+
+    def alias_map(self) -> Dict[str, str]:
+        """Return the effective alias map used by the resolver."""
+
+        aliases = {ref: ref for ref in self.footprints}
+        aliases.update(self.model.imported_aliases)
+        aliases.update(self.model.aliases)
+        return aliases
 
     def resolve_ref(self, ref: str) -> Optional[str]:
         """Resolve a DSL ref/alias to an actual KiCad footprint reference."""
 
-        ref = self.model.aliases.get(ref, ref)
-        if ref in self.ref_cache:
-            return self.ref_cache[ref]
-        if ref in self.footprints:
-            self.ref_cache[ref] = ref
-            return ref
+        original_ref = _normalize_ref(ref)
+        if original_ref in self.ref_cache:
+            return self.ref_cache[original_ref]
+        alias_map = self.alias_map()
+        target = alias_map.get(original_ref, original_ref)
+        if target in self.footprints:
+            self.ref_cache[original_ref] = target
+            return target
+
         if self.allow_suffix_match:
-            suffixes = [f".{ref}", f"/{ref}", f":{ref}"]
-            matches = [candidate for candidate in self.footprints if any(candidate.endswith(s) for s in suffixes)]
-            if len(matches) == 1:
-                self.messages.append(Message("note", f"resolved {ref!r} to hierarchical footprint {matches[0]!r}"))
-                self.ref_cache[ref] = matches[0]
-                return matches[0]
-            if len(matches) > 1:
-                self._warn_or_raise(f"ambiguous footprint reference {ref!r}; matches: {', '.join(matches)}")
+            matches: Set[str] = set()
+            normalized_query = normalize_alias_path(original_ref)
+            for alias, candidate_ref in alias_map.items():
+                if alias == original_ref:
+                    continue
+                normalized_alias = normalize_alias_path(alias)
+                if normalized_alias.endswith(f".{normalized_query}") or normalized_alias.endswith(f":{original_ref}"):
+                    matches.add(candidate_ref)
+            suffixes = [f".{original_ref}", f"/{original_ref}", f":{original_ref}"]
+            for candidate in self.footprints:
+                if any(candidate.endswith(s) for s in suffixes):
+                    matches.add(candidate)
+            sorted_matches = sorted(matches)
+            if len(sorted_matches) == 1:
+                self.messages.append(Message("note", f"resolved {original_ref!r} to {sorted_matches[0]!r} by unambiguous suffix match"))
+                self.ref_cache[original_ref] = sorted_matches[0]
+                return sorted_matches[0]
+            if len(sorted_matches) > 1:
+                self._warn_or_raise(f"ambiguous alias/reference {original_ref!r}; matches: {', '.join(sorted_matches)}")
                 return None
         return None
 
@@ -804,7 +1072,8 @@ class PlacementEngine:
                 dy = float(rule.get("dy", 0.0))
                 selected = rule.get("refs")
                 if selected is None:
-                    suffixes = [ref[len(source_prefix):] for ref in self.footprints if ref.startswith(source_prefix)]
+                    candidates = list(self.alias_map())
+                    suffixes = [alias[len(source_prefix):] for alias in candidates if alias.startswith(source_prefix)]
                 else:
                     suffixes = list(selected)
                 if not suffixes:
@@ -891,8 +1160,8 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
     engine.apply()
     validation_messages = validate_placements(engine) if validate else []
     engine.messages.extend(validation_messages)
-    if strict and any(m.level == "error" for m in validation_messages):
-        raise PlacementError("validation failed: " + "; ".join(m.text for m in validation_messages if m.level == "error"))
+    if strict and any(m.level == "error" for m in engine.messages):
+        raise PlacementError("validation failed: " + "; ".join(m.text for m in engine.messages if m.level == "error"))
     rewritten = text
     for ref, (x, y, rot) in sorted(engine.updates.items(), key=lambda kv: footprints[kv[0]].start, reverse=True):
         fp = footprints[ref]
@@ -903,6 +1172,9 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "rules_total": len(model.rules),
         "placements_applied": len(engine.updates),
         "aliases": dict(model.aliases),
+        "imported_aliases": dict(model.imported_aliases),
+        "effective_aliases": engine.alias_map(),
+        "alias_diagnostics": dataclasses.asdict(model.alias_diagnostics),
         "regions": dict(model.regions),
         "locked_refs": sorted(engine.locked),
         "validation_errors": sum(1 for m in engine.messages if m.level == "error"),
@@ -933,6 +1205,26 @@ def list_refs(pcb_path: Path, *, fmt: str = "text") -> int:
     return 0
 
 
+
+def list_aliases(netlist_path: Path, *, fmt: str = "text") -> int:
+    """List semantic aliases parsed from a Zener/pcb netlist artifact."""
+
+    aliases, diagnostics = parse_netlist_aliases(netlist_path)
+    if fmt == "json":
+        print(json.dumps({
+            "aliases": aliases,
+            "diagnostics": dataclasses.asdict(diagnostics),
+        }, indent=2, sort_keys=True))
+    else:
+        for alias, ref in sorted(aliases.items()):
+            print(f"{alias} -> {ref}")
+        print(f"\n{len(aliases)} alias(es)")
+        for error in diagnostics.errors:
+            print(f"error: {error}", file=sys.stderr)
+        for warning in diagnostics.warnings:
+            print(f"warn: {warning}", file=sys.stderr)
+    return 1 if diagnostics.errors else 0
+
 def default_output_path(pcb_path: Path) -> Path:
     if pcb_path.name.endswith(".kicad_pcb"):
         return pcb_path.with_name(pcb_path.name[:-10] + ".placed.kicad_pcb")
@@ -951,8 +1243,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-backup", action="store_true", help="Do not write .bak when editing in-place")
     parser.add_argument("--strict", action="store_true", help="Treat missing/ambiguous refs as errors")
     parser.add_argument("--no-suffix-match", action="store_true", help="Disable hierarchical suffix reference matching")
+    parser.add_argument("--netlist", type=Path, help="Optional Zener/pcb netlist artifact used to import semantic aliases")
     parser.add_argument("--list-refs", action="store_true", help="List footprint references in the PCB and exit")
-    parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --list-refs")
+    parser.add_argument("--list-aliases", action="store_true", help="List semantic aliases parsed from --netlist and exit")
+    parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --list-refs or --list-aliases")
     parser.add_argument("--report-json", type=Path, help="Write machine-readable placement report JSON")
     parser.add_argument("--version", action="version", version=f"pcb-place {__version__}")
     return parser
@@ -961,6 +1255,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.list_aliases:
+        if args.netlist is None:
+            parser.error("--netlist is required with --list-aliases")
+        if not args.netlist.exists():
+            raise SystemExit(f"Netlist file not found: {args.netlist}")
+        return list_aliases(args.netlist, fmt=args.format)
     if args.pcb is None:
         parser.error("pcb file is required")
     if not args.pcb.exists():
@@ -968,13 +1268,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.list_refs:
         return list_refs(args.pcb, fmt=args.format)
     if args.ppl is None:
-        parser.error("ppl file is required unless --list-refs is used")
+        parser.error("ppl file is required unless --list-refs or --list-aliases is used")
     if not args.ppl.exists():
         raise SystemExit(f"PPL file not found: {args.ppl}")
     if args.output and args.in_place:
         parser.error("--output and --in-place are mutually exclusive")
 
     model = load_ppl(args.ppl)
+    if args.netlist is not None:
+        if not args.netlist.exists():
+            raise SystemExit(f"Netlist file not found: {args.netlist}")
+        import_netlist_aliases(model, args.netlist)
     source_text = args.pcb.read_text(encoding="utf-8")
     run_validation = bool(args.validate or args.check)
     new_text, messages, report = apply_placements(source_text, model, strict=args.strict,
