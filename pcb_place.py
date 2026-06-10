@@ -959,52 +959,88 @@ def parse_footprints(text: str) -> Dict[str, Footprint]:
 
 
 
-def _edge_cuts_points(text: str) -> List[Point]:
-    """Return points from supported Edge.Cuts drawings.
+def _edge_cuts_primitives(text: str) -> Tuple[List[Tuple[Point, Point]], List[Tuple[Point, Point]]]:
+    """Return Edge.Cuts rectangles and line segments from supported KiCad drawings."""
 
-    KiCad stores board outlines as general graphics in the root board file.
-    This intentionally supports rectangular geometry first while keeping the
-    parser as a simple drawing-to-point collector for future shapes.
-    """
-
-    points: List[Point] = []
+    rects: List[Tuple[Point, Point]] = []
+    lines: List[Tuple[Point, Point]] = []
     for match in re.finditer(r'(?m)^\s*\((gr_rect|gr_line)\b', text):
         block = text[match.start():_find_matching_paren(text, text.find("(", match.start()))]
         if '(layer "Edge.Cuts")' not in block:
             continue
+        point_match = re.search(
+            r'\(start\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\).*?\(end\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\)',
+            block,
+            flags=re.S,
+        )
+        if not point_match:
+            continue
+        x0, y0, x1, y1 = map(float, point_match.groups())
         if match.group(1) == "gr_rect":
-            point_match = re.search(
-                r'\(start\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\).*?\(end\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\)',
-                block,
-                flags=re.S,
-            )
-            if point_match:
-                x0, y0, x1, y1 = map(float, point_match.groups())
-                points.extend([(x0, y0), (x1, y1)])
-        elif match.group(1) == "gr_line":
-            point_match = re.search(
-                r'\(start\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\).*?\(end\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\)',
-                block,
-                flags=re.S,
-            )
-            if point_match:
-                x0, y0, x1, y1 = map(float, point_match.groups())
-                points.extend([(x0, y0), (x1, y1)])
-    return points
+            rects.append(((x0, y0), (x1, y1)))
+        else:
+            lines.append(((x0, y0), (x1, y1)))
+    return rects, lines
 
-def parse_edge_cuts_geometry(text: str) -> Optional[BoardGeometry]:
-    points = _edge_cuts_points(text)
-    if not points:
-        return None
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    origin_x, origin_y = min(xs), min(ys)
-    width, height = max(xs) - origin_x, max(ys) - origin_y
+
+def _geometry_from_corners(a: Point, b: Point, *, source: str = "edge_cuts") -> BoardGeometry:
+    origin_x, origin_y = min(a[0], b[0]), min(a[1], b[1])
+    width, height = max(a[0], b[0]) - origin_x, max(a[1], b[1]) - origin_y
     if width <= 0 or height <= 0:
         raise PlacementError("Edge.Cuts geometry has non-positive width or height")
-    # For now pcb-place only understands rectangular board geometry.
-    return BoardGeometry(origin_x, origin_y, width, height, "edge_cuts")
+    return BoardGeometry(origin_x, origin_y, width, height, source)
 
+
+def _line_rectangle_geometry(lines: List[Tuple[Point, Point]], *, eps: float = 1e-6) -> Optional[BoardGeometry]:
+    """Return geometry only when four Edge.Cuts lines form one axis-aligned rectangle."""
+
+    if not lines:
+        return None
+    if len(lines) != 4:
+        raise PlacementError("Unsupported Edge.Cuts geometry: rectangular gr_line boards must have exactly four line segments")
+
+    points = [point for line in lines for point in line]
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    if x1 - x0 <= eps or y1 - y0 <= eps:
+        raise PlacementError("Edge.Cuts geometry has non-positive width or height")
+
+    def point_key(point: Point) -> Tuple[int, int]:
+        return (round(point[0] / eps), round(point[1] / eps))
+
+    def segment_key(a: Point, b: Point) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        ka, kb = point_key(a), point_key(b)
+        return (ka, kb) if ka <= kb else (kb, ka)
+
+    expected = {
+        segment_key((x0, y0), (x1, y0)),
+        segment_key((x1, y0), (x1, y1)),
+        segment_key((x1, y1), (x0, y1)),
+        segment_key((x0, y1), (x0, y0)),
+    }
+    actual: Set[Tuple[Tuple[int, int], Tuple[int, int]]] = set()
+    for a, b in lines:
+        horizontal = abs(a[1] - b[1]) <= eps and abs(a[0] - b[0]) > eps
+        vertical = abs(a[0] - b[0]) <= eps and abs(a[1] - b[1]) > eps
+        if not (horizontal or vertical):
+            raise PlacementError("Unsupported Edge.Cuts geometry: only axis-aligned rectangular gr_line outlines are supported")
+        actual.add(segment_key(a, b))
+    if actual != expected:
+        raise PlacementError("Unsupported Edge.Cuts geometry: gr_line segments do not form a single rectangle")
+    return BoardGeometry(x0, y0, x1 - x0, y1 - y0, "edge_cuts")
+
+
+def parse_edge_cuts_geometry(text: str) -> Optional[BoardGeometry]:
+    rects, lines = _edge_cuts_primitives(text)
+    if not rects and not lines:
+        return None
+    if rects:
+        if len(rects) != 1 or lines:
+            raise PlacementError("Unsupported Edge.Cuts geometry: expected one gr_rect or one four-line rectangle")
+        return _geometry_from_corners(rects[0][0], rects[0][1])
+    return _line_rectangle_geometry(lines)
 
 def resolve_board_geometry(text: str, model: Optional[PlacementModel], footprints: Mapping[str, Footprint],
                            *, allow_footprint_fallback: bool = True) -> Optional[BoardGeometry]:

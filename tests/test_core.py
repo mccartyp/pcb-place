@@ -514,3 +514,30 @@ Board(width=70, height=70, origin_x=140, origin_y=52, emit_outline=True)
     geometry = BoardGeometry.from_edge_cuts(out.read_text())
     assert geometry is not None
     assert geometry.origin_x == 140.0
+
+def _pcb_with_l_shaped_edge_lines() -> str:
+    return _pcb_with_at()[:-2] + '''  (gr_line (start 140 52) (end 210 52) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "l1"))
+  (gr_line (start 210 52) (end 210 82) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "l2"))
+  (gr_line (start 210 82) (end 170 82) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "l3"))
+  (gr_line (start 170 82) (end 170 122) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "l4"))
+  (gr_line (start 170 122) (end 140 122) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "l5"))
+  (gr_line (start 140 122) (end 140 52) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "l6"))
+)
+'''
+
+
+def _pcb_with_chamfered_edge_lines() -> str:
+    return _pcb_with_at()[:-2] + '''  (gr_line (start 140 52) (end 200 52) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "c1"))
+  (gr_line (start 200 52) (end 210 62) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "c2"))
+  (gr_line (start 210 62) (end 210 122) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "c3"))
+  (gr_line (start 210 122) (end 140 122) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "c4"))
+  (gr_line (start 140 122) (end 140 52) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "c5"))
+)
+'''
+
+
+def test_edge_cuts_rejects_non_rectangular_gr_line_outlines():
+    with pytest.raises(PlacementError, match="Unsupported Edge.Cuts geometry"):
+        BoardGeometry.from_edge_cuts(_pcb_with_l_shaped_edge_lines())
+    with pytest.raises(PlacementError, match="Unsupported Edge.Cuts geometry"):
+        BoardGeometry.from_edge_cuts(_pcb_with_chamfered_edge_lines())
