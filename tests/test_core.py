@@ -266,12 +266,13 @@ Anchor("U1", x=10, y=5)
         capture_output=True,
         text=True,
     )
-    assert "origin_x=140" in result.stdout
+    assert "origin source: board_definition" in result.stdout
+    assert "origin_x=0" in result.stdout
     assert "U1:" in result.stdout
     payload = json.loads(report.read_text())
-    assert payload["board"]["origin_x"] == 140.0
-    assert payload["bounds"]["min_x"] == 140.0
-    assert payload["placements"][0]["delta_x"] == 10.0
+    assert payload["board"]["origin_x"] == 0.0
+    assert payload["footprint_bounds"]["min_x"] == 140.0
+    assert payload["placements"][0]["delta_x"] == -130.0
 
 
 def test_rotation_form_preserved_and_explicit_rot_changes(tmp_path):
@@ -407,3 +408,109 @@ Anchor("U1", x=20, y=0)
     payload = json.loads(report.read_text())
     assert payload["validation_errors"] >= 1
     assert payload["placements"][0]["outside_board"] is True
+
+from pcb_place import BoardGeometry, emit_board_outline
+
+
+def _pcb_with_edge_rect() -> str:
+    return _pcb_with_at()[:-2] + '''  (gr_rect (start 140 52) (end 210 122) (stroke (width 0.1) (type default)) (fill none) (layer "Edge.Cuts") (uuid "edge-rect"))
+)
+'''
+
+
+def _pcb_with_edge_lines() -> str:
+    return _pcb_with_at()[:-2] + '''  (gr_line (start 140 52) (end 210 52) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "e1"))
+  (gr_line (start 210 52) (end 210 122) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "e2"))
+  (gr_line (start 210 122) (end 140 122) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "e3"))
+  (gr_line (start 140 122) (end 140 52) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "e4"))
+)
+'''
+
+
+def test_edge_cuts_gr_rect_parsing():
+    geometry = BoardGeometry.from_edge_cuts(_pcb_with_edge_rect())
+    assert geometry is not None
+    assert geometry.source == "edge_cuts"
+    assert geometry.origin_x == 140.0
+    assert geometry.origin_y == 52.0
+    assert geometry.width == 70.0
+    assert geometry.height == 70.0
+
+
+def test_edge_cuts_gr_line_rectangle_parsing_and_missing():
+    geometry = BoardGeometry.from_edge_cuts(_pcb_with_edge_lines())
+    assert geometry is not None
+    assert geometry.origin_x == 140.0
+    assert geometry.height == 70.0
+    assert BoardGeometry.from_edge_cuts(_pcb_with_at()) is None
+
+
+def test_emit_outline_true_generates_outline_and_conflict(tmp_path):
+    ppl = tmp_path / "outline.ppl"
+    ppl.write_text('''
+Board(width=70, height=70, origin_x=140, origin_y=52, emit_outline=True)
+Anchor("U1", x=10, y=8)
+''')
+    out, _messages, report = apply_placements(_pcb_with_at(), load_ppl(ppl), strict=True)
+    assert 'layer "Edge.Cuts"' in out
+    assert BoardGeometry.from_edge_cuts(out).width == 70.0
+    assert report["board_geometry"]["source"] == "placement_file"
+
+    conflict = tmp_path / "conflict.ppl"
+    conflict.write_text('''
+Board(width=80, height=70, origin_x=140, origin_y=52, emit_outline=True)
+Anchor("U1", x=10, y=8)
+''')
+    with pytest.raises(PlacementError, match="conflicts"):
+        apply_placements(_pcb_with_edge_rect(), load_ppl(conflict), strict=True)
+
+
+def test_geometry_aware_validation_prefers_edge_cuts(tmp_path):
+    ppl = tmp_path / "edge-authoritative.ppl"
+    ppl.write_text('''
+Board(width=300, height=300)
+Anchor("U1", x=5, y=5)
+''')
+    with pytest.raises(PlacementError, match="outside Board"):
+        apply_placements(_pcb_with_edge_rect(), load_ppl(ppl), strict=True, safe=True)
+
+
+def test_cli_print_board_and_improved_print_bounds(tmp_path):
+    pcb = tmp_path / "edge.kicad_pcb"
+    pcb.write_text(_pcb_with_edge_rect())
+    board = subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), "--print-board"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "source=edge_cuts" in board.stdout
+    assert "width=70" in board.stdout
+    bounds = subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), "--print-bounds"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "footprint_bounds:" in bounds.stdout
+    assert "board_bounds:" in bounds.stdout
+    assert "source=edge_cuts" in bounds.stdout
+
+
+def test_cli_emit_outline_only(tmp_path):
+    pcb = tmp_path / "no-edge.kicad_pcb"
+    ppl = tmp_path / "outline.ppl"
+    out = tmp_path / "outline.kicad_pcb"
+    pcb.write_text(_pcb_with_at())
+    ppl.write_text('''
+Board(width=70, height=70, origin_x=140, origin_y=52, emit_outline=True)
+''')
+    subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--emit-outline-only", str(out)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    geometry = BoardGeometry.from_edge_cuts(out.read_text())
+    assert geometry is not None
+    assert geometry.origin_x == 140.0
