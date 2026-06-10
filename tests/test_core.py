@@ -208,3 +208,202 @@ Anchor("U_MISSING", x=1, y=2)
     import_netlist_aliases(model, netlist)
     with pytest.raises(PlacementError, match="missing footprint"):
         apply_placements((ROOT / "tests/fixtures/simple.kicad_pcb").read_text(), model, strict=True)
+
+
+def _pcb_with_at(at_line: str = "(at 140 60)") -> str:
+    return f'''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    {at_line}
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+  )
+  (footprint "Test:C" (layer "F.Cu")
+    (at 150 70 45)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+  )
+)
+'''
+
+
+def test_board_origin_mapping_and_default_origin(tmp_path):
+    with_origin = tmp_path / "with_origin.ppl"
+    with_origin.write_text('''
+Board(width=70, height=40, origin_x=140, origin_y=60)
+Anchor("U1", x=10, y=5)
+''')
+    out, _messages, report = apply_placements(_pcb_with_at(), load_ppl(with_origin), strict=True)
+    assert '(at 150 65)' in out
+    assert report["board"]["origin_x"] == 140.0
+
+    default_origin = tmp_path / "default_origin.ppl"
+    default_origin.write_text('''
+Board(width=70, height=40)
+Anchor("U1", x=10, y=5)
+''')
+    out, _messages, report = apply_placements(_pcb_with_at(), load_ppl(default_origin), strict=True)
+    assert '(at 10 5)' in out
+    assert report["board"]["origin_x"] == 0.0
+
+
+def test_cli_infer_origin_and_print_bounds(tmp_path):
+    pcb = tmp_path / "origin.kicad_pcb"
+    ppl = tmp_path / "origin.ppl"
+    report = tmp_path / "report.json"
+    pcb.write_text(_pcb_with_at())
+    ppl.write_text('''
+Board(width=70, height=40)
+Anchor("U1", x=10, y=5)
+''')
+    bounds = subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), "--print-bounds"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "min_x=140" in bounds.stdout
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--infer-origin", "--dry-run", "--report-json", str(report)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "origin_x=140" in result.stdout
+    assert "U1:" in result.stdout
+    payload = json.loads(report.read_text())
+    assert payload["board"]["origin_x"] == 140.0
+    assert payload["bounds"]["min_x"] == 140.0
+    assert payload["placements"][0]["delta_x"] == 10.0
+
+
+def test_rotation_form_preserved_and_explicit_rot_changes(tmp_path):
+    no_rot = tmp_path / "no_rot.ppl"
+    no_rot.write_text('''
+Board(width=300, height=200)
+Anchor("U1", x=10, y=20)
+Anchor("C1", x=30, y=40)
+''')
+    out, _messages, _report = apply_placements(_pcb_with_at(), load_ppl(no_rot), strict=True)
+    assert '(at 10 20)' in out
+    assert '(at 30 40 45)' in out
+
+    explicit = tmp_path / "explicit.ppl"
+    explicit.write_text('''
+Board(width=300, height=200)
+Anchor("U1", x=10, y=20, rot=90)
+''')
+    out, _messages, _report = apply_placements(_pcb_with_at(), load_ppl(explicit), strict=True)
+    assert '(at 10 20 90)' in out
+
+
+def test_path_rotation_opt_in_and_cardinal_rounding(tmp_path):
+    preserve = tmp_path / "preserve.ppl"
+    preserve.write_text('''
+Board(width=300, height=200)
+Inline("U1", a="U1", b="C1", t=0.5)
+''')
+    out, _messages, _report = apply_placements(_pcb_with_at("(at 140 60 12)"), load_ppl(preserve), strict=True)
+    assert '(at 145 65 12)' in out
+
+    path = tmp_path / "path.ppl"
+    path.write_text('''
+Board(width=300, height=200)
+Inline("U1", a="U1", b="C1", t=0.5, rot="path")
+''')
+    out, _messages, _report = apply_placements(_pcb_with_at("(at 140 60 12)"), load_ppl(path), strict=True)
+    assert '(at 145 65 45)' in out
+
+    arbitrary = tmp_path / "arbitrary.ppl"
+    arbitrary.write_text('''
+Board(width=300, height=200)
+Anchor("U1", x=10, y=20, rot=44)
+Anchor("C1", x=30, y=40, rot=44, allow_arbitrary_rotation=True)
+''')
+    out, _messages, _report = apply_placements(_pcb_with_at(), load_ppl(arbitrary), strict=True, cardinal_rotations=True)
+    assert '(at 10 20 0)' in out
+    assert '(at 30 40 44)' in out
+
+
+def test_safety_rejects_nonfinite_outside_huge_duplicate_and_locked(tmp_path):
+    text = _pcb_with_at()
+    inf_ppl = tmp_path / "inf.ppl"
+    inf_ppl.write_text('''
+Board(width=70, height=40, origin_x=140, origin_y=60)
+Anchor("U1", x=1e999, y=0)
+''')
+    with pytest.raises(PlacementError, match="non-finite|outside"):
+        apply_placements(text, load_ppl(inf_ppl), strict=True, safe=True)
+
+    outside_ppl = tmp_path / "outside.ppl"
+    outside_ppl.write_text('''
+Board(width=70, height=40, origin_x=140, origin_y=60)
+Anchor("U1", x=80, y=5)
+''')
+    with pytest.raises(PlacementError, match="outside Board"):
+        apply_placements(text, load_ppl(outside_ppl), strict=True, safe=True)
+
+    huge_ppl = tmp_path / "huge.ppl"
+    huge_ppl.write_text('''
+Board(width=70, height=40, origin_x=140, origin_y=60)
+Anchor("U1", x=10000, y=5)
+''')
+    with pytest.raises(PlacementError, match="far outside"):
+        apply_placements(text, load_ppl(huge_ppl), strict=True, safe=True, allow_outside_board=True)
+
+    dup_ppl = tmp_path / "dup.ppl"
+    dup_ppl.write_text('''
+Board(width=300, height=200)
+Anchor("U1", x=1, y=2)
+Anchor("U1", x=3, y=4)
+''')
+    with pytest.raises(PlacementError, match="duplicate resolved"):
+        apply_placements(text, load_ppl(dup_ppl), strict=False, safe=True)
+
+    locked_ppl = tmp_path / "locked-safe.ppl"
+    locked_ppl.write_text('''
+Board(width=300, height=200)
+Lock("U1")
+Anchor("U1", x=3, y=4)
+''')
+    with pytest.raises(PlacementError, match="locked footprint"):
+        apply_placements(text, load_ppl(locked_ppl), strict=False, safe=True)
+
+
+def test_atomic_write_and_output_sanity_preserves_footprint_count(tmp_path):
+    pcb = tmp_path / "simple.kicad_pcb"
+    out = tmp_path / "simple.placed.kicad_pcb"
+    ppl = tmp_path / "simple.ppl"
+    pcb.write_text(_pcb_with_at())
+    ppl.write_text('''
+Board(width=300, height=200)
+Anchor("U1", x=10, y=20)
+''')
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "-o", str(out)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "wrote:" in result.stdout
+    assert out.exists()
+    assert len(parse_footprints(out.read_text())) == len(parse_footprints(pcb.read_text()))
+
+
+def test_cli_dry_run_reports_unsafe_placement_without_failing(tmp_path):
+    pcb = tmp_path / "unsafe.kicad_pcb"
+    ppl = tmp_path / "unsafe.ppl"
+    report = tmp_path / "unsafe-report.json"
+    pcb.write_text(_pcb_with_at("(at 0 0)"))
+    ppl.write_text('''
+Board(width=10, height=10)
+Anchor("U1", x=20, y=0)
+''')
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--dry-run", "--report-json", str(report)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "outside_board=yes" in result.stdout
+    assert "would be outside Board bounds" in result.stdout
+    payload = json.loads(report.read_text())
+    assert payload["validation_errors"] >= 1
+    assert payload["placements"][0]["outside_board"] is True
