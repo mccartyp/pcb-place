@@ -1,0 +1,4 @@
+Region("HIGH_SPEED"
+Cluster("HIGH_SPEED_CONNECTOR_J1"
+Corridor("TMDS0_CORRIDOR"
+ESD("U2"
