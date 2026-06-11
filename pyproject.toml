@@ -39,6 +39,7 @@ include = [
   "/README.md",
   "/pcb_place.py",
   "/pyproject.toml",
+  "/examples",
   "/tests",
 ]
 
