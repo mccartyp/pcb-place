@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 Number = float | int
 Point = Tuple[float, float]
@@ -101,6 +101,96 @@ class Footprint:
     at_has_rot: bool = False
     at_rot_text: Optional[str] = None
     layer: Optional[str] = None
+
+
+
+@dataclasses.dataclass(frozen=True)
+class BBox:
+    """Axis-aligned footprint bounding box in board coordinates."""
+
+    min_x: float
+    min_y: float
+    max_x: float
+    max_y: float
+
+    @property
+    def width(self) -> float:
+        return self.max_x - self.min_x
+
+    @property
+    def height(self) -> float:
+        return self.max_y - self.min_y
+
+    def expanded(self, amount: float) -> "BBox":
+        return BBox(self.min_x - amount, self.min_y - amount, self.max_x + amount, self.max_y + amount)
+
+    def overlaps(self, other: "BBox", *, eps: float = 1e-9) -> bool:
+        return not (self.max_x <= other.min_x + eps or other.max_x <= self.min_x + eps or
+                    self.max_y <= other.min_y + eps or other.max_y <= self.min_y + eps)
+
+    def clearance_to(self, other: "BBox") -> float:
+        dx = max(other.min_x - self.max_x, self.min_x - other.max_x, 0.0)
+        dy = max(other.min_y - self.max_y, self.min_y - other.max_y, 0.0)
+        if dx == 0.0 and dy == 0.0:
+            overlap_x = min(self.max_x, other.max_x) - max(self.min_x, other.min_x)
+            overlap_y = min(self.max_y, other.max_y) - max(self.min_y, other.min_y)
+            return -max(0.0, min(overlap_x, overlap_y))
+        return math.hypot(dx, dy)
+
+    def as_report(self) -> Dict[str, float]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class BBoxInfo:
+    ref: str
+    bbox: BBox
+    fallback: bool = False
+    warning: Optional[str] = None
+
+
+@dataclasses.dataclass
+class ClearanceRules:
+    """Configurable minimum clearance rules in millimeters."""
+
+    default: float = 0.25
+    passive_to_passive: float = 0.20
+    passive_to_ic: float = 0.50
+    ic_to_ic: float = 0.75
+    connector: float = 1.00
+    mechanical: float = 1.00
+
+    def required_for(self, class_a: str, class_b: str) -> float:
+        pair = {class_a, class_b}
+        if "mechanical" in pair:
+            return self.mechanical
+        if "connector" in pair:
+            return self.connector
+        if pair == {"passive"}:
+            return self.passive_to_passive
+        if pair == {"ic"}:
+            return self.ic_to_ic
+        if pair == {"passive", "ic"}:
+            return self.passive_to_ic
+        return self.default
+
+
+@dataclasses.dataclass
+class PlacementPolicy:
+    avoid_overlap: bool = True
+    allow_anchor_move: bool = False
+    max_search_radius: float = 5.0
+    search_step: float = 0.5
+
+
+@dataclasses.dataclass
+class AutoAdjustment:
+    ref: str
+    requested_x: float
+    requested_y: float
+    placed_x: float
+    placed_y: float
+    reason: str
 
 
 @dataclasses.dataclass
@@ -214,6 +304,9 @@ class PlacementModel:
     imported_aliases: Dict[str, str] = dataclasses.field(default_factory=dict)
     alias_diagnostics: AliasDiagnostics = dataclasses.field(default_factory=AliasDiagnostics)
     regions: Dict[str, Dict[str, Any]] = dataclasses.field(default_factory=dict)
+    clearance: ClearanceRules = dataclasses.field(default_factory=ClearanceRules)
+    policy: PlacementPolicy = dataclasses.field(default_factory=PlacementPolicy)
+    part_classes: Dict[str, str] = dataclasses.field(default_factory=dict)
 
     def add(self, rule_type: str, **kwargs: Any) -> None:
         self.rules.append({"type": rule_type, **kwargs})
@@ -619,6 +712,39 @@ def load_ppl(path: Path) -> PlacementModel:
             raise PlacementError(f"Region() unknown parameter(s): {', '.join(sorted(kwargs))}")
         model.region(str(name), x=x, y=y, w=w, h=h, role=role, note=note)
 
+    def Spacing(*, default: Number = 0.25, passive_to_passive: Number = 0.20,
+                passive_to_ic: Number = 0.50, ic_to_ic: Number = 0.75,
+                connector: Number = 1.00, mechanical: Number = 1.00, **kwargs: Any) -> None:
+        if kwargs:
+            raise PlacementError(f"Spacing() unknown parameter(s): {', '.join(sorted(kwargs))}")
+        model.clearance = ClearanceRules(float(default), float(passive_to_passive), float(passive_to_ic),
+                                         float(ic_to_ic), float(connector), float(mechanical))
+
+    def AvoidOverlap(enabled: bool = True, **kwargs: Any) -> None:
+        if kwargs:
+            raise PlacementError(f"AvoidOverlap() unknown parameter(s): {', '.join(sorted(kwargs))}")
+        model.policy.avoid_overlap = bool(enabled)
+
+    def PlacementPolicyDsl(*, avoid_overlap: bool = True, allow_anchor_move: bool = False,
+                           max_search_radius: Number = 5, search_step: Number = 0.5, **kwargs: Any) -> None:
+        if kwargs:
+            raise PlacementError(f"PlacementPolicy() unknown parameter(s): {', '.join(sorted(kwargs))}")
+        if float(max_search_radius) < 0 or float(search_step) <= 0:
+            raise PlacementError("PlacementPolicy(max_search_radius=..., search_step=...) must be positive")
+        model.policy = PlacementPolicy(bool(avoid_overlap), bool(allow_anchor_move),
+                                       float(max_search_radius), float(search_step))
+
+    def PartClass(ref: str, cls: str, **kwargs: Any) -> None:
+        if kwargs:
+            raise PlacementError(f"PartClass() unknown parameter(s): {', '.join(sorted(kwargs))}")
+        normalized = str(cls).lower().replace("-", "_")
+        aliases = {"passives": "passive", "ics": "ic", "mounting_hole": "mechanical", "mounting_holes": "mechanical"}
+        normalized = aliases.get(normalized, normalized)
+        allowed = {"passive", "ic", "connector", "mechanical", "testpoint", "switch", "default"}
+        if normalized not in allowed:
+            raise PlacementError(f"PartClass({ref!r}, {cls!r}) has unsupported class")
+        model.part_classes[_normalize_ref(ref)] = normalized
+
     def Lock(ref: str, *, reason: Optional[str] = None, note: Optional[str] = None, **kwargs: Any) -> None:
         if kwargs:
             raise PlacementError(f"Lock() unknown parameter(s): {', '.join(sorted(kwargs))}")
@@ -855,6 +981,11 @@ def load_ppl(path: Path) -> PlacementModel:
         "Board": Board,
         "Alias": Alias,
         "Region": Region,
+        "Spacing": Spacing,
+        "ClearanceRules": Spacing,
+        "AvoidOverlap": AvoidOverlap,
+        "PlacementPolicy": PlacementPolicyDsl,
+        "PartClass": PartClass,
         "Lock": Lock,
         "Component": Component,
         "Anchor": Anchor,
@@ -1103,6 +1234,150 @@ def _replace_at(block: str, x: float, y: float, rot: Optional[float]) -> str:
     return new_block
 
 
+
+# ---------------------------------------------------------------------------
+# Footprint bounding boxes and spacing
+# ---------------------------------------------------------------------------
+
+_NUM = r"([-+0-9.eE]+)"
+
+
+def _fp_kind_name(fp: Footprint) -> str:
+    match = re.match(r'\s*\(footprint\s+"([^"]+)"', fp.text)
+    return match.group(1) if match else "unknown"
+
+
+def infer_part_class(ref: str) -> str:
+    upper = ref.upper()
+    for prefix, cls in (("MH", "mechanical"), ("TP", "testpoint"), ("SW", "switch"),
+                        ("FB", "passive"), ("R", "passive"), ("C", "passive"),
+                        ("L", "passive"), ("F", "passive"), ("D", "passive"),
+                        ("U", "ic"), ("J", "connector"), ("P", "connector"),
+                        ("H", "mechanical")):
+        if upper.startswith(prefix):
+            return cls
+    return "default"
+
+
+def _part_class_for(model: PlacementModel, ref: str) -> str:
+    return model.part_classes.get(ref, infer_part_class(ref))
+
+
+def _rot_point(x: float, y: float, deg: float) -> Point:
+    rad = math.radians(deg)
+    c, s = math.cos(rad), math.sin(rad)
+    return x * c - y * s, x * s + y * c
+
+
+def _bbox_from_points(points: Sequence[Point]) -> BBox:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return BBox(min(xs), min(ys), max(xs), max(ys))
+
+
+def _transform_local_bbox(local: BBox, x: float, y: float, rot: float) -> BBox:
+    corners = [(local.min_x, local.min_y), (local.min_x, local.max_y), (local.max_x, local.min_y), (local.max_x, local.max_y)]
+    return _bbox_from_points([(x + rx, y + ry) for rx, ry in (_rot_point(cx, cy, rot) for cx, cy in corners)])
+
+
+def _parse_fp_local_bbox(fp: Footprint) -> Optional[BBox]:
+    points: List[Point] = []
+    text = fp.text
+    # Pads: use pad-local at/size rectangles. Rotation inside the footprint is approximated by its extents.
+    for match in re.finditer(r'\(pad\b', text):
+        block = text[match.start():_find_matching_paren(text, text.find("(", match.start()))]
+        at = re.search(r'\(at\s+' + _NUM + r'\s+' + _NUM + r'(?:\s+' + _NUM + r')?\)', block)
+        size = re.search(r'\(size\s+' + _NUM + r'\s+' + _NUM + r'\)', block)
+        if at and size:
+            cx, cy = float(at.group(1)), float(at.group(2))
+            w, h = float(size.group(1)), float(size.group(2))
+            points.extend([(cx - w / 2, cy - h / 2), (cx + w / 2, cy + h / 2), (cx - w / 2, cy + h / 2), (cx + w / 2, cy - h / 2)])
+    for pat in (r'\((?:fp_line|gr_line)\b[^)]*?\(start\s+' + _NUM + r'\s+' + _NUM + r'\).*?\(end\s+' + _NUM + r'\s+' + _NUM + r'\)',):
+        for m in re.finditer(pat, text, flags=re.S):
+            points.extend([(float(m.group(1)), float(m.group(2))), (float(m.group(3)), float(m.group(4)))])
+    for m in re.finditer(r'\((?:fp_rect|gr_rect)\b[^)]*?\(start\s+' + _NUM + r'\s+' + _NUM + r'\).*?\(end\s+' + _NUM + r'\s+' + _NUM + r'\)', text, flags=re.S):
+        x0, y0, x1, y1 = map(float, m.groups())
+        points.extend([(x0, y0), (x1, y1), (x0, y1), (x1, y0)])
+    for m in re.finditer(r'\((?:fp_circle|gr_circle)\b[^)]*?\(center\s+' + _NUM + r'\s+' + _NUM + r'\).*?\(end\s+' + _NUM + r'\s+' + _NUM + r'\)', text, flags=re.S):
+        cx, cy, ex, ey = map(float, m.groups())
+        r = math.hypot(ex - cx, ey - cy)
+        points.extend([(cx - r, cy - r), (cx + r, cy + r)])
+    for m in re.finditer(r'\((?:fp_poly|gr_poly)\b.*?\(pts\s+(.*?)\)\s*\)', text, flags=re.S):
+        for p in re.finditer(r'\(xy\s+' + _NUM + r'\s+' + _NUM + r'\)', m.group(1)):
+            points.append((float(p.group(1)), float(p.group(2))))
+    return _bbox_from_points(points) if points else None
+
+
+def _fallback_local_bbox(fp: Footprint, cls: str) -> Tuple[BBox, str]:
+    sizes = {
+        "passive": (1.6, 0.8),
+        "ic": (1.0, 1.0),
+        "connector": (2.0, 2.0),
+        "mechanical": (3.0, 3.0),
+        "testpoint": (1.0, 1.0),
+        "switch": (4.0, 4.0),
+        "default": (1.0, 1.0),
+    }
+    w, h = sizes.get(cls, sizes["default"])
+    kind = _fp_kind_name(fp)
+    warning = f"{fp.ref} footprint {kind!r} has no parsed pad/graphic geometry; using {w}x{h} mm {cls} fallback bbox"
+    return BBox(-w / 2, -h / 2, w / 2, h / 2), warning
+
+
+def footprint_bbox_at(fp: Footprint, x: float, y: float, rot: float, model: PlacementModel) -> BBoxInfo:
+    cls = _part_class_for(model, fp.ref)
+    local = _parse_fp_local_bbox(fp)
+    fallback = False
+    warning = None
+    if local is None:
+        local, warning = _fallback_local_bbox(fp, cls)
+        fallback = True
+    return BBoxInfo(fp.ref, _transform_local_bbox(local, x, y, rot), fallback, warning)
+
+
+def all_bbox_infos(engine: "PlacementEngine", *, refs: Optional[Iterable[str]] = None) -> Dict[str, BBoxInfo]:
+    selected = set(refs) if refs is not None else set(engine.positions)
+    infos: Dict[str, BBoxInfo] = {}
+    for ref in selected:
+        if ref not in engine.footprints:
+            continue
+        x, y, rot = engine.positions[ref]
+        infos[ref] = footprint_bbox_at(engine.footprints[ref], x, y, rot, engine.model)
+    return infos
+
+
+def _board_contains_bbox(geometry: Optional[BoardGeometry], bbox: BBox, *, eps: float = 1e-9) -> bool:
+    if geometry is None:
+        return True
+    return (geometry.min_x - eps <= bbox.min_x and bbox.max_x <= geometry.max_x + eps and
+            geometry.min_y - eps <= bbox.min_y and bbox.max_y <= geometry.max_y + eps)
+
+
+def spacing_analysis(engine: "PlacementEngine", *, refs: Optional[Iterable[str]] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    infos = all_bbox_infos(engine, refs=refs)
+    bbox_warnings = []
+    seen_warnings: Set[str] = set()
+    for info in infos.values():
+        if info.warning and info.warning not in seen_warnings:
+            bbox_warnings.append({"ref": info.ref, "message": info.warning})
+            seen_warnings.add(info.warning)
+    collisions: List[Dict[str, Any]] = []
+    violations: List[Dict[str, Any]] = []
+    refs_sorted = sorted(infos)
+    for i, a in enumerate(refs_sorted):
+        for b in refs_sorted[i + 1:]:
+            ia, ib = infos[a], infos[b]
+            ca, cb = _part_class_for(engine.model, a), _part_class_for(engine.model, b)
+            required = engine.model.clearance.required_for(ca, cb)
+            actual = ia.bbox.clearance_to(ib.bbox)
+            item = {"ref_a": a, "ref_b": b, "bbox_a": ia.bbox.as_report(), "bbox_b": ib.bbox.as_report(),
+                    "class_a": ca, "class_b": cb, "required_clearance": required, "actual_clearance": actual}
+            if ia.bbox.overlaps(ib.bbox):
+                collisions.append(item)
+            elif actual < required - 1e-9:
+                violations.append(item)
+    return collisions, violations, bbox_warnings
+
 # ---------------------------------------------------------------------------
 # Placement engine
 # ---------------------------------------------------------------------------
@@ -1128,6 +1403,7 @@ class PlacementEngine:
         self.placement_attempts: Dict[str, int] = {}
         self.ref_cache: Dict[str, str] = {}
         self.locked: Dict[str, str] = {}
+        self.auto_adjustments: List[AutoAdjustment] = []
         for error in model.alias_diagnostics.errors:
             self.messages.append(Message("error", error))
         for warning in model.alias_diagnostics.warnings:
@@ -1186,7 +1462,8 @@ class PlacementEngine:
         self.messages.append(Message("warn", msg))
 
     def place(self, ref: str, x: float, y: float, rot: Optional[float], why: str, note: Optional[str] = None,
-              *, allow_arbitrary_rotation: bool = False) -> None:
+              *, allow_arbitrary_rotation: bool = False, avoid_overlap: bool = False,
+              clearance_override: Optional[float] = None, candidate_sides: Optional[Sequence[str]] = None) -> None:
         actual_ref = self.resolve_ref(ref)
         if actual_ref is None:
             self._warn_or_raise(f"missing footprint {ref!r} for {why}")
@@ -1205,6 +1482,17 @@ class PlacementEngine:
             if changed:
                 self._warn_or_raise(f"locked footprint {actual_ref!r} cannot be moved by {why}; locked by {self.locked[actual_ref]}")
                 return
+        if avoid_overlap and self.model.policy.avoid_overlap:
+            placed = self._find_non_overlapping_position(actual_ref, float(x), float(y), float(new_rot),
+                                                         clearance_override=clearance_override,
+                                                         candidate_sides=candidate_sides)
+            if placed is None:
+                raise PlacementError(f"{actual_ref!r} could not be placed by {why} without violating clearance or board bounds; requested x={_fmt_num(x)} y={_fmt_num(y)}")
+            px, py, reason = placed
+            if abs(px - x) > 1e-9 or abs(py - y) > 1e-9:
+                self.auto_adjustments.append(AutoAdjustment(actual_ref, float(x), float(y), px, py, reason))
+                self.messages.append(Message("note", f"adjusted {actual_ref}: requested x={_fmt_num(x)} y={_fmt_num(y)} placed x={_fmt_num(px)} y={_fmt_num(py)}; {reason}"))
+                x, y = px, py
         fp = self.footprints[actual_ref]
         outside = False
         if self.board_geometry is not None:
@@ -1269,6 +1557,69 @@ class PlacementEngine:
             raise PlacementError(f"Unknown rotation spec {rot_spec!r}")
         return float(rot_spec)
 
+
+    def _clearance_override(self, rule: Dict[str, Any]) -> Optional[float]:
+        value = rule.get("clearance")
+        if value is None:
+            value = rule.get("extra", {}).get("clearance")
+        return None if value is None else float(value)
+
+    def _collides_at(self, ref: str, x: float, y: float, rot: float, *, clearance_override: Optional[float] = None) -> Optional[str]:
+        if ref not in self.footprints:
+            return None
+        test_info = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model)
+        if not _board_contains_bbox(self.board_geometry, test_info.bbox):
+            return "would leave board bounds"
+        obstacle_refs = set(self.updates) | set(self.locked)
+        for other in sorted(obstacle_refs):
+            if other == ref or other not in self.footprints:
+                continue
+            ox, oy, orot = self.positions[other]
+            other_info = footprint_bbox_at(self.footprints[other], ox, oy, orot, self.model)
+            required = clearance_override
+            if required is None:
+                required = self.model.clearance.required_for(_part_class_for(self.model, ref), _part_class_for(self.model, other))
+            if test_info.bbox.expanded(required).overlaps(other_info.bbox):
+                return f"avoided collision with {other}"
+        return None
+
+    def _find_non_overlapping_position(self, ref: str, x: float, y: float, rot: float,
+                                       *, clearance_override: Optional[float],
+                                       candidate_sides: Optional[Sequence[str]]) -> Optional[Tuple[float, float, str]]:
+        first = self._collides_at(ref, x, y, rot, clearance_override=clearance_override)
+        if first is None:
+            return (x, y, "requested location is legal")
+        step = self.model.policy.search_step
+        max_r = self.model.policy.max_search_radius
+        sides = list(candidate_sides or ["top", "right", "bottom", "left"])
+        vectors = {"right": (1.0, 0.0), "left": (-1.0, 0.0), "top": (0.0, -1.0), "bottom": (0.0, 1.0)}
+        candidates: List[Tuple[float, float]] = []
+        n = int(max_r / step)
+        # Slide along the requested side first, then search outward in side directions.
+        for side in sides:
+            if side in {"top", "bottom"}:
+                for k in range(1, n + 1):
+                    d = k * step
+                    candidates.extend([(x + d, y), (x - d, y)])
+            elif side in {"left", "right"}:
+                for k in range(1, n + 1):
+                    d = k * step
+                    candidates.extend([(x, y + d), (x, y - d)])
+        for k in range(1, n + 1):
+            d = k * step
+            for side in sides:
+                vx, vy = vectors.get(side, (0.0, 0.0))
+                candidates.append((x + vx * d, y + vy * d))
+        seen: Set[Tuple[int, int]] = set()
+        for cx, cy in candidates:
+            key = (round(cx / 1e-6), round(cy / 1e-6))
+            if key in seen:
+                continue
+            seen.add(key)
+            if self._collides_at(ref, cx, cy, rot, clearance_override=clearance_override) is None:
+                return (cx, cy, first)
+        return None
+
     def _allow_arbitrary_rotation(self, rule: Dict[str, Any]) -> bool:
         return bool(rule.get("allow_arbitrary_rotation") or rule.get("extra", {}).get("allow_arbitrary_rotation"))
 
@@ -1278,7 +1629,8 @@ class PlacementEngine:
         for i, ref in enumerate(rule["refs"]):
             x, y = _board_to_abs(self.model, sx + px * i, sy + py * i)
             self.place(ref, x, y, self.resolve_rot(rule.get("rot")), why, rule.get("note"),
-                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
+                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                       avoid_overlap=True, clearance_override=self._clearance_override(rule))
 
     def apply(self) -> None:
         """Apply rules in deterministic passes.
@@ -1315,7 +1667,8 @@ class PlacementEngine:
                     x, y = _board_to_abs(self.model, sx + col * px, sy + row * py)
                     self.place(ref, x, y,
                                self.resolve_rot(rule.get("rot")), "grid", rule.get("note"),
-                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
+                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                               avoid_overlap=True, clearance_override=self._clearance_override(rule))
 
         # Relational pass.
         for rule in self.model.rules:
@@ -1332,7 +1685,8 @@ class PlacementEngine:
                     x += (-vy / length) * float(rule["offset"])
                     y += (vx / length) * float(rule["offset"])
                 self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot"), a, b), typ, rule.get("note"),
-                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
+                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                           avoid_overlap=True, clearance_override=self._clearance_override(rule))
 
             elif typ == "satellite":
                 px, py = self.get_pos(rule["parent"])
@@ -1353,7 +1707,9 @@ class PlacementEngine:
                 else:
                     raise PlacementError(f"Unknown satellite side {side!r}")
                 self.place(rule["ref"], x + dx, y + dy, self.resolve_rot(rule.get("rot")), typ, rule.get("note"),
-                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
+                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                           avoid_overlap=True, clearance_override=self._clearance_override(rule),
+                           candidate_sides=[side] if side in {"top", "right", "bottom", "left"} else None)
 
             elif typ == "orbit":
                 cx, cy = self.get_pos(rule["parent"])
@@ -1365,7 +1721,8 @@ class PlacementEngine:
                     x = cx + radius * math.cos(theta)
                     y = cy + radius * math.sin(theta)
                     self.place(ref, x, y, self.resolve_rot(rule.get("rot")), "orbit", rule.get("note"),
-                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
+                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                               avoid_overlap=True, clearance_override=self._clearance_override(rule))
 
             elif typ == "mirror":
                 sx, sy = self.get_pos(rule["source"])
@@ -1430,7 +1787,9 @@ class PlacementEngine:
                                                    f"clearance={_fmt_num(rule['clearance'])} parsed but not emitted yet"))
 
 
-def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25) -> List[Message]:
+def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
+                        allow_overlap: bool = False, warn_overlap: bool = False,
+                        allow_outside_board: bool = False) -> List[Message]:
     """Run lightweight, CI-friendly placement validation.
 
     KiCad footprints can have complex outlines.  This first validator uses
@@ -1447,7 +1806,7 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25) -
             messages.append(Message("error", "Board geometry dimensions must be positive"))
         for ref in sorted(engine.updates):
             x, y, _rot = engine.positions[ref]
-            if not geometry.contains(x, y):
+            if not geometry.contains(x, y) and not allow_outside_board:
                 messages.append(Message("error", f"{ref!r} is outside Board geometry ({geometry.source}): x={_fmt_num(x)} y={_fmt_num(y)}"))
 
     # Near-coincident origins are usually accidental overlaps in generated placements.
@@ -1460,7 +1819,8 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25) -
         for b in refs[i + 1:]:
             bx, by, _ = engine.positions[b]
             if math.hypot(ax - bx, ay - by) < min_spacing:
-                messages.append(Message("error", f"{a!r} and {b!r} have overlapping/near-coincident origins"))
+                messages.append(Message("warn" if (allow_overlap or warn_overlap) else "error",
+                                        f"{a!r} and {b!r} have overlapping/near-coincident origins"))
 
     for rule in engine.model.rules:
         if rule["type"] != "keepout":
@@ -1471,6 +1831,22 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25) -
             x, y, _rot = engine.positions[ref]
             if x0 <= x <= x1 and y0 <= y <= y1:
                 messages.append(Message("error", f"{ref!r} origin lies inside keepout {rule['name']!r}"))
+
+    collisions, violations, bbox_warnings = spacing_analysis(engine, refs=engine.updates)
+    for warning in bbox_warnings:
+        messages.append(Message("warn", warning["message"]))
+    overlap_level = "warn" if (allow_overlap or warn_overlap) else "error"
+    for item in collisions:
+        messages.append(Message(overlap_level,
+            f"ERROR: {item['ref_a']} overlaps {item['ref_b']}\n"
+            f"  {item['ref_a']} bbox: {item['bbox_a']}\n"
+            f"  {item['ref_b']} bbox: {item['bbox_b']}\n"
+            f"  required clearance: {_fmt_num(item['required_clearance'])} mm"))
+    for item in violations:
+        level = "warn" if (allow_overlap or warn_overlap) else "error"
+        messages.append(Message(level,
+            f"{item['ref_a']} and {item['ref_b']} spacing {_fmt_num(item['actual_clearance'])} mm is below "
+            f"required {_fmt_num(item['required_clearance'])} mm ({item['class_a']} to {item['class_b']})"))
 
     return messages
 
@@ -1512,7 +1888,8 @@ def validate_safe_placements(engine: PlacementEngine, *, allow_large_move: bool 
 def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
                      allow_suffix_match: bool = True, validate: bool = False, safe: bool = False,
                      allow_large_move: bool = False, allow_outside_board: bool = False,
-                     cardinal_rotations: bool = False, safety_fatal: bool = True) -> Tuple[str, List[Message], Dict[str, Any]]:
+                     cardinal_rotations: bool = False, safety_fatal: bool = True,
+                     allow_overlap: bool = False, warn_overlap: bool = False) -> Tuple[str, List[Message], Dict[str, Any]]:
     """Apply placement rules and return rewritten KiCad text plus diagnostics."""
 
     footprints = parse_footprints(text)
@@ -1529,7 +1906,9 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
     engine = PlacementEngine(footprints, model, strict=strict, allow_suffix_match=allow_suffix_match,
                              cardinal_rotations=cardinal_rotations, board_geometry=board_geometry)
     engine.apply()
-    validation_messages = validate_placements(engine) if validate else []
+    collision_messages = validate_placements(engine, allow_overlap=allow_overlap, warn_overlap=warn_overlap,
+                                             allow_outside_board=allow_outside_board)
+    validation_messages = collision_messages if (validate or safe) else []
     safety_messages = validate_safe_placements(engine, allow_large_move=allow_large_move,
                                                allow_outside_board=allow_outside_board) if safe else []
     engine.messages.extend(validation_messages)
@@ -1538,6 +1917,7 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
     engine.messages.extend(safety_messages)
     if safe and safety_fatal and any(m.level == "error" for m in engine.messages):
         raise PlacementError("validation failed: " + "; ".join(m.text for m in engine.messages if m.level == "error"))
+    collisions, spacing_violations, bbox_warnings = spacing_analysis(engine, refs=engine.updates)
     rewritten = text
     if model.board.emit_outline and defined_geometry is not None:
         rewritten = emit_board_outline(rewritten, defined_geometry)
@@ -1554,6 +1934,9 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "effective_aliases": engine.alias_map(),
         "alias_diagnostics": dataclasses.asdict(model.alias_diagnostics),
         "regions": dict(model.regions),
+        "clearance_rules": dataclasses.asdict(model.clearance),
+        "placement_policy": dataclasses.asdict(model.policy),
+        "part_classes": {ref: _part_class_for(model, ref) for ref in sorted(footprints)},
         "locked_refs": sorted(engine.locked),
         "validation_errors": sum(1 for m in engine.messages if m.level == "error"),
         "board": dataclasses.asdict(model.board) | {"origin_x": model.board.origin_x, "origin_y": model.board.origin_y},
@@ -1565,6 +1948,12 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "geometry_source": None if board_geometry is None else board_geometry.source,
         "updated_refs": sorted(engine.updates),
         "placements": [dataclasses.asdict(engine.updates[ref]) for ref in sorted(engine.updates)],
+        "collisions": collisions,
+        "spacing_violations": spacing_violations,
+        "bbox_warnings": bbox_warnings,
+        "auto_adjustments": [dataclasses.asdict(a) for a in engine.auto_adjustments],
+        "collision_count": len(collisions),
+        "spacing_violation_count": len(spacing_violations),
         "messages": [dataclasses.asdict(m) for m in engine.messages],
     }
     return rewritten, engine.messages, report
@@ -1736,6 +2125,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-safe", dest="safe", action="store_false", help="Disable pre-write safety checks")
     parser.add_argument("--allow-large-move", action="store_true", help="Allow placements far outside original footprint bounds")
     parser.add_argument("--allow-outside-board", action="store_true", help="Allow placements outside declared Board bounds")
+    parser.add_argument("--allow-overlap", action="store_true", help="Allow footprint overlaps and spacing violations after reporting them")
+    parser.add_argument("--warn-overlap", action="store_true", help="Report footprint overlaps and spacing violations as warnings")
     parser.add_argument("--cardinal-rotations", action="store_true", help="Round explicit rotations to nearest 0/90/180/270 unless a rule allows arbitrary rotation")
     parser.add_argument("--no-suffix-match", action="store_true", help="Disable hierarchical suffix reference matching")
     parser.add_argument("--netlist", type=Path, help="Optional Zener/pcb netlist artifact used to import semantic aliases")
@@ -1800,7 +2191,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                                                   allow_large_move=bool(args.allow_large_move),
                                                   allow_outside_board=bool(args.allow_outside_board),
                                                   cardinal_rotations=bool(args.cardinal_rotations),
-                                                  safety_fatal=not bool(args.dry_run))
+                                                  safety_fatal=not bool(args.dry_run),
+                                                  allow_overlap=bool(args.allow_overlap),
+                                                  warn_overlap=bool(args.warn_overlap))
     for message in messages:
         print(message)
     if args.report_json:
@@ -1821,6 +2214,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.dry_run:
         print(f"dry-run: {report['placements_applied']} placement(s) would be applied to "
               f"{report['footprints_total']} footprint(s); changed={changed}")
+        print(f"  collisions={report.get('collision_count', 0)} spacing_violations={report.get('spacing_violation_count', 0)} "
+              f"fallback_bboxes={len(report.get('bbox_warnings', []))} auto_adjustments={len(report.get('auto_adjustments', []))}")
+        for adj in report.get("auto_adjustments", []):
+            print(f"  adjusted {adj['ref']}: requested=({_fmt_num(adj['requested_x'])}, {_fmt_num(adj['requested_y'])}) "
+                  f"placed=({_fmt_num(adj['placed_x'])}, {_fmt_num(adj['placed_y'])}) reason={adj['reason']}")
         for item in report.get("placements", []):
             rot_change = "yes" if item["rotation_changed"] else "no"
             outside = "yes" if item["outside_board"] else "no"

@@ -99,7 +99,7 @@ Implemented today:
 - Rotation preservation by default, with explicit opt-in for path-aligned/computed rotations
 - Safe-by-default pre-write validation for non-finite coordinates, large moves, outside-board placement, duplicate targets, unresolved aliases, and locked footprint movement
 - Atomic output writes and post-write parser sanity checks
-- Basic validation for board-boundary, keepout-origin, and near-coincident placed footprints
+- Validation for board-boundary, keepout-origin, footprint bounding-box collisions, spacing rules, and near-coincident placed footprints
 
 Not implemented yet:
 
@@ -108,7 +108,6 @@ Not implemented yet:
 - Copper zones
 - Differential-pair tuning
 - KiCad keepout-zone emission
-- True footprint courtyard/collision geometry
 - KiCad locked-footprint flags
 
 ## Install
@@ -212,6 +211,45 @@ pcb-place board.kicad_pcb placement.ppl --no-safe
 ```
 
 If you want mechanically simple rotations, `--cardinal-rotations` rounds explicit rotations to the nearest `0`, `90`, `180`, or `270` degrees unless an individual rule sets `allow_arbitrary_rotation=True`.
+
+
+## Placement Safety
+
+`pcb-place` checks placed footprint bounding boxes instead of treating footprint center points as sufficient physical geometry.  It parses common KiCad footprint primitives such as pads and footprint graphics to estimate each footprint's occupied area, reports fallback bounding boxes when exact geometry is unavailable, and validates both direct overlaps and minimum spacing.
+
+Spacing is configurable globally:
+
+```python
+Spacing(
+    default=0.25,
+    passive_to_ic=0.50,
+    connector=1.00,
+)
+
+PartClass("U1", "ic")
+PartClass("R1", "passive")
+```
+
+If `PartClass(...)` is omitted, `pcb-place` infers classes from reference prefixes such as `R`/`C`/`L` for passive components, `U` for ICs, `J`/`P` for connectors, and `H`/`MH` for mechanical parts.  Individual placement rules can also request a one-off clearance, for example `Satellite("R1", parent="U1", side="top", distance=2, clearance=0.5)`.
+
+Explicit absolute anchors remain deterministic and are not automatically moved by default.  Relative and automatic placement primitives (`Satellite`, `Orbit`, `Row`, `Column`, `Array`, `Between`, and `Inline`) use the placement policy to search nearby legal candidate locations when the requested location would collide or violate spacing:
+
+```python
+PlacementPolicy(
+    avoid_overlap=True,
+    allow_anchor_move=False,
+    max_search_radius=5,
+    search_step=0.5,
+)
+```
+
+Writes fail on collisions by default.  Use `--warn-overlap` to demote overlap/spacing diagnostics to warnings, or `--allow-overlap` only after reviewing the output.  Dry runs and JSON reports include collision counts, spacing violations, fallback bounding-box warnings, and any auto-adjusted placements.
+
+For dense PCB work, run the safety report before writing output:
+
+```bash
+pcb-place board.kicad_pcb placement.ppl --dry-run --report-json report.json
+```
 
 ## Board Geometry
 

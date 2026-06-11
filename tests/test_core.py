@@ -541,3 +541,125 @@ def test_edge_cuts_rejects_non_rectangular_gr_line_outlines():
         BoardGeometry.from_edge_cuts(_pcb_with_l_shaped_edge_lines())
     with pytest.raises(PlacementError, match="Unsupported Edge.Cuts geometry"):
         BoardGeometry.from_edge_cuts(_pcb_with_chamfered_edge_lines())
+
+
+def _safety_pcb() -> str:
+    return '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (gr_rect (start 0 0) (end 30 30) (stroke (width 0.1) (type default)) (fill none) (layer "Edge.Cuts") (uuid "edge"))
+  (footprint "Pkg:SOIC" (layer "F.Cu")
+    (at 0 0 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at -2 -1) (size 1 1) (layers "F.Cu"))
+    (pad "2" smd rect (at 2 1) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Pkg:R" (layer "F.Cu")
+    (at 0 0 0)
+    (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at -0.5 0) (size 0.6 0.8) (layers "F.Cu"))
+    (pad "2" smd rect (at 0.5 0) (size 0.6 0.8) (layers "F.Cu"))
+  )
+  (footprint "Pkg:J" (layer "F.Cu")
+    (at 0 0 0)
+    (property "Reference" "J1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Pkg:H" (layer "F.Cu")
+    (at 0 0 0)
+    (property "Reference" "H1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" thru_hole circle (at 0 0) (size 1 1) (layers "*.Cu"))
+  )
+)
+'''
+
+
+def test_direct_overlap_detection_fails(tmp_path):
+    ppl = tmp_path / "overlap.ppl"
+    ppl.write_text('''
+Board(width=30, height=30)
+AvoidOverlap(False)
+Anchor("U1", x=10, y=10)
+Anchor("R1", x=10, y=10)
+''')
+    with pytest.raises(PlacementError, match="overlaps"):
+        apply_placements(_safety_pcb(), load_ppl(ppl), strict=True, safe=True)
+
+
+def test_spacing_violation_and_spacing_dsl(tmp_path):
+    ppl = tmp_path / "spacing.ppl"
+    ppl.write_text('''
+Board(width=30, height=30)
+Spacing(default=0.25, passive_to_ic=2.0)
+PartClass("U1", "ic")
+PartClass("R1", "passive")
+Anchor("U1", x=10, y=10)
+Anchor("R1", x=13.8, y=10)
+''')
+    with pytest.raises(PlacementError, match="passive to ic|ic to passive|required 2"):
+        apply_placements(_safety_pcb(), load_ppl(ppl), strict=True, safe=True)
+    _out, _messages, report = apply_placements(_safety_pcb(), load_ppl(ppl), strict=True, safe=True, warn_overlap=True)
+    assert report["clearance_rules"]["passive_to_ic"] == 2.0
+    assert report["spacing_violations"]
+
+
+def test_partclass_inference(tmp_path):
+    ppl = tmp_path / "classes.ppl"
+    ppl.write_text('''
+Board(width=30, height=30)
+Anchor("U1", x=5, y=5)
+Anchor("R1", x=10, y=5)
+Anchor("J1", x=15, y=5)
+Anchor("H1", x=20, y=5)
+''')
+    _out, _messages, report = apply_placements(_safety_pcb(), load_ppl(ppl), strict=True, safe=True, warn_overlap=True)
+    assert report["part_classes"]["R1"] == "passive"
+    assert report["part_classes"]["U1"] == "ic"
+    assert report["part_classes"]["J1"] == "connector"
+    assert report["part_classes"]["H1"] == "mechanical"
+
+
+def test_satellite_avoidance_auto_adjusts_and_respects_bounds(tmp_path):
+    ppl = tmp_path / "avoid.ppl"
+    ppl.write_text('''
+Board(width=30, height=30)
+PlacementPolicy(avoid_overlap=True, max_search_radius=5, search_step=0.5)
+Anchor("U1", x=10, y=10)
+Satellite("R1", parent="U1", side="top", distance=0.2, clearance=0.5)
+''')
+    _out, _messages, report = apply_placements(_safety_pcb(), load_ppl(ppl), strict=True, safe=True, warn_overlap=True)
+    assert report["auto_adjustments"]
+    placed = report["placements"][0] if report["placements"][0]["ref"] == "R1" else report["placements"][1]
+    assert 0 <= placed["x"] <= 30 and 0 <= placed["y"] <= 30
+
+
+def test_locked_anchor_not_moved_by_avoidance(tmp_path):
+    ppl = tmp_path / "locked-avoid.ppl"
+    ppl.write_text('''
+Board(width=30, height=30)
+Anchor("U1", x=10, y=10, lock=True)
+AvoidOverlap(False)
+Anchor("R1", x=10, y=10)
+''')
+    with pytest.raises(PlacementError, match="overlaps"):
+        apply_placements(_safety_pcb(), load_ppl(ppl), strict=True, safe=True)
+
+
+def test_fallback_bbox_warning_report_json_and_dry_run(tmp_path):
+    pcb = tmp_path / "simple.kicad_pcb"
+    ppl = tmp_path / "simple.ppl"
+    report = tmp_path / "report.json"
+    pcb.write_text((ROOT / "tests/fixtures/simple.kicad_pcb").read_text())
+    ppl.write_text('''
+Board(width=50, height=30)
+Anchor("U1", x=10, y=10)
+Satellite("C1", parent="U1", side="top", distance=0.1)
+''')
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--dry-run", "--report-json", str(report), "--warn-overlap"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(report.read_text())
+    assert "collisions" in payload and "spacing_violations" in payload and "bbox_warnings" in payload and "auto_adjustments" in payload
+    assert payload["bbox_warnings"]
+    assert "auto_adjustments=" in result.stdout
