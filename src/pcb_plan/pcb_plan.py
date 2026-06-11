@@ -135,6 +135,10 @@ class Plan:
     warnings: List[str]
     uncertain_inferences: List[str]
     explanations: Dict[str, Dict[str, Any]]
+    topology_failures: List[str]
+    decoupling_groups: List[Dict[str, Any]]
+    pullup_groups: List[Dict[str, Any]]
+    duplicate_rules: List[str]
 
 
 def _q(value: Any) -> str:
@@ -846,10 +850,11 @@ def infer_roles(components: Dict[str, PlanComponent], intent: Mapping[str, Any])
             comp.role = "clock"; comp.role_reasons.append("reference/value/footprint suggests clock source")
         elif pref == "R":
             non_ground = [n for n in nets if not is_ground(n)]
-            if any(is_power(n) for n in nets) and len(non_ground) >= 2:
-                comp.role = "pullup_pulldown"; comp.role_reasons.append("resistor connects power to a signal")
-            elif len(non_ground) == 1 and len(nets) == 2:
+            non_power_non_ground = [n for n in non_ground if not is_power(n)]
+            if len(nets) == 2 and len(non_ground) == 2 and not any(is_power(n) for n in nets):
                 comp.role = "series"; comp.role_reasons.append("two-pin resistor candidate on signal path")
+            elif (any(is_power(n) for n in nets) or any(is_ground(n) for n in nets)) and non_power_non_ground:
+                comp.role = "pullup_pulldown"; comp.role_reasons.append("resistor connects power/ground to a signal")
             else:
                 comp.role = "resistor"; comp.role_reasons.append("reference prefix indicates resistor")
         elif pref == "U":
@@ -1069,6 +1074,249 @@ def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanCompone
     return sorted(set(members), key=lambda r: (r != anchor.ref, r))
 
 
+_PASSIVE_SUPPORT_ROLES = {
+    "resistor", "capacitor", "decoupling", "series", "pullup_pulldown",
+    "inductor", "ferrite", "testpoint", "esd_protection",
+}
+
+_CARDINAL_DIRECTIONS: List[Tuple[float, str]] = [(0.0, "right"), (90.0, "bottom"), (180.0, "left"), (270.0, "top")]
+
+
+class ConnectivityGraph:
+    """Lightweight component/pin/net connectivity graph for topology queries.
+
+    Built directly from parsed components and nets, this answers questions
+    such as "what is this resistor between?" and "what is the owning signal
+    source for this pullup?" so that primitive inference can validate
+    topology instead of relying on coarse shared-net heuristics alone.
+    """
+
+    def __init__(self, components: Mapping[str, PlanComponent], nets: Mapping[str, PlanNet]) -> None:
+        self.components = components
+        self.nets = nets
+
+    def net_members(self, net: str) -> List[Tuple[str, str]]:
+        return list(self.nets.get(net, PlanNet(net)).pads)
+
+    def peers(self, ref: str, net: str, exclude_roles: Optional[set] = None) -> List[str]:
+        """Other components on `net`, optionally excluding certain roles."""
+        exclude_roles = exclude_roles or set()
+        result: List[str] = []
+        for r, _pin in self.net_members(net):
+            if r == ref or r not in self.components:
+                continue
+            if self.components[r].role in exclude_roles:
+                continue
+            if r not in result:
+                result.append(r)
+        return result
+
+    def series_endpoints(self, ref: str) -> Optional[Tuple[str, str]]:
+        """Return (a, b) if ref is a true series element A -> ref -> B, else None.
+
+        Requires exactly two non-ground nets, each of which connects ref to
+        exactly one *other* non-passive component. Shared-net relationships
+        with other passives (e.g. two decoupling capacitors on the same
+        power/ground nets) are not sufficient to infer a series relationship.
+        """
+        comp = self.components.get(ref)
+        if comp is None:
+            return None
+        non_ground = [n for n in comp.nets if not is_ground(n)]
+        if len(non_ground) != 2:
+            return None
+        endpoints: List[str] = []
+        for net in non_ground:
+            real = set(self.peers(ref, net, exclude_roles=_PASSIVE_SUPPORT_ROLES))
+            if len(real) != 1:
+                return None
+            endpoints.append(next(iter(real)))
+        if endpoints[0] == endpoints[1]:
+            return None
+        return endpoints[0], endpoints[1]
+
+    def pullup_owner(self, ref: str, signal_net: Optional[str]) -> Optional[PlanComponent]:
+        """Return the component that owns the signal a pullup/pulldown biases.
+
+        Ownership preference: connectors (the signal leaves the board) first,
+        then the MCU/controller, then other ICs/transceivers/peripherals.
+        """
+        if not signal_net:
+            return None
+        priority = {"high_speed_connector": 0, "connector": 0, "mcu": 1, "hdmi_retimer": 2, "rf_module": 2, "ic": 3, "power_regulator": 4}
+        candidates = [self.components[r] for r in self.peers(ref, signal_net, exclude_roles=_PASSIVE_SUPPORT_ROLES)]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: (priority.get(c.role, 9), c.ref))
+        return candidates[0]
+
+
+def _orbit_point(cx: float, cy: float, radius: float, angle_deg: float) -> Point:
+    theta = math.radians(angle_deg)
+    return cx + radius * math.cos(theta), cy + radius * math.sin(theta)
+
+
+def _blocked_rects(board: BoardGeometry, components: Mapping[str, PlanComponent], keepouts: Sequence[Any], exclude_ref: str) -> List[Dict[str, float]]:
+    rects: List[Dict[str, float]] = []
+    for k in keepouts:
+        if isinstance(k, dict) and all(f in k for f in ("x", "y", "w", "h")):
+            try:
+                rects.append({"x": float(k["x"]), "y": float(k["y"]), "w": float(k["w"]), "h": float(k["h"])})
+            except (TypeError, ValueError):
+                continue
+    for comp in components.values():
+        if comp.ref == exclude_ref or "connector" not in comp.role or comp.bbox is None:
+            continue
+        rects.append({
+            "x": comp.bbox.min_x - board.origin_x - 1.0,
+            "y": comp.bbox.min_y - board.origin_y - 1.0,
+            "w": (comp.bbox.max_x - comp.bbox.min_x) + 2.0,
+            "h": (comp.bbox.max_y - comp.bbox.min_y) + 2.0,
+        })
+    return rects
+
+
+def _point_legal(x: float, y: float, board: BoardGeometry, rects: Sequence[Mapping[str, float]], margin: float = 0.5) -> bool:
+    if x < margin or y < margin or x > board.width - margin or y > board.height - margin:
+        return False
+    for r in rects:
+        if r["x"] - margin <= x <= r["x"] + r["w"] + margin and r["y"] - margin <= y <= r["y"] + r["h"] + margin:
+            return False
+    return True
+
+
+def _distribute_around(
+    anchor: PlanComponent,
+    refs: Sequence[str],
+    board: BoardGeometry,
+    components: Mapping[str, PlanComponent],
+    keepouts: Sequence[Any],
+    base_radius: float = 2.0,
+) -> Tuple[List[Tuple[List[str], float, float, float, str]], bool]:
+    """Group `refs` onto legal perimeter sides of `anchor` for Orbit() placement.
+
+    Returns (layout, degraded). `layout` is a list of
+    (refs_subset, radius, start_angle, step_angle, side_label) tuples, one
+    per side used, suitable for emitting Orbit(). `degraded` is True if no
+    side avoided the board edges, keepouts, or nearby connectors, in which
+    case all four cardinal sides are used as a last resort and the caller
+    should warn that the result requires review.
+    """
+    cx = anchor.x - board.origin_x
+    cy = anchor.y - board.origin_y
+    rects = _blocked_rects(board, components, keepouts, anchor.ref)
+    legal: List[Tuple[float, str]] = []
+    for angle, label in _CARDINAL_DIRECTIONS:
+        x, y = _orbit_point(cx, cy, base_radius, angle)
+        if _point_legal(x, y, board, rects):
+            legal.append((angle, label))
+    degraded = not legal
+    if not legal:
+        legal = list(_CARDINAL_DIRECTIONS)
+    groups: Dict[Tuple[float, str], List[str]] = {key: [] for key in legal}
+    for i, ref in enumerate(refs):
+        key = legal[i % len(legal)]
+        groups[key].append(ref)
+    layout: List[Tuple[List[str], float, float, float, str]] = []
+    for (angle, label), members in groups.items():
+        if not members:
+            continue
+        step = 8.0 if len(members) > 1 else 0.0
+        layout.append((members, base_radius, angle, step, label))
+    return layout, degraded
+
+
+_SEMANTIC_CLUSTER_HINTS: Tuple[Tuple[str, str], ...] = (
+    ("ESP32", "ESP32 cluster"),
+    ("HDMI", "HDMI cluster"),
+    ("TMDS", "HDMI cluster"),
+    ("USB", "USB cluster"),
+    ("WIFI", "RF cluster"),
+)
+
+
+def _cluster_category(comp: PlanComponent) -> str:
+    """Human-readable semantic category for a cluster anchored on `comp`."""
+    haystack = f"{comp.footprint.upper()} {(comp.value or '').upper()} {' '.join(comp.nets).upper()}"
+    for token, label in _SEMANTIC_CLUSTER_HINTS:
+        if token in haystack:
+            return label
+    if comp.role == "mcu":
+        return "MCU cluster"
+    if comp.role == "power_regulator":
+        return "power cluster"
+    if comp.role == "rf_module":
+        return "RF cluster"
+    if comp.role == "hdmi_retimer":
+        return "HDMI cluster"
+    if "connector" in comp.role:
+        return "connector cluster"
+    return f"{comp.role} cluster"
+
+
+_BOUNDS_RULE_KINDS = {"region", "keepout", "corner", "fixed"}
+_XY_RE = re.compile(r"\bx=(-?[0-9.eE+-]+).*?\by=(-?[0-9.eE+-]+)")
+_WH_RE = re.compile(r"\bw=(-?[0-9.eE+-]+).*?\bh=(-?[0-9.eE+-]+)")
+
+
+def _validate_board_bounds(rules: Sequence[PlanRule], board: BoardGeometry) -> List[str]:
+    """Flag region/keepout/corner/fixed rules whose coordinates fall outside the board."""
+    out: List[str] = []
+    for rule in rules:
+        if rule.kind not in _BOUNDS_RULE_KINDS:
+            continue
+        m = _XY_RE.search(rule.text)
+        if not m:
+            continue
+        x, y = float(m.group(1)), float(m.group(2))
+        w = h = 0.0
+        wm = _WH_RE.search(rule.text)
+        if wm:
+            w, h = float(wm.group(1)), float(wm.group(2))
+        if x < -1e-6 or y < -1e-6 or x + w > board.width + 1e-6 or y + h > board.height + 1e-6:
+            out.append(f"{rule.kind} rule is outside board bounds ({board.width:g} x {board.height:g}): {rule.text}")
+    return out
+
+
+_REFINEMENT_RULE_KINDS = {
+    "fixed", "corner", "satellite", "nearpad", "decoupling", "decoupling_array",
+    "pullup", "pullup_array", "series", "between", "esd",
+}
+
+
+def _validate_rules(rules: Sequence[PlanRule], components: Mapping[str, PlanComponent]) -> Tuple[List[str], List[str]]:
+    """Detect duplicate/conflicting rules and impossible topology references.
+
+    Returns (duplicate_rule_descriptions, topology_problem_descriptions).
+    """
+    duplicates: List[str] = []
+    problems: List[str] = []
+    seen_texts: set = set()
+    primary_owner: Dict[str, str] = {}
+    for rule in rules:
+        if rule.text in seen_texts:
+            duplicates.append(f"duplicate placement rule text: {rule.text}")
+        seen_texts.add(rule.text)
+        if rule.kind in {"between", "series", "esd"} and len(rule.refs) >= 3:
+            a_ref, b_ref = rule.refs[1], rule.refs[2]
+            if a_ref == b_ref or a_ref not in components or b_ref not in components:
+                problems.append(f"{rule.kind} rule for {rule.refs[0]} has an impossible Between() location: a={a_ref!r}, b={b_ref!r}")
+        if rule.kind in {"nearpad", "decoupling", "pullup"} and len(rule.refs) >= 2:
+            parent_ref = rule.refs[1]
+            if parent_ref not in components:
+                problems.append(f"{rule.kind} rule for {rule.refs[0]} has an impossible NearPad() location: parent {parent_ref!r} is missing")
+        if rule.kind not in _REFINEMENT_RULE_KINDS or not rule.refs:
+            continue
+        targets = rule.refs if rule.kind in {"decoupling_array", "pullup_array"} else [rule.refs[0]]
+        for ref in targets:
+            existing = primary_owner.get(ref)
+            if existing and existing != rule.kind:
+                duplicates.append(f"{ref}: duplicate primary placement ownership from {existing} and {rule.kind} rules")
+            else:
+                primary_owner.setdefault(ref, rule.kind)
+    return duplicates, problems
+
+
 def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], nets: Dict[str, PlanNet], aliases: Dict[str, str], alias_diagnostics: AliasDiagnostics, intent: Mapping[str, Any], warnings: List[str]) -> Plan:
     infer_roles(components, intent)
     pairs = detect_differential_pairs(nets)
@@ -1090,6 +1338,7 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     rules: List[PlanRule] = []
     explanations: Dict[str, Dict[str, Any]] = {}
     uncertain: List[str] = []
+    topology_failures: List[str] = []
 
     regions: Dict[str, Dict[str, Any]] = {}
     if isinstance(intent.get("regions"), dict):
@@ -1145,7 +1394,7 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             else:
                 text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement=Anchor(x={local_x:.3f}, y={local_y:.3f}, rot={comp.rot:g}), role={_q(comp.role)})'
                 rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector cluster kept at existing location; not adjacent to a board edge."))
-            clusters.append({"name": name, "anchor": comp.ref, "members": members, "role": comp.role})
+            clusters.append({"name": name, "anchor": comp.ref, "members": members, "role": comp.role, "category": _cluster_category(comp), "confidence": "high" if len(members) > 1 else "low"})
             explanations.setdefault(comp.ref, {}).update({"role": comp.role, "generated_rule": text})
 
     # High speed pairs/corridors and ESD chains.
@@ -1183,48 +1432,119 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             placement = f'Anchor(x={comp.x - board.origin_x:.3f}, y={comp.y - board.origin_y:.3f}' + (f', region={_q(region)}' if region else '') + ')'
             text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement={placement}, role={_q(comp.role)})'
             rules.append(PlanRule("cluster", text, members, f"{comp.ref} {comp.role} support cluster preserves coarse neighborhood before pin-aware refinements."))
-            clusters.append({"name": name, "anchor": comp.ref, "members": members, "role": comp.role})
+            clusters.append({"name": name, "anchor": comp.ref, "members": members, "role": comp.role, "category": _cluster_category(comp), "confidence": "high" if len(members) > 1 else "low"})
             explanations.setdefault(comp.ref, {}).update({"role": comp.role, "generated_rule": text})
             if comp.role == "rf_module" and not any(k.get("role") == "rf" for k in keepouts if isinstance(k, dict)):
                 rect = _synthesized_rf_keepout(comp, board)
                 ko = f'Keepout({_q(comp.ref + "_ANTENNA")}, x={rect["x"]:.3f}, y={rect["y"]:.3f}, w={rect["w"]:.3f}, h={rect["h"]:.3f}, role="rf")'
                 rules.append(PlanRule("keepout", ko, [comp.ref], f"{comp.ref} inferred RF/module; synthesized antenna keepout adjacent to module edge and requires engineering review."))
 
+    graph = ConnectivityGraph(components, nets)
     ic_candidates = [c for c in components.values() if c.role in {"ic", "mcu", "hdmi_retimer", "rf_module"}]
+
+    # Decoupling capacitors: group caps that share the same owning power pin
+    # (same parent IC + same power net/pad) and emit one primitive per group
+    # instead of one Decoupling()+NearPad() pair per capacitor.
+    decoupling_groups: List[Dict[str, Any]] = []
+    decoupling_keys: Dict[Tuple[str, str], List[Tuple[PlanComponent, Optional[str]]]] = {}
     for cap in [c for c in components.values() if c.role == "decoupling"]:
         power_nets = {n for n in cap.nets if is_power(n)}
         parent = _nearest_parent(cap, ic_candidates, power_nets) or _nearest_parent(cap, ic_candidates)
-        if parent:
-            pad = _nearest_pad(parent, power_nets)
-            if pad:
-                text = f'Decoupling({_q(cap.ref)}, parent={_q(parent.ref)}, pad={_q(pad)}, distance=1.5, power_net={_q(next(iter(power_nets), None))}, ground_net="GND")'
-            else:
-                text = f'Decoupling({_q(cap.ref)}, parent={_q(parent.ref)}, distance=2.0, power_net={_q(next(iter(power_nets), None))}, ground_net="GND")'
-            rules.append(PlanRule("decoupling", text, [cap.ref, parent.ref], f"{cap.ref} inferred as decoupling: connects {', '.join(cap.nets)} near {parent.ref}."))
-            if pad:
-                near_text = f'NearPad({_q(cap.ref)}, parent={_q(parent.ref)}, pad={_q(pad)}, distance=1.5, role="decoupling")'
-                rules.append(PlanRule("nearpad", near_text, [cap.ref, parent.ref], f"{cap.ref} explicit near-pad refinement for reviewable pin-aware placement."))
-            explanations[cap.ref] = {"role": cap.role, "nets": cap.nets, "parent_candidate": parent.ref, "generated_rule": text}
-        else:
-            uncertain.append(f"{cap.ref} is power-to-ground capacitor but no parent IC candidate was found.")
+        if not parent:
+            uncertain.append(f"{cap.ref} is a power-to-ground capacitor but no parent IC candidate was found.")
+            topology_failures.append(f"{cap.ref}: no parent IC candidate found for decoupling inference")
+            continue
+        power_net = next(iter(power_nets), None)
+        pad = _nearest_pad(parent, power_nets)
+        decoupling_keys.setdefault((parent.ref, pad or power_net or "UNKNOWN"), []).append((cap, power_net))
 
+    for (parent_ref, _pad_or_net), caps in sorted(decoupling_keys.items()):
+        parent = components[parent_ref]
+        power_net = next((pn for _c, pn in caps if pn), None)
+        pad = _nearest_pad(parent, {power_net} if power_net else set())
+        members = [c.ref for c, _ in caps]
+        if len(caps) == 1:
+            cap = caps[0][0]
+            if pad:
+                text = f'Decoupling({_q(cap.ref)}, parent={_q(parent_ref)}, pad={_q(pad)}, distance=1.5, power_net={_q(power_net)}, ground_net="GND")'
+            else:
+                text = f'Decoupling({_q(cap.ref)}, parent={_q(parent_ref)}, distance=2.0, power_net={_q(power_net)}, ground_net="GND")'
+            rules.append(PlanRule("decoupling", text, [cap.ref, parent_ref], f"{cap.ref} inferred as decoupling capacitor for {parent_ref} ({power_net or 'unknown net'}); single placement primitive."))
+            explanations[cap.ref] = {"role": cap.role, "nets": cap.nets, "parent_candidate": parent_ref, "generated_rule": text, "primitive_selected": "Decoupling", "primitive_scores": {"NearPad": 70 if pad else 0, "Decoupling": 90, "Cluster": 0, "Anchor": 10}}
+            decoupling_groups.append({"parent": parent_ref, "power_net": power_net, "pad": pad, "members": members, "primitive": "Decoupling", "grouped": False})
+        else:
+            layout, degraded = _distribute_around(parent, members, board, components, keepouts, base_radius=2.0)
+            if degraded:
+                warnings.append(f"WARNING: no board-edge/keepout-clear side was found for the decoupling array near {parent_ref}; defaulted to all four cardinal sides and requires review.")
+            sides_used: List[str] = []
+            for refs_subset, radius, start_angle, step_angle, side in layout:
+                text = f'Orbit(refs={_q(refs_subset)}, parent={_q(parent_ref)}, radius={radius:g}, start_angle={start_angle:g}, step_angle={step_angle:g}, role="decoupling")'
+                rules.append(PlanRule("decoupling_array", text, list(refs_subset), f"{', '.join(refs_subset)} grouped decoupling array for {parent_ref} ({power_net or 'unknown net'}) on the {side} side; replaces per-capacitor Decoupling()/NearPad() rules."))
+                sides_used.append(side)
+                for cref in refs_subset:
+                    explanations[cref] = {"role": "decoupling", "nets": components[cref].nets, "parent_candidate": parent_ref, "generated_rule": text, "primitive_selected": "Orbit (decoupling array)", "primitive_scores": {"NearPad": 0, "Decoupling": 40, "Cluster": 80, "Anchor": 10}}
+            decoupling_groups.append({"parent": parent_ref, "power_net": power_net, "pad": pad, "members": members, "primitive": "Orbit", "grouped": True, "sides": sides_used})
+
+    # Pullup/pulldown resistors: determine the true owning signal source
+    # (connector/MCU/peripheral) via the connectivity graph and group
+    # resistors that share an owner into a single placement primitive.
+    pullup_groups: List[Dict[str, Any]] = []
+    pullup_owners: Dict[str, List[Tuple[PlanComponent, Optional[str]]]] = {}
     for r in [c for c in components.values() if c.role == "pullup_pulldown"]:
         signal_nets = [n for n in r.nets if not is_power(n) and not is_ground(n)]
-        parent = _nearest_parent(r, ic_candidates, set(signal_nets)) or _nearest_parent(r, ic_candidates)
-        if parent:
-            text = f'Pullup({_q(r.ref)}, parent={_q(parent.ref)}, net={_q(signal_nets[0] if signal_nets else None)}, distance=3.0)'
-            rules.append(PlanRule("pullup", text, [r.ref, parent.ref], f"{r.ref} inferred as pullup/pulldown on {signal_nets[0] if signal_nets else 'unknown signal'} near {parent.ref}."))
-            explanations[r.ref] = {"role": r.role, "nets": r.nets, "parent_candidate": parent.ref, "generated_rule": text}
+        signal_net = signal_nets[0] if signal_nets else None
+        owner = graph.pullup_owner(r.ref, signal_net)
+        if owner is None:
+            owner = _nearest_parent(r, ic_candidates, set(signal_nets)) or _nearest_parent(r, ic_candidates)
+        if owner is None:
+            uncertain.append(f"{r.ref} looks like a pullup/pulldown but no owning connector/IC/peripheral could be determined from the connectivity graph.")
+            topology_failures.append(f"{r.ref}: no owning component found for pullup/pulldown inference")
+            continue
+        pullup_owners.setdefault(owner.ref, []).append((r, signal_net))
+
+    for owner_ref, items in sorted(pullup_owners.items()):
+        owner = components[owner_ref]
+        if len(items) == 1:
+            r, signal_net = items[0]
+            pad = _nearest_pad(owner, {signal_net} if signal_net else set())
+            if pad:
+                text = f'Pullup({_q(r.ref)}, parent={_q(owner_ref)}, net={_q(signal_net)}, pad={_q(pad)}, distance=3.0)'
+            else:
+                text = f'Pullup({_q(r.ref)}, parent={_q(owner_ref)}, net={_q(signal_net)}, distance=3.0)'
+            rules.append(PlanRule("pullup", text, [r.ref, owner_ref], f"{r.ref} inferred as pullup/pulldown on {signal_net or 'unknown signal'}; placed near owning {owner.role} {owner_ref}."))
+            explanations[r.ref] = {"role": r.role, "nets": r.nets, "parent_candidate": owner_ref, "generated_rule": text, "primitive_selected": "Pullup", "primitive_scores": {"NearPad": 70 if pad else 0, "Pullup": 90, "Cluster": 0, "Anchor": 10}}
+            pullup_groups.append({"owner": owner_ref, "members": [r.ref], "primitive": "Pullup", "grouped": False})
+        else:
+            members = [r.ref for r, _ in items]
+            layout, degraded = _distribute_around(owner, members, board, components, keepouts, base_radius=3.0)
+            if degraded:
+                warnings.append(f"WARNING: no board-edge/keepout-clear side was found for the pullup array near {owner_ref}; defaulted to all four cardinal sides and requires review.")
+            sides_used = []
+            for refs_subset, radius, start_angle, step_angle, side in layout:
+                text = f'Orbit(refs={_q(refs_subset)}, parent={_q(owner_ref)}, radius={radius:g}, start_angle={start_angle:g}, step_angle={step_angle:g}, role="pullup")'
+                rules.append(PlanRule("pullup_array", text, list(refs_subset), f"{', '.join(refs_subset)} grouped pullup/pulldown array near owning {owner.role} {owner_ref} on the {side} side."))
+                sides_used.append(side)
+                for rref in refs_subset:
+                    explanations[rref] = {"role": "pullup_pulldown", "nets": components[rref].nets, "parent_candidate": owner_ref, "generated_rule": text, "primitive_selected": "Orbit (pullup array)", "primitive_scores": {"NearPad": 0, "Pullup": 40, "Cluster": 80, "Anchor": 10}}
+            pullup_groups.append({"owner": owner_ref, "members": members, "primitive": "Orbit", "grouped": True, "sides": sides_used})
+
+    # Series passives: only infer Series() when the connectivity graph shows
+    # a true A -> resistor -> B path (each non-ground net connects the
+    # resistor to exactly one other non-passive component). Shared-net
+    # relationships with other passives (e.g. decoupling caps) are
+    # insufficient and are rejected with a warning instead.
     for r in [c for c in components.values() if c.role == "series"]:
-        peers = [components[ref] for n in r.nets for ref, _ in nets.get(n, PlanNet(n)).pads if ref in components and ref != r.ref and components[ref].role not in {"resistor", "capacitor"}]
-        unique_peers = []
-        for peer in peers:
-            if peer.ref not in {p.ref for p in unique_peers}:
-                unique_peers.append(peer)
-        if len(unique_peers) >= 2:
-            text = f'Series({_q(r.ref)}, a={_q(unique_peers[0].ref)}, b={_q(unique_peers[1].ref)}, t=0.5, offset=0)'
-            rules.append(PlanRule("series", text, [r.ref, unique_peers[0].ref, unique_peers[1].ref], f"{r.ref} inferred as series component between {unique_peers[0].ref} and {unique_peers[1].ref}."))
-            explanations[r.ref] = {"role": r.role, "nets": r.nets, "generated_rule": text}
+        endpoints = graph.series_endpoints(r.ref)
+        if endpoints:
+            a_ref, b_ref = endpoints
+            text = f'Series({_q(r.ref)}, a={_q(a_ref)}, b={_q(b_ref)}, t=0.5, offset=0)'
+            rules.append(PlanRule("series", text, [r.ref, a_ref, b_ref], f"{r.ref} validated as series component between {a_ref} and {b_ref} via connectivity graph."))
+            explanations[r.ref] = {"role": r.role, "nets": r.nets, "generated_rule": text, "primitive_selected": "Series"}
+        else:
+            msg = f"{r.ref} looks like a two-pin series component, but the connectivity graph could not find a unique A -> {r.ref} -> B topology; rejecting Series() inference."
+            uncertain.append(msg)
+            warnings.append("WARNING: " + msg)
+            topology_failures.append(f"{r.ref}: rejected Series() inference (no validated A-resistor-B topology)")
 
     placed_refs = {ref for rule in rules for ref in rule.refs}
     anchor_candidates = [c for c in components.values() if c.role in {"ic", "mcu", "hdmi_retimer", "rf_module", "power_regulator", "connector", "high_speed_connector"}]
@@ -1258,6 +1578,11 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     if unplaced_support:
         warnings.append("Support components without generated placement rules require review: " + ", ".join(sorted(unplaced_support)))
 
+    warnings.extend(_validate_board_bounds(rules, board))
+    duplicate_rules, rule_problems = _validate_rules(rules, components)
+    warnings.extend(duplicate_rules)
+    topology_failures.extend(rule_problems)
+
     roles = {ref: c.role for ref, c in components.items()}
     return Plan(
         board,
@@ -1284,6 +1609,10 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
         warnings,
         uncertain,
         explanations,
+        topology_failures,
+        decoupling_groups,
+        pullup_groups,
+        duplicate_rules,
     )
 
 
@@ -1475,8 +1804,8 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
         ("Regions and keepouts", {"region", "keepout"}),
         ("Fixed mechanical placement", {"corner", "fixed"}),
         ("Clusters and routing corridors", {"cluster", "corridor"}),
-        ("Critical pin-aware refinements", {"decoupling", "esd", "nearpad", "between"}),
-        ("Low-priority refinements", {"pullup", "series", "satellite"}),
+        ("Critical pin-aware refinements", {"decoupling", "decoupling_array", "esd", "nearpad", "between"}),
+        ("Low-priority refinements", {"pullup", "pullup_array", "series", "satellite"}),
     ]
     emitted: set[int] = set()
     for title, kinds in sections:
@@ -1511,6 +1840,12 @@ def report(plan: Plan) -> Dict[str, Any]:
     quality_warnings = list(plan.warnings)
     if plan.components and len(unplaced) / len(plan.components) > 0.5:
         quality_warnings.append(f"Most components are unplaced ({len(unplaced)}/{len(plan.components)}); review connectivity and semantic intent.")
+    primitive_counts: Dict[str, int] = {}
+    for r in plan.rules:
+        primitive = r.text.split("(", 1)[0].strip()
+        primitive_counts[primitive] = primitive_counts.get(primitive, 0) + 1
+    total_clusters = single_clusters + multi_clusters
+    cluster_quality_score = (multi_clusters / total_clusters) if total_clusters else 1.0
     return {
         "components_parsed": len(plan.components),
         "nets_parsed": len(plan.nets),
@@ -1532,6 +1867,13 @@ def report(plan: Plan) -> Dict[str, Any]:
         "warnings": quality_warnings,
         "unplaced_components": unplaced,
         "uncertain_inferences": plan.uncertain_inferences,
+        "primitive_counts": primitive_counts,
+        "duplicate_rules": plan.duplicate_rules,
+        "failed_topology_inference": plan.topology_failures,
+        "cluster_quality_score": cluster_quality_score,
+        "decoupling_groups": plan.decoupling_groups,
+        "pullup_groups": plan.pullup_groups,
+        "series_components_validated": rule_count("series"),
         "routing": {
             "mode": plan.routing.get("mode"),
             "classes": _as_mapping(plan.routing.get("classes")),
