@@ -1,15 +1,51 @@
-# pcb-place
+# pcb-place repository
 
-This repository provides two complementary command-line tools for reviewable PCB placement workflows. The intended direction is to build from Zener board designs into a complete **board-as-code build definition** workflow: electrical design, generated layout artifacts, planner floorplan intent, deterministic placement execution, and final KiCad engineering review.
+This repository contains two complementary command-line tools for reviewable PCB
+planning and placement workflows:
 
-- [`pcb-plan`](README-plan.md) is an experimental, heuristic planner. It reads a KiCad board plus optional Zener/pcb netlist and `.pln` board-plan files, infers placement intent from pins, nets, footprints, and roles, then generates an explicit `.ppl` part-placement file.
-- [`pcb-place`](README-place.md) is the deterministic placement executor. It reads a `.ppl` placement plan and a KiCad `.kicad_pcb` file, then writes a placed KiCad board.
+- [`pcb-plan`](src/pcb-plan/README.md) owns `board.pln` planning intent. It can
+  initialize, update, review, and explain `board.pln`; infer placement, routing,
+  and simulation intent; and emit deterministic `placement.ppl` files for
+  execution.
+- [`pcb-place`](src/pcb-place/README.md) is the deterministic placement executor.
+  It consumes `placement.ppl`, validates placement rules, applies footprint
+  placement to KiCad `.kicad_pcb` files, and writes placed boards.
 
-The split is intentional: planning is knowledge-based and heuristic, while execution is deterministic, reviewable, and CI-friendly.
+The split is intentional: planning is knowledge-based and heuristic, while
+execution is deterministic, reviewable, and CI-friendly. `pcb-plan` must not move
+footprints or route traces; `pcb-place` must not infer planning strategy from
+netlists or own `board.pln`.
+
+## Repository structure
+
+```text
+.
+├── README.md                  # Repository overview and structure
+├── pyproject.toml             # Packaging and console-script metadata
+├── src/
+│   ├── pcb-plan/
+│   │   ├── README.md          # pcb-plan and board.pln documentation
+│   │   ├── pcb_plan.py        # pcb-plan implementation
+│   │   └── pcb_plan_facades/  # Internal migration/facade modules
+│   ├── pcb-place/
+│   │   ├── README.md          # pcb-place DSL and executor documentation
+│   │   └── pcb_place.py       # pcb-place implementation
+│   ├── pcb_plan/              # Import package for console scripts
+│   └── pcb_place/             # Import package for console scripts
+├── examples/                  # Example placement workflows and inputs
+└── tests/                     # Unit and CLI integration tests
+```
+
+There are no root-level `pcb_plan.py` or `pcb_place.py` compatibility entry
+points. The canonical executable implementations live beside their READMEs in
+`src/pcb-plan/` and `src/pcb-place/`. Small import packages under
+`src/pcb_plan/` and `src/pcb_place/` provide normal Python entry point targets
+for installed console scripts.
 
 ## Overall workflow
 
-`pcb-plan` and `pcb-place` are designed to fit after generated board creation and before manual routing/review:
+`pcb-plan` and `pcb-place` fit after generated board creation and before manual
+routing/review:
 
 ```text
 Zener / Diode pcb design
@@ -18,7 +54,11 @@ pcb build
     ↓
 pcb layout
     ↓
-pcb-plan
+pcb-plan init/update/review
+    ↓
+board.pln
+    ↓
+pcb-plan emit
     ↓
 placement.ppl
     ↓
@@ -34,36 +74,67 @@ A conservative command-line workflow is:
 ```bash
 pcb build board.zen
 pcb layout board.zen
-pcb-plan --board layout.kicad_pcb --netlist default.net --intent board.pln -o placement.ppl
+
+pcb-plan init \
+  --board layout.kicad_pcb \
+  --netlist default.net \
+  -o board.pln
+
+pcb-plan emit \
+  --pln board.pln \
+  --board layout.kicad_pcb \
+  --netlist default.net \
+  -o placement.ppl
+
 pcb-place layout.kicad_pcb placement.ppl --dry-run
 pcb-place layout.kicad_pcb placement.ppl -o layout.placed.kicad_pcb
 pcbnew layout.placed.kicad_pcb
 ```
 
-For early use, you can skip the planner and write `placement.ppl` by hand, or run the planner with only a KiCad board:
+For early use, you can skip the planner and write `placement.ppl` by hand, or
+run the planner with only a KiCad board:
 
 ```bash
-pcb-plan --board layout.kicad_pcb -o placement.ppl
+pcb-plan emit --board layout.kicad_pcb -o placement.ppl
 pcb-place layout.kicad_pcb placement.ppl -o layout.placed.kicad_pcb
+```
+
+Legacy one-shot planner invocation is still supported for compatibility:
+
+```bash
+pcb-plan --board layout.kicad_pcb --netlist default.net --intent board.pln -o placement.ppl
 ```
 
 ## Tool responsibilities
 
-### pcb-plan: generate placement intent
+### pcb-plan: own planning intent
 
-`pcb-plan` reads board/netlist/`.pln` artifacts and emits a readable `.ppl` file. It may infer roles such as connectors, ICs, decoupling capacitors, ESD devices, high-speed differential interfaces, RF modules, power regulators, pullups, and series passives.
+`pcb-plan` owns the `board.pln` lifecycle and emits a readable `.ppl` placement
+plan. It may infer roles such as connectors, ICs, decoupling capacitors, ESD
+devices, high-speed differential interfaces, RF modules, power regulators,
+pullups, and series passives.
 
-Planner output is meant to be reviewed, edited, diffed, and re-run. It does **not** route traces, tune differential pairs, validate impedance, certify EMI behavior, or claim production readiness.
+Planner output is meant to be reviewed, edited, diffed, and re-run. It does
+**not** route traces, tune differential pairs, validate impedance, certify EMI
+behavior, or claim production readiness.
 
-See [`README-plan.md`](README-plan.md) for planner CLI details, supported inputs, generated reports, `--explain REF`, heuristics, and limitations.
+See [`src/pcb-plan/README.md`](src/pcb-plan/README.md) for planner CLI details,
+`board.pln` syntax, provenance, reports, routing/SI hooks, simulation hooks,
+heuristics, and limitations.
 
 ### pcb-place: execute placement intent
 
-`pcb-place` reads an explicit `.ppl` part-placement file and applies deterministic footprint-level placement updates to a KiCad `.kicad_pcb` file. It provides dry-run, check, validation, reporting, alias import, board-geometry handling, keepout/region validation, and safe atomic writes.
+`pcb-place` reads an explicit `.ppl` part-placement file and applies
+deterministic footprint-level placement updates to a KiCad `.kicad_pcb` file. It
+provides dry-run, check, validation, reporting, alias import, board-geometry
+handling, keepout/region validation, and safe atomic writes.
 
-Executor behavior should remain predictable and independent of planner heuristics. It does **not** infer placement strategy from netlists and does **not** route traces.
+Executor behavior should remain predictable and independent of planner
+heuristics. It does **not** infer placement strategy from netlists and does
+**not** route traces.
 
-See [`README-place.md`](README-place.md) for the placement DSL, safety checks, CLI reference, and executor-specific examples.
+See [`src/pcb-place/README.md`](src/pcb-place/README.md) for the placement DSL,
+safety checks, CLI reference, and executor-specific examples.
 
 ## Installation
 
@@ -91,13 +162,24 @@ pcb-place --help
 
 Both tools are sidecars around KiCad files:
 
-- `pcb-plan` never writes directly to `.kicad_pcb`; it reads optional `.pln` board-plan files and only emits `.ppl` part-placement files plus optional JSON reports.
-- `pcb-place` rewrites only matched footprint-level placement records and defaults to writing a separate output file unless `--in-place` is explicitly requested.
-- Generated or executed placement must be reviewed in KiCad before routing and fabrication.
-- High-speed routing, impedance, return paths, reference planes, DRC/ERC, manufacturability, thermal behavior, RF behavior, and EMI compliance remain engineering responsibilities.
+- `pcb-plan` never writes directly to `.kicad_pcb`; it reads or writes
+  `board.pln`, emits `placement.ppl`, and can emit JSON/Markdown reports plus
+  routing/simulation planning artifacts.
+- `pcb-place` rewrites only matched footprint-level placement records and
+  defaults to writing a separate output file unless `--in-place` is explicitly
+  requested.
+- Generated or executed placement must be reviewed in KiCad before routing and
+  fabrication.
+- High-speed routing, impedance, return paths, reference planes, DRC/ERC,
+  manufacturability, thermal behavior, RF behavior, and EMI compliance remain
+  engineering responsibilities.
 
 ## Documentation map
 
-- [`README-plan.md`](README-plan.md): planner-specific documentation for generating `.ppl` files.
-- [`README-place.md`](README-place.md): executor-specific documentation for applying `.ppl` files to KiCad boards.
+- [`src/pcb-plan/README.md`](src/pcb-plan/README.md): planner-specific
+  documentation for `board.pln`, lifecycle commands, routing/SI constraints,
+  simulation hooks, reports, and `.ppl` generation.
+- [`src/pcb-place/README.md`](src/pcb-place/README.md): executor-specific
+  documentation for applying `.ppl` files to KiCad boards.
 - [`examples/`](examples): example placement workflows and input files.
+- [`tests/`](tests): unit and CLI integration tests for both tools.

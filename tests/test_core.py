@@ -6,7 +6,9 @@ import sys
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
+
+PLACE_CLI = ROOT / "src/pcb-place/pcb_place.py"
 
 import pcb_place
 from pcb_place import apply_placements, import_netlist_aliases, is_valid_uuid, load_ppl, parse_footprints, parse_netlist_aliases
@@ -31,7 +33,7 @@ def test_apply_basic_rules():
 
 def test_cli_list_refs_json():
     result = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(ROOT / "tests/fixtures/simple.kicad_pcb"), "--list-refs", "--format", "json"],
+        [sys.executable, str(PLACE_CLI), str(ROOT / "tests/fixtures/simple.kicad_pcb"), "--list-refs", "--format", "json"],
         check=True,
         capture_output=True,
         text=True,
@@ -44,7 +46,7 @@ def test_cli_check_fails_when_stale(tmp_path):
     pcb = tmp_path / "simple.kicad_pcb"
     ppl = ROOT / "tests/fixtures/simple.ppl"
     pcb.write_text((ROOT / "tests/fixtures/simple.kicad_pcb").read_text())
-    result = subprocess.run([sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--check"], capture_output=True, text=True)
+    result = subprocess.run([sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--check"], capture_output=True, text=True)
     assert result.returncode == 1
 
 from pcb_place import PlacementError
@@ -82,7 +84,7 @@ def test_cli_validate(tmp_path):
     pcb = tmp_path / "simple.kicad_pcb"
     ppl = ROOT / "tests/fixtures/simple.ppl"
     pcb.write_text((ROOT / "tests/fixtures/simple.kicad_pcb").read_text())
-    result = subprocess.run([sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--validate"], capture_output=True, text=True)
+    result = subprocess.run([sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--validate"], capture_output=True, text=True)
     assert result.returncode == 0
     assert "validate:" in result.stdout
 
@@ -166,7 +168,7 @@ Anchor("MCU.U_DOES_NOT_EXIST", x=1, y=2)
 
 def test_cli_list_aliases_json():
     result = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), "--netlist", str(ROOT / "tests/fixtures/zener.json"), "--list-aliases", "--format", "json"],
+        [sys.executable, str(PLACE_CLI), "--netlist", str(ROOT / "tests/fixtures/zener.json"), "--list-aliases", "--format", "json"],
         check=True,
         capture_output=True,
         text=True,
@@ -185,7 +187,7 @@ Board(width=50, height=30)
 Anchor("MCU.U_MCU", x=25, y=15, rot=0)
 ''')
     subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--netlist", str(ROOT / "tests/fixtures/zener.json"), "--report-json", str(report), "--dry-run"],
+        [sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--netlist", str(ROOT / "tests/fixtures/zener.json"), "--report-json", str(report), "--dry-run"],
         check=True,
         capture_output=True,
         text=True,
@@ -255,14 +257,14 @@ Board(width=70, height=40)
 Anchor("U1", x=10, y=5)
 ''')
     bounds = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), "--print-bounds"],
+        [sys.executable, str(PLACE_CLI), str(pcb), "--print-bounds"],
         check=True,
         capture_output=True,
         text=True,
     )
     assert "min_x=140" in bounds.stdout
     result = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--infer-origin", "--dry-run", "--report-json", str(report)],
+        [sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--infer-origin", "--dry-run", "--report-json", str(report)],
         check=True,
         capture_output=True,
         text=True,
@@ -380,7 +382,7 @@ Board(width=300, height=200)
 Anchor("U1", x=10, y=20)
 ''')
     result = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "-o", str(out)],
+        [sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "-o", str(out)],
         check=True,
         capture_output=True,
         text=True,
@@ -400,7 +402,7 @@ Board(width=10, height=10)
 Anchor("U1", x=20, y=0)
 ''')
     result = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--dry-run", "--report-json", str(report)],
+        [sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--dry-run", "--report-json", str(report)],
         check=True,
         capture_output=True,
         text=True,
@@ -557,7 +559,7 @@ def test_cli_print_board_and_improved_print_bounds(tmp_path):
     pcb = tmp_path / "edge.kicad_pcb"
     pcb.write_text(_pcb_with_edge_rect())
     board = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), "--print-board"],
+        [sys.executable, str(PLACE_CLI), str(pcb), "--print-board"],
         check=True,
         capture_output=True,
         text=True,
@@ -565,7 +567,7 @@ def test_cli_print_board_and_improved_print_bounds(tmp_path):
     assert "source=edge_cuts" in board.stdout
     assert "width=70" in board.stdout
     bounds = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), "--print-bounds"],
+        [sys.executable, str(PLACE_CLI), str(pcb), "--print-bounds"],
         check=True,
         capture_output=True,
         text=True,
@@ -584,7 +586,7 @@ def test_cli_emit_outline_only(tmp_path):
 Board(width=70, height=70, origin_x=140, origin_y=52, emit_outline=True)
 ''')
     subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--emit-outline-only", str(out)],
+        [sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--emit-outline-only", str(out)],
         check=True,
         capture_output=True,
         text=True,
@@ -603,7 +605,7 @@ def test_cli_debug_write_reports_generated_uuids(tmp_path):
 Board(width=70, height=70, origin_x=140, origin_y=52, emit_outline=True)
 ''')
     result = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--emit-outline-only", str(out), "--debug-write"],
+        [sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--emit-outline-only", str(out), "--debug-write"],
         check=True,
         capture_output=True,
         text=True,
@@ -751,7 +753,7 @@ Anchor("U1", x=10, y=10)
 Satellite("C1", parent="U1", side="top", distance=0.1)
 ''')
     result = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--dry-run", "--report-json", str(report), "--warn-overlap"],
+        [sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--dry-run", "--report-json", str(report), "--warn-overlap"],
         check=True,
         capture_output=True,
         text=True,
@@ -919,7 +921,7 @@ Satellite("C5", parent="U6", side="top", distance=2)
     assert any("C5 moved by cluster MCU later refined by satellite" in m.text for m in messages)
 
     clusters = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--print-clusters"],
+        [sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--print-clusters"],
         check=True,
         capture_output=True,
         text=True,
@@ -928,7 +930,7 @@ Satellite("C5", parent="U6", side="top", distance=2)
     assert "members: 2" in clusters.stdout
 
     subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--report-json", str(report), "--dry-run", "--allow-overlap"],
+        [sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--report-json", str(report), "--dry-run", "--allow-overlap"],
         check=True,
         capture_output=True,
         text=True,
@@ -1043,7 +1045,7 @@ Anchor("D1", x=4, y=4, priority=2)
     assert any(item["reason"] == "higher_priority" for item in report["overridden_rules"])
     assert report["priority_conflicts"]
     assert '(at 5 5 0)' in out
-    result = subprocess.run([sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--print-regions"], check=True, capture_output=True, text=True)
+    result = subprocess.run([sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--print-regions"], check=True, capture_output=True, text=True)
     assert "Region CONTROL" in result.stdout
 
 

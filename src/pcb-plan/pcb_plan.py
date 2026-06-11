@@ -16,6 +16,14 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+# Allow this implementation file to run directly from src/pcb-plan while
+# still resolving the import package used by installed console scripts.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SRC_ROOT = _REPO_ROOT / "src"
+for _path in (_SRC_ROOT, _REPO_ROOT):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
 from pcb_place import (
     AliasDiagnostics,
     BBox,
@@ -344,8 +352,8 @@ def _parse_simple_yaml(text: str) -> Dict[str, Any]:
         while stack and indent <= stack[-1][0]:
             stack.pop()
         parent = stack[-1][1]
-        if stripped.startswith("- "):
-            item_text = stripped[2:].strip()
+        if stripped == "-" or stripped.startswith("- "):
+            item_text = stripped[1:].strip()
             if not isinstance(parent, list):
                 # A key with no scalar value defaults to a dict, but a following
                 # dash means it should be a list (e.g. keepouts: / - name: ...).
@@ -357,7 +365,11 @@ def _parse_simple_yaml(text: str) -> Dict[str, Any]:
                     stack.append((indent - 2, parent))
                 else:
                     continue
-            if ":" in item_text and not item_text.startswith(("{", "[")):
+            if not item_text:
+                item = {}
+                parent.append(item)
+                stack.append((indent, item))
+            elif ":" in item_text and not item_text.startswith(("{", "[")):
                 k, v = item_text.split(":", 1)
                 item = {k.strip(): _parse_scalar(v)}
                 parent.append(item)
@@ -1194,53 +1206,535 @@ def explain_text(plan: Plan, ref: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="pcb-plan", description="Generate a reviewable pcb-place .ppl placement plan from a KiCad board")
-    parser.add_argument("--board", required=True, type=Path, help="Input KiCad .kicad_pcb board")
-    parser.add_argument("--netlist", type=Path, help="Optional Zener/pcb netlist artifact")
-    parser.add_argument("--intent", type=Path, help="Optional .pln board-plan file (YAML subset or JSON content)")
-    parser.add_argument("-o", "--output", type=Path, help="Output placement.ppl path")
-    parser.add_argument("--report-json", type=Path, help="Write planner report JSON")
-    parser.add_argument("--emit-routing-policy", type=Path, help="Write routing-policy.yaml handoff from .pln routing constraints")
-    parser.add_argument("--emit-openems-plan", type=Path, help="Write OpenEMS handoff plan when simulation.openems is enabled")
-    parser.add_argument("--explain", help="Print inference explanation for a reference")
-    parser.add_argument("--version", action="version", version=f"pcb-plan {__version__}")
-    return parser
+
+def provenance_value(value: Any, source: str, confidence: str = "medium", requires_review: bool = True) -> Dict[str, Any]:
+    """Represent an inferred board.pln value with visible provenance."""
+    return {
+        "value": value,
+        "source": source,
+        "confidence": confidence,
+        "requires_review": requires_review,
+    }
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    if not args.board.exists():
-        raise SystemExit(f"Board file not found: {args.board}")
-    if args.netlist and not args.netlist.exists():
-        raise SystemExit(f"Netlist file not found: {args.netlist}")
-    if args.intent and not args.intent.exists():
-        raise SystemExit(f"Intent file not found: {args.intent}")
-    board, components, nets, warnings = parse_board(args.board)
-    aliases, alias_diag, net_warnings = import_netlist(args.netlist, components, nets)
+def unwrap_provenance(value: Any) -> Any:
+    """Convert board.pln provenance wrappers into plain values for planners."""
+    if isinstance(value, Mapping):
+        keys = set(value.keys())
+        if {"value", "source", "confidence", "requires_review"}.issubset(keys):
+            return unwrap_provenance(value.get("value"))
+        return {str(k): unwrap_provenance(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [unwrap_provenance(v) for v in value]
+    return value
+
+
+def load_pln(path: Optional[Path]) -> Dict[str, Any]:
+    return load_intent(path)
+
+
+def serialize_pln(payload: Mapping[str, Any]) -> str:
+    return emit_yaml(payload)
+
+
+def validate_pln(payload: Mapping[str, Any]) -> List[str]:
+    warnings: List[str] = []
+    allowed = {
+        "board", "regions", "keepouts", "roles", "clusters", "high_speed", "routing",
+        "stackup", "differential_pairs", "net_classes", "simulation", "provenance",
+        "fixed", "routing_overrides",
+    }
+    for key in payload:
+        if key not in allowed:
+            warnings.append(f"Unknown board.pln section {key!r}.")
+    board = _as_mapping(payload.get("board"))
+    for field in ("width", "height"):
+        value = unwrap_provenance(board.get(field))
+        if value is not None and not _is_positive_number(value):
+            warnings.append(f"board.{field} must be positive.")
+    return warnings
+
+
+def _prov_dict_from_mapping(spec: Mapping[str, Any], source: str, confidence: str = "medium", review: bool = True) -> Dict[str, Any]:
+    return {str(k): provenance_value(v, source, confidence, review) for k, v in spec.items()}
+
+
+def infer_stackup_candidates(plan: Plan) -> Dict[str, Any]:
+    if plan.stackup:
+        return plan.stackup
+    has_high_speed = bool(plan.differential_pairs) or any(is_high_speed(n) for n in plan.nets)
+    if not has_high_speed:
+        return {
+            "layers": [
+                {"name": "F.Cu", "type": "signal"},
+                {"name": "B.Cu", "type": "signal"},
+            ],
+            "notes": provenance_value("2-layer default candidate; review for impedance-controlled designs", "inferred_from_board_complexity", "low", True),
+        }
+    return {
+        "layers": [
+            {"name": "F.Cu", "type": "signal"},
+            {"name": "In1.GND", "type": "plane", "net": "GND"},
+            {"name": "In2.PWR", "type": "plane"},
+            {"name": "B.Cu", "type": "signal"},
+        ],
+        "dielectric": [
+            {"between": ["F.Cu", "In1.GND"], "material": "FR4", "thickness_mm": provenance_value(0.18, "candidate_for_high_speed_impedance", "low", True), "er": provenance_value(4.2, "generic_fr4_assumption", "low", True)}
+        ],
+        "notes": provenance_value("4-layer controlled-impedance candidate inferred from high-speed nets", "inferred_from_high_speed_nets", "medium", True),
+    }
+
+
+def infer_simulation_config(plan: Plan) -> Dict[str, Any]:
+    existing = _as_mapping(plan.simulation)
+    openems_triggers: List[str] = []
+    ngspice_triggers: List[str] = []
+    net_names = " ".join(plan.nets.keys()).upper()
+    if any(token in net_names for token in ("HDMI", "USB", "ETH", "RF", "TMDS", "SSTX", "SSRX")) or plan.differential_pairs:
+        openems_triggers.append("high_speed_or_differential_interface")
+    if any(c.role in {"regulator", "power", "filter", "oscillator"} for c in plan.components.values()):
+        ngspice_triggers.append("power_or_analog_network")
+    if existing:
+        return existing
+    return {
+        "openems": {
+            "enabled": provenance_value("auto", "inferred_from_interfaces", "medium" if openems_triggers else "low", True),
+            "trigger_on": [provenance_value(t, "inferred_from_interfaces", "medium", True) for t in openems_triggers],
+        },
+        "ngspice": {
+            "enabled": provenance_value("auto", "inferred_from_roles", "medium" if ngspice_triggers else "low", True),
+            "trigger_on": [provenance_value(t, "inferred_from_roles", "medium", True) for t in ngspice_triggers],
+        },
+    }
+
+
+def infer_routing_constraints(plan: Plan) -> Dict[str, Any]:
+    if plan.routing:
+        return plan.routing
+    classes: Dict[str, Any] = {
+        "low_speed": {
+            "trace_width_mm": provenance_value(0.15, "default_low_speed_candidate", "low", True),
+            "clearance_mm": provenance_value(0.15, "default_low_speed_candidate", "low", True),
+            "preferred_layers": [provenance_value("F.Cu", "default_low_speed_candidate", "low", True), provenance_value("B.Cu", "default_low_speed_candidate", "low", True)],
+            "via_policy": provenance_value("allow", "default_low_speed_candidate", "low", True),
+        }
+    }
+    if plan.differential_pairs:
+        classes["high_speed_diff"] = {
+            "differential": provenance_value(True, "inferred_from_differential_pairs", "medium", True),
+            "impedance_ohms": provenance_value(100, "inferred_from_high_speed_diff", "medium", True),
+            "trace_width_mm": provenance_value(0.12, "candidate_requires_stackup_solver", "low", True),
+            "trace_spacing_mm": provenance_value(0.15, "candidate_requires_stackup_solver", "low", True),
+            "reference_plane": provenance_value("In1.GND", "candidate_4_layer_stackup", "low", True),
+            "preferred_layer": provenance_value("F.Cu", "candidate_4_layer_stackup", "low", True),
+            "max_skew_mm": provenance_value(0.25, "inferred_from_high_speed_diff", "medium", True),
+            "via_policy": provenance_value("avoid", "inferred_from_high_speed_diff", "medium", True),
+        }
+    return {
+        "mode": provenance_value("all_nets_constrained" if plan.differential_pairs else "low_speed_only", "inferred_from_connectivity", "medium", True),
+        "classes": classes,
+    }
+
+
+def plan_to_pln(plan: Plan) -> Dict[str, Any]:
+    pairs = {
+        pair.name: {
+            "p": provenance_value(pair.p, "inferred_from_net_names", "medium", True),
+            "n": provenance_value(pair.n, "inferred_from_net_names", "medium", True),
+            "components": [provenance_value(ref, "inferred_from_pair_connectivity", "medium", True) for ref in pair.components],
+            "class": provenance_value("high_speed_diff", "inferred_from_net_names", "medium", True),
+        }
+        for pair in plan.differential_pairs
+    }
+    high_speed_nets = sorted(n for n in plan.nets if is_high_speed(n))
+    payload: Dict[str, Any] = {
+        "board": {
+            "width": provenance_value(plan.board.width, f"inferred_from_{plan.board.source}", "high" if plan.board.source == "edge_cuts" else "medium", plan.board.source != "edge_cuts"),
+            "height": provenance_value(plan.board.height, f"inferred_from_{plan.board.source}", "high" if plan.board.source == "edge_cuts" else "medium", plan.board.source != "edge_cuts"),
+            "origin_x": provenance_value(plan.board.origin_x, f"inferred_from_{plan.board.source}", "high" if plan.board.source == "edge_cuts" else "medium", plan.board.source != "edge_cuts"),
+            "origin_y": provenance_value(plan.board.origin_y, f"inferred_from_{plan.board.source}", "high" if plan.board.source == "edge_cuts" else "medium", plan.board.source != "edge_cuts"),
+            "units": provenance_value("mm", "kicad_default", "high", False),
+        },
+        "regions": {name: _prov_dict_from_mapping(spec, "inferred_from_board_geometry", "medium", True) for name, spec in plan.regions.items()},
+        "keepouts": [_prov_dict_from_mapping(k, "inferred_from_component_roles", "medium", True) for k in plan.keepouts],
+        "roles": {ref: provenance_value(role, "; ".join(plan.components[ref].role_reasons) or "inferred_from_reference_and_nets", "medium" if role != "unknown" else "low", role == "unknown") for ref, role in plan.roles.items()},
+        "clusters": [_prov_dict_from_mapping(c, "inferred_from_connectivity", "medium", True) for c in plan.clusters],
+        "high_speed": {
+            "nets": [provenance_value(n, "inferred_from_net_names", "medium", True) for n in high_speed_nets],
+            "interfaces": [provenance_value(p.name, "inferred_from_differential_pairs", "medium", True) for p in plan.differential_pairs],
+        },
+        "routing": infer_routing_constraints(plan),
+        "stackup": infer_stackup_candidates(plan),
+        "differential_pairs": pairs,
+        "net_classes": plan.net_classes,
+        "simulation": infer_simulation_config(plan),
+        "provenance": {
+            "generator": "pcb-plan init",
+            "schema_version": "0.1",
+            "visibility": "inferred values include value/source/confidence/requires_review wrappers where practical",
+        },
+    }
+    return payload
+
+
+def pln_report(plan: Plan, pln_payload: Mapping[str, Any], action: str) -> Dict[str, Any]:
+    base = report(plan)
+    review_required: List[str] = []
+    def walk(value: Any, path: str = "") -> None:
+        if isinstance(value, Mapping):
+            if value.get("requires_review") is True and "value" in value:
+                review_required.append(path or "<root>")
+            for k, v in value.items():
+                walk(v, f"{path}.{k}" if path else str(k))
+        elif isinstance(value, list):
+            for i, v in enumerate(value):
+                walk(v, f"{path}[{i}]")
+    walk(pln_payload)
+    base.update({
+        "action": action,
+        "pln_schema_sections": sorted(pln_payload.keys()),
+        "pln_validation_warnings": validate_pln(pln_payload),
+        "review_required_items": review_required,
+    })
+    return base
+
+
+def review_pln_text(payload: Mapping[str, Any]) -> str:
+    warnings = validate_pln(payload)
+    plain = unwrap_provenance(payload)
+    lines = ["board.pln review", "================", ""]
+    board = _as_mapping(plain.get("board"))
+    if board:
+        lines.append(f"Board: {board.get('width', '?')} x {board.get('height', '?')} {board.get('units', 'mm')} at origin ({board.get('origin_x', '?')}, {board.get('origin_y', '?')})")
+    lines.append("")
+    for title, key in (("Inferred constraints", "routing"), ("Stackup", "stackup"), ("Simulation", "simulation"), ("Differential pairs", "differential_pairs"), ("Roles", "roles"), ("Regions", "regions"), ("Keepouts", "keepouts")):
+        lines.append(title + ":")
+        value = plain.get(key, {})
+        rendered = emit_yaml(value).rstrip().splitlines() if value else ["  none"]
+        lines.extend(("  " + r if r else r) for r in rendered[:80])
+        lines.append("")
+    lines.append("Provenance and confidence:")
+    def provenance_lines(value: Any, path: str = "") -> Iterable[str]:
+        if isinstance(value, Mapping):
+            if "value" in value and "source" in value:
+                yield f"  {path}: source={value.get('source')}, confidence={value.get('confidence')}, requires_review={value.get('requires_review')}"
+            else:
+                for k, v in value.items():
+                    yield from provenance_lines(v, f"{path}.{k}" if path else str(k))
+        elif isinstance(value, list):
+            for i, v in enumerate(value):
+                yield from provenance_lines(v, f"{path}[{i}]")
+    prov = list(provenance_lines(payload))
+    lines.extend(prov[:120] if prov else ["  none"])
+    lines.append("")
+    lines.append("Warnings:")
+    lines.extend(f"  - {w}" for w in warnings) if warnings else lines.append("  none")
+    lines.append("")
+    lines.append("Missing information / review-required items:")
+    review = [line.split(":", 1)[0].strip() for line in prov if "requires_review=True" in line]
+    lines.extend(f"  - {item}" for item in review[:120]) if review else lines.append("  none")
+    return "\n".join(lines) + "\n"
+
+
+def explain_pln_text(payload: Mapping[str, Any], query: str) -> str:
+    plain = unwrap_provenance(payload)
+    query_norm = _normalize_ref(query) if re.match(r"^[A-Za-z]+\d+$", query) else query
+    results: List[Tuple[str, Any, Any]] = []
+    def walk(raw: Any, unwrapped: Any, path: str = "") -> None:
+        tail = path.rsplit(".", 1)[-1]
+        if path == query or tail == query or tail == query_norm or (isinstance(unwrapped, str) and unwrapped == query):
+            results.append((path, raw, unwrapped))
+        if isinstance(raw, Mapping):
+            for k, v in raw.items():
+                walk(v, unwrap_provenance(v), f"{path}.{k}" if path else str(k))
+        elif isinstance(raw, list):
+            for i, v in enumerate(raw):
+                walk(v, unwrap_provenance(v), f"{path}[{i}]")
+    walk(payload, plain)
+    if not results:
+        raise PlacementError(f"unknown board.pln object {query!r}")
+    lines = [f"{query}:"]
+    for path, raw, unwrapped in results[:12]:
+        lines.append(f"  path: {path}")
+        lines.append(f"  value: {json.dumps(unwrapped, sort_keys=True)}")
+        if isinstance(raw, Mapping) and "source" in raw:
+            lines.append(f"  why it exists: {raw.get('source')}")
+            lines.append(f"  confidence: {raw.get('confidence')}")
+            lines.append(f"  requires_review: {raw.get('requires_review')}")
+        else:
+            lines.append("  why it exists: explicit or grouped board.pln object")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def apply_feedback_updates(payload: Mapping[str, Any], reports: Mapping[str, Any]) -> Dict[str, Any]:
+    updated = json.loads(json.dumps(payload))
+    proposals = updated.setdefault("provenance", {}).setdefault("update_proposals", [])
+    sim = updated.setdefault("simulation", {})
+    if reports.get("openems"):
+        proposals.append({
+            "type": "openems_feedback",
+            "value": "review routing corridors, reference planes, layer preferences, keepouts, and via restrictions",
+            "source": "openems_report",
+            "confidence": "medium",
+            "requires_review": True,
+        })
+        sim.setdefault("openems", {}).setdefault("feedback", provenance_value("openems report supplied; inspect proposed EM/SI changes", "openems_report", "medium", True))
+    if reports.get("ngspice"):
+        proposals.append({
+            "type": "ngspice_feedback",
+            "value": "review power regions, regulator annotations, startup sequencing, filters, and analog networks",
+            "source": "ngspice_report",
+            "confidence": "medium",
+            "requires_review": True,
+        })
+        sim.setdefault("ngspice", {}).setdefault("feedback", provenance_value("ngspice report supplied; inspect proposed circuit-behavior changes", "ngspice_report", "medium", True))
+    if reports.get("place"):
+        proposals.append({
+            "type": "placement_feedback",
+            "value": "review placement warnings for new keepouts, region changes, or cluster changes",
+            "source": "pcb_place_report",
+            "confidence": "medium",
+            "requires_review": True,
+        })
+    if reports.get("routing"):
+        proposals.append({
+            "type": "routing_feedback",
+            "value": "review routing DRC/congestion for class, via-policy, layer, skew, and length-tolerance adjustments",
+            "source": "routing_report",
+            "confidence": "medium",
+            "requires_review": True,
+        })
+    return updated
+
+
+def unified_diff_text(old: str, new: str, old_name: str = "board.pln", new_name: str = "board.updated.pln") -> str:
+    import difflib
+    return "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True), fromfile=old_name, tofile=new_name))
+
+
+def _load_optional_json(path: Optional[Path]) -> Any:
+    if not path:
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_plan_from_inputs(board_path: Path, netlist_path: Optional[Path], pln_path: Optional[Path]) -> Tuple[Plan, Dict[str, Any]]:
+    board, components, nets, warnings = parse_board(board_path)
+    aliases, alias_diag, net_warnings = import_netlist(netlist_path, components, nets)
     warnings.extend(net_warnings)
-    intent = load_intent(args.intent)
+    raw_intent = load_pln(pln_path)
+    intent = unwrap_provenance(raw_intent)
     if isinstance(intent.get("board"), dict):
         b = intent["board"]
         board = BoardGeometry(width=float(b.get("width", board.width)), height=float(b.get("height", board.height)), origin_x=float(b.get("origin_x", board.origin_x)), origin_y=float(b.get("origin_y", board.origin_y)), source="intent")
     plan = generate_plan(board, components, nets, aliases, alias_diag, intent, warnings)
-    if args.report_json:
-        args.report_json.write_text(json.dumps(report(plan), indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    if args.emit_routing_policy:
-        args.emit_routing_policy.parent.mkdir(parents=True, exist_ok=True)
-        args.emit_routing_policy.write_text(emit_routing_policy(plan, args.board), encoding="utf-8")
-    if args.emit_openems_plan and openems_plan_should_emit(plan):
-        args.emit_openems_plan.parent.mkdir(parents=True, exist_ok=True)
-        args.emit_openems_plan.write_text(emit_openems_plan(plan, args.board), encoding="utf-8")
-    if args.explain:
+    return plan, raw_intent
+
+def _add_common_emit_args(parser: argparse.ArgumentParser, *, board_required: bool = True) -> None:
+    parser.add_argument("--board", required=board_required, type=Path, help="Input KiCad .kicad_pcb board")
+    parser.add_argument("--netlist", type=Path, help="Optional Zener/pcb netlist artifact")
+    parser.add_argument("-o", "--output", type=Path, help="Output path")
+    parser.add_argument("--report-json", type=Path, help="Write planner report JSON")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="pcb-plan", description="Own board.pln lifecycle and generate reviewable pcb-place .ppl placement plans")
+    parser.add_argument("--version", action="version", version=f"pcb-plan {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    init = sub.add_parser("init", help="Generate an initial board.pln")
+    _add_common_emit_args(init)
+    init.add_argument("--summary-md", type=Path, help="Write human-readable init summary markdown")
+
+    update = sub.add_parser("update", help="Update board.pln from feedback reports")
+    update.add_argument("--pln", required=True, type=Path, help="Existing board.pln")
+    update.add_argument("--board", type=Path, help="Optional KiCad board for regenerated report context")
+    update.add_argument("--place-report", type=Path, help="Optional pcb-place report JSON")
+    update.add_argument("--routing-report", type=Path, help="Optional routing report JSON")
+    update.add_argument("--openems-report", type=Path, help="Optional OpenEMS report JSON")
+    update.add_argument("--ngspice-report", type=Path, help="Optional ngspice report JSON")
+    update.add_argument("-o", "--output", required=True, type=Path, help="Updated board.pln path")
+    update.add_argument("--patch", type=Path, help="Write human-reviewable unified diff patch")
+    update.add_argument("--report-json", type=Path, help="Write update report JSON")
+    update.add_argument("--summary-md", type=Path, help="Write update summary markdown")
+
+    review = sub.add_parser("review", help="Review board.pln")
+    review.add_argument("--pln", required=True, type=Path, help="board.pln to review")
+
+    explain = sub.add_parser("explain", help="Explain a board.pln object")
+    explain.add_argument("object", help="Reference, net, or dotted board.pln path")
+    explain.add_argument("--pln", type=Path, default=Path("board.pln"), help="board.pln to explain (default: board.pln)")
+    explain.add_argument("--board", type=Path, help="Optional board for legacy component explanations")
+    explain.add_argument("--netlist", type=Path, help="Optional netlist for legacy component explanations")
+
+    emit = sub.add_parser("emit", help="Generate placement.ppl from board.pln and board inputs")
+    emit.add_argument("--pln", "--intent", dest="pln", type=Path, help="board.pln planning-intent file")
+    _add_common_emit_args(emit)
+    emit.add_argument("--emit-routing-policy", type=Path, help="Write routing-policy.yaml handoff from .pln routing constraints")
+    emit.add_argument("--emit-openems-plan", type=Path, help="Write OpenEMS handoff plan when simulation.openems is enabled")
+    emit.add_argument("--summary-md", type=Path, help="Write human-readable summary markdown")
+
+    # Legacy one-shot placement generation flags kept for compatibility.
+    parser.add_argument("--board", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--netlist", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--intent", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("-o", "--output", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--report-json", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--emit-routing-policy", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--emit-openems-plan", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--explain", help=argparse.SUPPRESS)
+    return parser
+
+
+def _ensure_exists(path: Optional[Path], label: str) -> None:
+    if path and not path.exists():
+        raise SystemExit(f"{label} file not found: {path}")
+
+
+def _write_report(path: Optional[Path], payload: Mapping[str, Any]) -> None:
+    if path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_text(path: Optional[Path], text: str) -> None:
+    if path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    else:
+        sys.stdout.write(text)
+
+
+def _summary_markdown(title: str, payload: Mapping[str, Any]) -> str:
+    report_payload = _as_mapping(payload.get("report")) or payload
+    warnings = _as_list(report_payload.get("warnings")) + _as_list(report_payload.get("pln_validation_warnings"))
+    review_items = _as_list(report_payload.get("review_required_items"))
+    lines = [f"# {title}", "", "## Inferred roles", ""]
+    roles = _as_mapping(report_payload.get("inferred_roles"))
+    if roles:
+        lines.extend(f"- `{ref}`: `{role}`" for ref, role in sorted(roles.items()))
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Inferred constraints", ""])
+    routing = _as_mapping(report_payload.get("routing"))
+    if routing:
+        lines.append("```yaml")
+        lines.append(emit_yaml(routing).rstrip())
+        lines.append("```")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Warnings", ""])
+    lines.extend(f"- {w}" for w in warnings) if warnings else lines.append("- none")
+    lines.extend(["", "## Review-required items", ""])
+    lines.extend(f"- `{item}`" for item in review_items[:200]) if review_items else lines.append("- none")
+    return "\n".join(lines) + "\n"
+
+
+def run_emit(args: argparse.Namespace, *, legacy: bool = False) -> int:
+    pln_path = getattr(args, "pln", None) or getattr(args, "intent", None)
+    _ensure_exists(args.board, "Board")
+    _ensure_exists(args.netlist, "Netlist")
+    _ensure_exists(pln_path, "board.pln")
+    plan, _ = _load_plan_from_inputs(args.board, args.netlist, pln_path)
+    _write_report(args.report_json, report(plan))
+    if getattr(args, "emit_routing_policy", None):
+        _write_text(args.emit_routing_policy, emit_routing_policy(plan, args.board))
+    if getattr(args, "emit_openems_plan", None) and openems_plan_should_emit(plan):
+        _write_text(args.emit_openems_plan, emit_openems_plan(plan, args.board))
+    if legacy and getattr(args, "explain", None):
         sys.stdout.write(explain_text(plan, args.explain))
         return 0
+    if getattr(args, "summary_md", None):
+        _write_text(args.summary_md, _summary_markdown("pcb-plan summary", {"report": report(plan)}))
     ppl = emit_ppl(plan, args.board, args.netlist)
-    if args.output:
-        args.output.write_text(ppl, encoding="utf-8")
-    else:
-        sys.stdout.write(ppl)
+    _write_text(args.output, ppl)
     return 0
+
+
+def run_init(args: argparse.Namespace) -> int:
+    _ensure_exists(args.board, "Board")
+    _ensure_exists(args.netlist, "Netlist")
+    plan, _ = _load_plan_from_inputs(args.board, args.netlist, None)
+    payload = plan_to_pln(plan)
+    text = serialize_pln(payload)
+    _write_text(args.output, text)
+    report_payload = pln_report(plan, payload, "init")
+    _write_report(args.report_json, report_payload)
+    if getattr(args, "summary_md", None):
+        _write_text(args.summary_md, _summary_markdown("pcb-plan init summary", {"report": report_payload}))
+    return 0
+
+
+def run_update(args: argparse.Namespace) -> int:
+    _ensure_exists(args.pln, "board.pln")
+    for path, label in ((args.board, "Board"), (args.place_report, "pcb-place report"), (args.routing_report, "Routing report"), (args.openems_report, "OpenEMS report"), (args.ngspice_report, "ngspice report")):
+        _ensure_exists(path, label)
+    old_text = args.pln.read_text(encoding="utf-8")
+    payload = load_pln(args.pln)
+    reports = {
+        "place": _load_optional_json(args.place_report),
+        "routing": _load_optional_json(args.routing_report),
+        "openems": _load_optional_json(args.openems_report),
+        "ngspice": _load_optional_json(args.ngspice_report),
+    }
+    updated = apply_feedback_updates(payload, reports)
+    new_text = serialize_pln(updated)
+    _write_text(args.output, new_text)
+    if args.patch:
+        _write_text(args.patch, unified_diff_text(old_text, new_text, str(args.pln), str(args.output)))
+    report_payload: Dict[str, Any] = {
+        "action": "update",
+        "reports_consumed": sorted(k for k, v in reports.items() if v is not None),
+        "pln_validation_warnings": validate_pln(updated),
+        "proposed_changes": _as_list(_as_mapping(updated.get("provenance")).get("update_proposals")),
+    }
+    if args.board:
+        plan, _ = _load_plan_from_inputs(args.board, None, args.output)
+        report_payload.update(pln_report(plan, updated, "update"))
+    _write_report(args.report_json, report_payload)
+    if getattr(args, "summary_md", None):
+        _write_text(args.summary_md, _summary_markdown("pcb-plan update summary", {"report": report_payload}))
+    return 0
+
+
+def run_review(args: argparse.Namespace) -> int:
+    _ensure_exists(args.pln, "board.pln")
+    sys.stdout.write(review_pln_text(load_pln(args.pln)))
+    return 0
+
+
+def run_explain(args: argparse.Namespace) -> int:
+    if args.board:
+        _ensure_exists(args.board, "Board")
+        _ensure_exists(args.netlist, "Netlist")
+        plan, _ = _load_plan_from_inputs(args.board, args.netlist, args.pln if args.pln.exists() else None)
+        try:
+            sys.stdout.write(explain_text(plan, args.object))
+            return 0
+        except PlacementError:
+            pass
+    _ensure_exists(args.pln, "board.pln")
+    sys.stdout.write(explain_pln_text(load_pln(args.pln), args.object))
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    command = args.command or "legacy_emit"
+    if command == "init":
+        return run_init(args)
+    if command == "update":
+        return run_update(args)
+    if command == "review":
+        return run_review(args)
+    if command == "explain":
+        return run_explain(args)
+    if command == "emit":
+        return run_emit(args)
+    if not args.board:
+        raise SystemExit("Board file not found: provide --board or use a subcommand such as 'pcb-plan init' or 'pcb-plan emit'.")
+    return run_emit(args, legacy=True)
 
 
 if __name__ == "__main__":
