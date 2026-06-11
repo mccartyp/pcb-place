@@ -801,3 +801,132 @@ Anchor("U1", x=10, y=10)
     )
     assert report["collisions"] == []
     assert report["spacing_violations"] == []
+
+
+def _cluster_pcb() -> str:
+    return '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 10 10 90)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+    (property "Reference" "U6" (at 0 0 0) (layer "F.SilkS"))
+  )
+  (footprint "Test:C" (layer "F.Cu")
+    (at 12 10 45)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+    (property "Reference" "C5" (at 0 0 0) (layer "F.SilkS"))
+  )
+  (footprint "Test:R" (layer "F.Cu")
+    (at 10 13 180)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+    (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS"))
+  )
+  (footprint "Test:J" (layer "F.Cu")
+    (at 40 10 0)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+    (property "Reference" "J1" (at 0 0 0) (layer "F.SilkS"))
+  )
+)
+'''
+
+
+def _load_inline_ppl(tmp_path, text):
+    ppl = tmp_path / "placement.ppl"
+    ppl.write_text(text)
+    return load_ppl(ppl)
+
+
+def test_cluster_anchor_placement_preserves_relative_geometry_and_rotations(tmp_path):
+    model = _load_inline_ppl(tmp_path, '''
+Board(width=80, height=50)
+Cluster("MCU", anchor="U6", members=["U6", "C5", "R1"], placement=Anchor(x=30, y=20))
+''')
+    out, messages, report = apply_placements(_cluster_pcb(), model, strict=True, allow_overlap=True)
+    fps = parse_footprints(out)
+    assert (fps["U6"].x, fps["U6"].y, fps["U6"].rot) == (30, 20, 90)
+    assert (fps["C5"].x, fps["C5"].y, fps["C5"].rot) == (32, 20, 45)
+    assert (fps["R1"].x, fps["R1"].y, fps["R1"].rot) == (30, 23, 180)
+    assert report["clusters"][0]["delta"] == [20.0, 10.0]
+
+
+def test_cluster_edge_and_corner_placement(tmp_path):
+    edge_model = _load_inline_ppl(tmp_path, '''
+Board(width=80, height=50)
+Cluster("IO", anchor="U6", members=["C5"], placement=Edge(edge="left", y=25, inset=3))
+''')
+    out, _messages, report = apply_placements(_cluster_pcb(), edge_model, strict=True, allow_overlap=True)
+    fps = parse_footprints(out)
+    assert (fps["U6"].x, fps["U6"].y) == (3, 25)
+    assert (fps["C5"].x, fps["C5"].y) == (5, 25)
+    assert report["clusters"][0]["member_count"] == 2  # anchor auto-added
+
+    corner_model = _load_inline_ppl(tmp_path, '''
+Board(width=80, height=50)
+Cluster("IO", anchor="U6", members=["U6", "C5"], placement=Corner(corner="bottom_right", inset=5))
+''')
+    out, _messages, _report = apply_placements(_cluster_pcb(), corner_model, strict=True, allow_overlap=True)
+    fps = parse_footprints(out)
+    assert (fps["U6"].x, fps["U6"].y) == (75, 45)
+    assert (fps["C5"].x, fps["C5"].y) == (77, 45)
+
+
+def test_cluster_duplicate_missing_and_ignore_missing(tmp_path):
+    model = _load_inline_ppl(tmp_path, '''
+Board(width=80, height=50)
+Cluster("MCU", anchor="U6", members=["U6", "C5", "C5", "R99"], placement=Anchor(x=30, y=20), ignore_missing=True)
+''')
+    _out, messages, report = apply_placements(_cluster_pcb(), model, strict=True, allow_overlap=True)
+    texts = [m.text for m in messages]
+    assert any("duplicate member 'C5'" in text for text in texts)
+    assert any("missing member 'R99'" in text for text in texts)
+    assert report["clusters"][0]["member_count"] == 2
+
+    missing = _load_inline_ppl(tmp_path, '''
+Board(width=80, height=50)
+Cluster("MCU", anchor="U6", members=["R99"], placement=Anchor(x=30, y=20))
+''')
+    with pytest.raises(pcb_place.PlacementError, match="missing member"):
+        apply_placements(_cluster_pcb(), missing, strict=True)
+
+
+def test_cluster_satellite_refinement_warns_and_report_json_cli(tmp_path):
+    pcb = tmp_path / "cluster.kicad_pcb"
+    ppl = tmp_path / "cluster.ppl"
+    report = tmp_path / "report.json"
+    pcb.write_text(_cluster_pcb())
+    ppl.write_text('''
+Board(width=80, height=50)
+Cluster("MCU", anchor="U6", members=["U6", "C5"], placement=Anchor(x=30, y=20))
+Satellite("C5", parent="U6", side="top", distance=2)
+''')
+    out, messages, _report = apply_placements(pcb.read_text(), load_ppl(ppl), strict=True, allow_overlap=True)
+    fps = parse_footprints(out)
+    assert (fps["C5"].x, fps["C5"].y) == (30, 18)
+    assert any("C5 moved by cluster MCU later refined by satellite" in m.text for m in messages)
+
+    clusters = subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--print-clusters"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "Cluster MCU" in clusters.stdout
+    assert "members: 2" in clusters.stdout
+
+    subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--report-json", str(report), "--dry-run", "--allow-overlap"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(report.read_text())
+    assert payload["clusters"][0]["name"] == "MCU"
+    assert payload["clusters"][0]["new_anchor"] == [30.0, 20.0]
+
+
+def test_cluster_collision_validation(tmp_path):
+    model = _load_inline_ppl(tmp_path, '''
+Board(width=80, height=50)
+Cluster("MCU", anchor="U6", members=["U6", "C5"], placement=Anchor(x=40, y=10))
+''')
+    _out, _messages, report = apply_placements(_cluster_pcb(), model, strict=False, validate=True)
+    assert any(item["ref_a"] == "J1" or item["ref_b"] == "J1" for item in report["collisions"])

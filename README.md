@@ -84,12 +84,65 @@ Most generated PCB workflows can produce components and nets. Placement is often
 
 This allows placement to be version-controlled, regenerated, reviewed, and checked in CI.
 
+## Cluster-Based Floorplanning
+
+`Cluster()` is the preferred mechanism for moving an existing functional PCB neighborhood. A cluster has a named anchor footprint, a set of member footprints, and an unbound placement primitive that positions the anchor. `pcb-place` computes the anchor delta and applies that same `dx`/`dy` to every cluster member, preserving each member's local geometry and rotation.
+
+Use clusters for electrical neighborhoods such as HDMI channels, MCU subsystems, WiFi sections, power regulators, and user I/O groups. Mechanical objects should remain independent primitives: place mounting holes, fiducials, tooling holes, board outlines, and mechanical keepouts directly with `Corner()`, `Edge()`, `Anchor()`, `Keepout()`, or board geometry rather than putting them into clusters.
+
+Recommended floorplanning flow:
+
+1. Place fixed mechanical objects.
+2. Place clusters.
+3. Refine cluster internals with individual primitives.
+4. Validate bounds, overlaps, spacing, and keepouts.
+5. Route downstream.
+
+Example: move an HDMI input neighborhood by placing connector `J1` on the left edge, carrying its ESD, passives, test points, and switch along with it:
+
+```python
+Cluster(
+    "HDMI_IN",
+    anchor = "J1",
+    members = ["J1", "D3", "D4", "R21", "R22", "R23", "C28", "C31", "C32", "C33", "C34", "C36", "TP4", "TP5", "TP6", "SW1"],
+    placement = Edge(edge = "left", y = 20, inset = 2.5),
+)
+```
+
+Example: move an MCU neighborhood to a board coordinate while keeping decouplers and pull resistors in their imported relative positions:
+
+```python
+Cluster(
+    "MCU",
+    anchor = "U6",
+    members = ["U6", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13", "R1", "R2", "R3"],
+    placement = Anchor(x = 36, y = 30),
+)
+```
+
+Clusters do not lock members. Later rules execute after earlier rules and can refine any member. This lets you place a neighborhood first, then tighten important parts:
+
+```python
+Cluster("MCU", anchor = "U6", members = ["U6", "C5", "C6"], placement = Anchor(x = 36, y = 30))
+Satellite("C5", parent = "U6", side = "top", distance = 2)
+```
+
+When a later rule refines a member already moved by a cluster, `pcb-place` emits a warning such as `C5 moved by cluster MCU later refined by Satellite`. Cluster placement is deterministic and does not auto-spread members; run validation to catch board-boundary, overlap, spacing, and keepout issues after placement.
+
+Useful cluster reporting commands:
+
+```bash
+pcb-place board.kicad_pcb placement.ppl --print-clusters
+pcb-place board.kicad_pcb placement.ppl --report-json report.json --dry-run
+```
+
 ## Scope
 
 Implemented today:
 
 - KiCad `.kicad_pcb` footprint parsing and rewriting
 - Deterministic footprint placement
+- Cluster-based floorplanning for moving functional PCB neighborhoods while preserving internal geometry
 - Python/Starlark-like `.ppl` placement DSL
 - Exact and hierarchical suffix reference matching
 - Optional Zener/pcb netlist alias imports for semantic instance paths
