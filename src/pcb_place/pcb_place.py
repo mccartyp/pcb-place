@@ -864,7 +864,14 @@ def load_ppl(path: Path) -> PlacementModel:
             px = float(inset) if e == "left" else w - float(inset)
             py = float(y) if y is not None else float(offset if offset is not None else h / 2.0)
         elif e in ("top", "bottom"):
-            px = float(x) if x is not None else float(offset if offset is not None else w / 2.0)
+            if x is not None:
+                px = float(x)
+            elif offset is not None:
+                px = float(offset)
+            elif y is not None:
+                px = float(y)
+            else:
+                px = w / 2.0
             py = float(inset) if e == "top" else h - float(inset)
         else:
             raise PlacementError(f"Unknown edge {edge!r}")
