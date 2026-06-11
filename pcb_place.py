@@ -1656,10 +1656,13 @@ def region_violations(engine: "PlacementEngine", *, refs: Optional[Iterable[str]
             actual = engine.resolve_ref(str(rule["ref"]))
             if actual:
                 allowed_refs.add(actual)
-        if rule.get("region") and rule.get("ref"):
+        region = rule.get("region")
+        if region is None:
+            region = rule.get("extra", {}).get("region")
+        if region and rule.get("ref"):
             actual = engine.resolve_ref(str(rule["ref"]))
             if actual:
-                rule_region_by_ref[actual] = str(rule["region"])
+                rule_region_by_ref[actual] = str(region)
     for ref, region_name in sorted(rule_region_by_ref.items()):
         if ref in allowed_refs:
             continue
@@ -1681,13 +1684,16 @@ class PlacementEngine:
 
     def __init__(self, footprints: Mapping[str, Footprint], model: PlacementModel,
                  *, strict: bool = False, allow_suffix_match: bool = True,
-                 cardinal_rotations: bool = False, board_geometry: Optional[BoardGeometry] = None) -> None:
+                 cardinal_rotations: bool = False, board_geometry: Optional[BoardGeometry] = None,
+                 allow_keepout_overlap: bool = False, allow_outside_region: bool = False) -> None:
         self.footprints = dict(footprints)
         self.model = model
         self.strict = strict
         self.allow_suffix_match = allow_suffix_match
         self.cardinal_rotations = cardinal_rotations
         self.board_geometry = board_geometry
+        self.allow_keepout_overlap = allow_keepout_overlap
+        self.allow_outside_region = allow_outside_region
         self.messages: List[Message] = []
         self.positions: Dict[str, Tuple[float, float, float]] = {
             ref: (fp.x, fp.y, fp.rot) for ref, fp in self.footprints.items()
@@ -1810,8 +1816,10 @@ class PlacementEngine:
             placed = self._find_non_overlapping_position(actual_ref, float(x), float(y), float(new_rot),
                                                          clearance_override=clearance_override,
                                                          candidate_sides=candidate_sides,
-                                                         region=self._region_bbox(rule.get("region")),
-                                                         allow_keepout_overlap=self._rule_flag(rule, "allow_keepout_overlap", False))
+                                                         region=(None if self.allow_outside_region else
+                                                                 self._region_bbox(self._rule_value(rule, "region"))),
+                                                         allow_keepout_overlap=(self.allow_keepout_overlap or
+                                                                                self._rule_flag(rule, "allow_keepout_overlap", False)))
             if placed is None:
                 raise PlacementError(f"{actual_ref!r} could not be placed by {why} without violating clearance or board bounds; requested x={_fmt_num(x)} y={_fmt_num(y)}")
             px, py, reason = placed
@@ -1839,6 +1847,8 @@ class PlacementEngine:
             Message("place", f"place {actual_ref:>16s} -> x={_fmt_num(x):>8s} y={_fmt_num(y):>8s} "
                              f"rot={rot_label:>8s}  {why}{suffix}")
         )
+        if self._rule_flag(rule, "lock", False) or self._rule_flag(rule, "locked", False):
+            self.lock(actual_ref, f"{why} rule")
 
     def _placement_target(self, rule: Mapping[str, Any]) -> Point:
         typ = str(rule["type"])
@@ -1959,13 +1969,17 @@ class PlacementEngine:
             value = rule.get("extra", {}).get("clearance")
         return None if value is None else float(value)
 
+    def _rule_value(self, rule: Mapping[str, Any], name: str, default: Any = None) -> Any:
+        value = rule.get(name)
+        if value is None:
+            value = rule.get("extra", {}).get(name, default)
+        return value
+
     def _rule_flag(self, rule: Mapping[str, Any], name: str, default: bool = False) -> bool:
-        return bool(rule.get(name, rule.get("extra", {}).get(name, default)))
+        return bool(self._rule_value(rule, name, default))
 
     def _rule_priority(self, rule: Mapping[str, Any], actual_ref: str) -> float:
-        value = rule.get("priority")
-        if value is None:
-            value = rule.get("extra", {}).get("priority")
+        value = self._rule_value(rule, "priority")
         if value is None:
             value = self.model.priority_refs.get(actual_ref)
         return 0.0 if value is None else float(value)
@@ -2116,8 +2130,6 @@ class PlacementEngine:
                 x, y = self._placement_target(rule)
                 self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot")), typ, rule.get("note"),
                            allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule), rule=rule)
-                if rule.get("lock") or self._rule_flag(rule, "locked", False):
-                    self.lock(rule["ref"], f"{typ} rule")
 
             elif typ == "cluster":
                 self.place_cluster(rule)
@@ -2382,7 +2394,9 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         if existing_geometry is not None and not existing_geometry.nearly_equals(defined_geometry):
             raise PlacementError("Board emit_outline=True conflicts with existing Edge.Cuts geometry")
     engine = PlacementEngine(footprints, model, strict=strict, allow_suffix_match=allow_suffix_match,
-                             cardinal_rotations=cardinal_rotations, board_geometry=board_geometry)
+                             cardinal_rotations=cardinal_rotations, board_geometry=board_geometry,
+                             allow_keepout_overlap=allow_keepout_overlap,
+                             allow_outside_region=allow_outside_region)
     engine.apply()
     collision_messages = validate_placements(engine, allow_overlap=allow_overlap, warn_overlap=warn_overlap,
                                              allow_outside_board=allow_outside_board,

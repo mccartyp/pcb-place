@@ -1085,3 +1085,45 @@ Anchor("C1", x=14, y=10, allow_keepout_overlap=True)
 ''')
     _out, _messages, report = apply_placements(_pad_pcb(), allowed, strict=True, validate=True, allow_keepout_overlap=True, allow_overlap=True)
     assert report["keepout_violations"] == []
+
+
+def test_global_keepout_overlap_is_honored_during_search(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=100, height=100)
+Keepout("ANT", x=29, y=29, w=3, h=3)
+Anchor("C1", x=30, y=30, soft=True)
+''')
+    out, _messages, report = apply_placements(_pad_pcb(), model, strict=True, validate=True, allow_keepout_overlap=True)
+    assert '(at 30 30 45)' in out
+    assert report["auto_adjustments"] == []
+    assert report["keepout_violations"] == []
+
+
+def test_region_constraints_are_read_from_rule_extras(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=100, height=100)
+Region("CONTROL", x=0, y=0, w=5, h=5)
+Mirror("C1", source="U1", axis="vertical", region="CONTROL")
+''')
+    _out, _messages, report = apply_placements(_pad_pcb(), model, strict=False, validate=True)
+    assert report["region_violations"]
+    assert report["region_violations"][0]["ref"] == "C1"
+
+    constrained = _load_inline(tmp_path, '''
+Board(width=100, height=100)
+Region("CONTROL", x=0, y=0, w=5, h=5)
+PlacementPolicy(max_search_radius=1, search_step=0.5)
+Satellite("C1", parent="U1", side="right", distance=10, region="CONTROL")
+''')
+    with pytest.raises(PlacementError, match="without violating clearance or board bounds"):
+        apply_placements(_pad_pcb(), constrained, strict=True)
+
+
+def test_locked_flag_locks_non_anchor_rules(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=100, height=100)
+Satellite("C1", parent="U1", side="right", distance=10, locked=True)
+Anchor("C1", x=40, y=40, priority=1)
+''')
+    with pytest.raises(PlacementError, match="locked footprint"):
+        apply_placements(_pad_pcb(), model, strict=True)
