@@ -433,6 +433,100 @@ def detect_differential_pairs(nets: Mapping[str, PlanNet]) -> List[DifferentialP
     return pairs
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _synthesized_rf_keepout(
+    comp: PlanComponent,
+    board: BoardGeometry,
+    *,
+    desired_w: float = 12.0,
+    desired_h: float = 10.0,
+    margin: float = 0.25,
+) -> Dict[str, float]:
+    """Return a board-local RF keepout adjacent to, not covering, an RF module.
+
+    The synthesized rectangle is placed in the nearest available edge strip outside
+    the module's parsed bounding box. This keeps default planner output usable by
+    pcb-place validation while still reserving antenna clearance at a board edge.
+    """
+
+    if comp.bbox is None:
+        cx = comp.x - board.origin_x
+        cy = comp.y - board.origin_y
+        min_x = max(0.0, cx - 1.0)
+        max_x = min(board.width, cx + 1.0)
+        min_y = max(0.0, cy - 1.0)
+        max_y = min(board.height, cy + 1.0)
+    else:
+        min_x = comp.bbox.min_x - board.origin_x
+        max_x = comp.bbox.max_x - board.origin_x
+        min_y = comp.bbox.min_y - board.origin_y
+        max_y = comp.bbox.max_y - board.origin_y
+        cx = (min_x + max_x) / 2.0
+        cy = (min_y + max_y) / 2.0
+
+    candidates: List[Tuple[float, Dict[str, float]]] = []
+
+    left_w = max(0.0, min(desired_w, min_x - margin))
+    if left_w > 0.0:
+        candidates.append((
+            min_x,
+            {
+                "x": max(0.0, min_x - margin - left_w),
+                "y": _clamp(cy - desired_h / 2.0, 0.0, max(0.0, board.height - desired_h)),
+                "w": left_w,
+                "h": min(desired_h, board.height),
+            },
+        ))
+
+    right_x = max_x + margin
+    right_w = max(0.0, min(desired_w, board.width - right_x))
+    if right_w > 0.0:
+        candidates.append((
+            board.width - max_x,
+            {
+                "x": right_x,
+                "y": _clamp(cy - desired_h / 2.0, 0.0, max(0.0, board.height - desired_h)),
+                "w": right_w,
+                "h": min(desired_h, board.height),
+            },
+        ))
+
+    top_h = max(0.0, min(desired_h, min_y - margin))
+    if top_h > 0.0:
+        candidates.append((
+            min_y,
+            {
+                "x": _clamp(cx - desired_w / 2.0, 0.0, max(0.0, board.width - desired_w)),
+                "y": max(0.0, min_y - margin - top_h),
+                "w": min(desired_w, board.width),
+                "h": top_h,
+            },
+        ))
+
+    bottom_y = max_y + margin
+    bottom_h = max(0.0, min(desired_h, board.height - bottom_y))
+    if bottom_h > 0.0:
+        candidates.append((
+            board.height - max_y,
+            {
+                "x": _clamp(cx - desired_w / 2.0, 0.0, max(0.0, board.width - desired_w)),
+                "y": bottom_y,
+                "w": min(desired_w, board.width),
+                "h": bottom_h,
+            },
+        ))
+
+    if not candidates:
+        # Degenerate fallback for extremely cramped boards: keep a small corner
+        # marker rather than covering the module and causing executor failure.
+        return {"x": 0.0, "y": 0.0, "w": min(1.0, board.width), "h": min(1.0, board.height)}
+
+    _distance, rect = min(candidates, key=lambda item: (item[0], -item[1]["w"] * item[1]["h"]))
+    return rect
+
 def _nearest_parent(comp: PlanComponent, candidates: Iterable[PlanComponent], shared_nets: Optional[set[str]] = None) -> Optional[PlanComponent]:
     best: Tuple[float, Optional[PlanComponent]] = (1e99, None)
     for cand in candidates:
@@ -542,7 +636,7 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     for comp in components.values():
         if comp.role in {"ic", "mcu", "power_regulator", "rf_module", "hdmi_retimer"}:
             members = _cluster_members(comp, components, radius=12.0)
-            region = "POWER" if comp.role == "power_regulator" and "POWER" in regions else "CONTROL" if "CONTROL" in regions else None
+            region = "POWER" if comp.role == "power_regulator" and "POWER" in regions else "RF" if comp.role == "rf_module" and "RF" in regions else "CONTROL" if comp.role != "rf_module" and "CONTROL" in regions else None
             name = re.sub(r"[^A-Za-z0-9_]+", "_", comp.role.upper() + "_" + comp.ref)
             placement = f'Anchor(x={comp.x - board.origin_x:.3f}, y={comp.y - board.origin_y:.3f}' + (f', region={_q(region)}' if region else '') + ')'
             text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement={placement}, role={_q(comp.role)})'
@@ -550,10 +644,9 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             clusters.append({"name": name, "anchor": comp.ref, "members": members, "role": comp.role})
             explanations.setdefault(comp.ref, {}).update({"role": comp.role, "generated_rule": text})
             if comp.role == "rf_module" and not any(k.get("role") == "rf" for k in keepouts if isinstance(k, dict)):
-                x = max(0, min(board.width - 12, comp.x - board.origin_x))
-                y = max(0, min(board.height - 10, comp.y - board.origin_y - 10))
-                ko = f'Keepout({_q(comp.ref + "_ANTENNA")}, x={x:.3f}, y={y:.3f}, w=12, h=10, role="rf")'
-                rules.append(PlanRule("keepout", ko, [comp.ref], f"{comp.ref} inferred RF/module; antenna keepout requires engineering review."))
+                rect = _synthesized_rf_keepout(comp, board)
+                ko = f'Keepout({_q(comp.ref + "_ANTENNA")}, x={rect["x"]:.3f}, y={rect["y"]:.3f}, w={rect["w"]:.3f}, h={rect["h"]:.3f}, role="rf")'
+                rules.append(PlanRule("keepout", ko, [comp.ref], f"{comp.ref} inferred RF/module; synthesized antenna keepout adjacent to module edge and requires engineering review."))
 
     ic_candidates = [c for c in components.values() if c.role in {"ic", "mcu", "hdmi_retimer", "rf_module"}]
     for cap in [c for c in components.values() if c.role == "decoupling"]:

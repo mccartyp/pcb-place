@@ -82,6 +82,25 @@ def test_ppl_emission_report_json_and_explain(tmp_path):
     assert "role: esd_protection" in explain.stdout
 
 
+def test_rf_module_synthesized_keepout_does_not_reject_generated_plan(tmp_path):
+    board_path = ROOT / "tests/fixtures/rf_module/layout.kicad_pcb"
+    out = tmp_path / "placement.ppl"
+    subprocess.run(
+        [sys.executable, str(ROOT / "pcb_plan.py"), "--board", str(board_path), "-o", str(out)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    ppl = out.read_text()
+    assert 'Keepout("U12_ANTENNA", x=42.000, y=0.000, w=12.000, h=7.250, role="rf")' in ppl
+    subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(board_path), str(out), "--dry-run", "--strict"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_json_and_simple_yaml_intent_are_optional_and_honored(tmp_path):
     intent = tmp_path / "board.pln"
     intent.write_text(
