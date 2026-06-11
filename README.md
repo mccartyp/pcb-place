@@ -183,3 +183,25 @@ Both tools are sidecars around KiCad files:
   documentation for applying `.ppl` files to KiCad boards.
 - [`examples/`](examples): example placement workflows and input files.
 - [`tests/`](tests): unit and CLI integration tests for both tools.
+
+## Claude Skills
+
+[`skills/`](skills) contains Claude Code skills that teach Claude how to drive
+this repository's tools:
+
+- [`skills/pcb-plan/SKILL.md`](skills/pcb-plan/SKILL.md) — `board.pln` and
+  `placement.ppl` lifecycle: init/review/explain/update/emit, routing/SI
+  constraints, stackup, differential pairs, simulation hooks, provenance.
+- [`skills/pcb-place/SKILL.md`](skills/pcb-place/SKILL.md) — applying and
+  debugging `placement.ppl` against a `.kicad_pcb` board: dry-run,
+  validation, collisions/spacing/keepouts/regions, troubleshooting.
+- [`skills/pcb-automation-orchestrator/SKILL.md`](skills/pcb-automation-orchestrator/SKILL.md) —
+  end-to-end iteration across `pcb-plan`, `pcb-place`, routing, DRC/ERC, and
+  optional OpenEMS/ngspice simulation, including all-net and high-speed
+  routing modes.
+
+Short workflow: use `pcb-plan` to own `board.pln` and emit `placement.ppl`,
+use `pcb-place` to apply/debug that `placement.ppl` against a KiCad board, and
+use `pcb-automation-orchestrator` to coordinate the full
+plan/place/route/verify/simulate loop. See [`skills/README.md`](skills/README.md)
+for details on when to use each.
