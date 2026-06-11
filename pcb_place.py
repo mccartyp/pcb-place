@@ -52,7 +52,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 Number = float | int
 Point = Tuple[float, float]
@@ -759,7 +759,7 @@ def load_ppl(path: Path) -> PlacementModel:
             raise PlacementError(f"Lock() unknown parameter(s): {', '.join(sorted(kwargs))}")
         model.add("lock", ref=_normalize_ref(ref), note=note or reason)
 
-    def Anchor(ref: str, *, x: Optional[Number] = None, y: Optional[Number] = None,
+    def Anchor(ref: Optional[str] = None, *, x: Optional[Number] = None, y: Optional[Number] = None,
                at: Optional[Point] = None, rot: Optional[Number | str] = None,
                role: Optional[str] = None, side: str = "F", lock: bool = False,
                relative_to: Optional[str] = None, dx: Number = 0, dy: Number = 0,
@@ -775,9 +775,9 @@ def load_ppl(path: Path) -> PlacementModel:
             y = r["y"] + r["h"] / 2.0
         if relative_to is None and (x is None or y is None):
             raise PlacementError(f"Anchor({ref!r}) requires x/y, at=(x,y), relative_to=..., or region=...")
-        model.add(
-            "anchor",
-            ref=_normalize_ref(ref),
+        rule = dict(
+            type="anchor",
+            ref=None if ref is None else _normalize_ref(ref),
             x=None if x is None else float(x),
             y=None if y is None else float(y),
             relative_to=None if relative_to is None else _normalize_ref(relative_to),
@@ -791,13 +791,17 @@ def load_ppl(path: Path) -> PlacementModel:
             note=note or comment,
             extra=dict(kwargs),
         )
+        if ref is None:
+            return rule
+        model.rules.append(rule)
+        return None
 
     def Fixed(ref: str, **kwargs: Any) -> None:
         kwargs.setdefault("lock", True)
         Anchor(ref, **kwargs)
         model.rules[-1]["type"] = "fixed"
 
-    def Corner(ref: str, *, corner: str, inset: Number | Point = 3,
+    def Corner(ref: Optional[str] = None, *, corner: str, inset: Number | Point = 3,
                rot: Optional[Number | str] = None, role: Optional[str] = "mounting_hole",
                lock: bool = True, note: Optional[str] = None, **kwargs: Any) -> None:
         w, h, _ox, _oy = _require_board_size(model, "Corner")
@@ -822,10 +826,14 @@ def load_ppl(path: Path) -> PlacementModel:
             x, y = w - ix, h - iy
         else:
             raise PlacementError(f"Unknown corner {corner!r}")
-        model.add("corner", ref=_normalize_ref(ref), x=x, y=y, rot=_rot_or_none(rot),
-                  role=role, lock=bool(lock), corner=c, note=note, extra=dict(kwargs))
+        rule = dict(type="corner", ref=None if ref is None else _normalize_ref(ref), x=x, y=y, rot=_rot_or_none(rot),
+                    role=role, lock=bool(lock), corner=c, note=note, extra=dict(kwargs))
+        if ref is None:
+            return rule
+        model.rules.append(rule)
+        return None
 
-    def Edge(ref: str, *, edge: str, offset: Optional[Number] = None, inset: Number = 0,
+    def Edge(ref: Optional[str] = None, *, edge: str, offset: Optional[Number] = None, inset: Number = 0,
              x: Optional[Number] = None, y: Optional[Number] = None,
              rot: Optional[Number | str] = None, role: Optional[str] = None,
              lock: bool = False, note: Optional[str] = None, **kwargs: Any) -> None:
@@ -839,28 +847,40 @@ def load_ppl(path: Path) -> PlacementModel:
             py = float(inset) if e == "top" else h - float(inset)
         else:
             raise PlacementError(f"Unknown edge {edge!r}")
-        model.add("edge", ref=_normalize_ref(ref), x=px, y=py,
-                  rot=_rot_or_none(rot), role=role,
-                  lock=bool(lock), edge=e, note=note, extra=dict(kwargs))
+        rule = dict(type="edge", ref=None if ref is None else _normalize_ref(ref), x=px, y=py,
+                    rot=_rot_or_none(rot), role=role,
+                    lock=bool(lock), edge=e, note=note, extra=dict(kwargs))
+        if ref is None:
+            return rule
+        model.rules.append(rule)
+        return None
 
-    def Between(ref: str, *, a: str, b: str, t: Number = 0.5,
+    def Between(ref: Optional[str] = None, *, a: str, b: str, t: Number = 0.5,
                 dx: Number = 0, dy: Number = 0, offset: Optional[Number] = None,
                 rot: Optional[Number | str] = None, align: Optional[str] = None,
                 role: Optional[str] = None, note: Optional[str] = None, **kwargs: Any) -> None:
         if align is not None and rot is None:
             rot = align
-        model.add("between", ref=_normalize_ref(ref), a=_normalize_ref(a), b=_normalize_ref(b),
-                  t=float(t), dx=float(dx), dy=float(dy),
-                  offset=None if offset is None else float(offset), rot=_rot_or_none(rot),
-                  role=role, note=note, extra=dict(kwargs))
+        rule = dict(type="between", ref=None if ref is None else _normalize_ref(ref), a=_normalize_ref(a), b=_normalize_ref(b),
+                    t=float(t), dx=float(dx), dy=float(dy),
+                    offset=None if offset is None else float(offset), rot=_rot_or_none(rot),
+                    role=role, note=note, extra=dict(kwargs))
+        if ref is None:
+            return rule
+        model.rules.append(rule)
+        return None
 
-    def Inline(ref: str, *, a: str, b: str, t: Number = 0.5,
+    def Inline(ref: Optional[str] = None, *, a: str, b: str, t: Number = 0.5,
                rot: Optional[Number | str] = None, align: Optional[str] = None,
                role: Optional[str] = None, note: Optional[str] = None, **kwargs: Any) -> None:
         if align is not None and rot is None:
             rot = align
-        model.add("inline", ref=_normalize_ref(ref), a=_normalize_ref(a), b=_normalize_ref(b),
-                  t=float(t), rot=_rot_or_none(rot), role=role, note=note, extra=dict(kwargs))
+        rule = dict(type="inline", ref=None if ref is None else _normalize_ref(ref), a=_normalize_ref(a), b=_normalize_ref(b),
+                    t=float(t), rot=_rot_or_none(rot), role=role, note=note, extra=dict(kwargs))
+        if ref is None:
+            return rule
+        model.rules.append(rule)
+        return None
 
     def Satellite(ref: str, *, parent: str, side: str = "right", distance: Number = 2,
                   index: int = 0, pitch: Number = 1.5, dx: Number = 0, dy: Number = 0,
@@ -871,11 +891,16 @@ def load_ppl(path: Path) -> PlacementModel:
                   index=int(index), pitch=float(pitch), dx=float(dx), dy=float(dy),
                   rot=_rot_or_none(rot), role=role, note=note, extra=dict(kwargs))
 
-    def Orbit(*, refs: Sequence[str], parent: str, radius: Number = 3,
+    def Orbit(*, refs: Optional[Sequence[str]] = None, parent: str, radius: Number = 3,
               start_angle: Number = 0, step_angle: Optional[Number] = None,
+              index: int = 0, angle: Optional[Number] = None,
               rot: Optional[Number | str] = None, role: Optional[str] = None,
               note: Optional[str] = None, **kwargs: Any) -> None:
         """Distribute support parts around an anchor in polar coordinates."""
+        if refs is None:
+            return dict(type="orbit", refs=None, parent=_normalize_ref(parent), radius=float(radius),
+                        start_angle=float(start_angle if angle is None else angle), step_angle=0.0 if step_angle is None else float(step_angle),
+                        index=int(index), rot=_rot_or_none(rot), role=role, note=note, extra=dict(kwargs))
         refs = list(refs)
         if not refs:
             return
@@ -884,6 +909,35 @@ def load_ppl(path: Path) -> PlacementModel:
         model.add("orbit", refs=[_normalize_ref(r) for r in refs], parent=_normalize_ref(parent),
                   radius=float(radius), start_angle=float(start_angle), step_angle=float(step_angle),
                   rot=_rot_or_none(rot), role=role, note=note, extra=dict(kwargs))
+
+    def Cluster(name: str, *, anchor: str, members: Sequence[str], placement: Mapping[str, Any],
+                ignore_missing: bool = False, role: Optional[str] = None,
+                note: Optional[str] = None, **kwargs: Any) -> None:
+        if kwargs:
+            raise PlacementError(f"Cluster() unknown parameter(s): {', '.join(sorted(kwargs))}")
+        if not name:
+            raise PlacementError("Cluster(name, ...) requires a non-empty name")
+        if not isinstance(placement, Mapping) or not placement.get("type"):
+            raise PlacementError("Cluster(placement=...) must be an unbound placement primitive such as Anchor(...)")
+        supported = {"anchor", "fixed", "edge", "corner", "between", "inline", "orbit"}
+        if placement["type"] not in supported:
+            raise PlacementError(f"Cluster({name!r}) does not support placement={placement['type']!r}")
+        raw_members = [_normalize_ref(m) for m in members]
+        anchor_ref = _normalize_ref(anchor)
+        if anchor_ref not in raw_members:
+            raw_members.insert(0, anchor_ref)
+        seen: Set[str] = set()
+        duplicate_members: List[str] = []
+        unique_members: List[str] = []
+        for member in raw_members:
+            if member in seen:
+                duplicate_members.append(member)
+                continue
+            seen.add(member)
+            unique_members.append(member)
+        model.add("cluster", name=str(name), anchor=anchor_ref, members=unique_members,
+                  duplicate_members=duplicate_members, placement=dict(placement),
+                  ignore_missing=bool(ignore_missing), role=role, note=note)
 
     def Array(*, refs: Iterable[str], start: Point, pitch: Point = (2, 0),
               rot: Optional[Number | str] = None, role: Optional[str] = None,
@@ -1005,6 +1059,7 @@ def load_ppl(path: Path) -> PlacementModel:
         "Inline": Inline,
         "Satellite": Satellite,
         "Orbit": Orbit,
+        "Cluster": Cluster,
         "Array": Array,
         "Row": Row,
         "Column": Column,
@@ -1481,6 +1536,8 @@ class PlacementEngine:
         self.ref_cache: Dict[str, str] = {}
         self.locked: Dict[str, str] = {}
         self.auto_adjustments: List[AutoAdjustment] = []
+        self.clusters: List[Dict[str, Any]] = []
+        self.last_cluster_by_ref: Dict[str, str] = {}
         for error in model.alias_diagnostics.errors:
             self.messages.append(Message("error", error))
         for warning in model.alias_diagnostics.warnings:
@@ -1545,6 +1602,9 @@ class PlacementEngine:
         if actual_ref is None:
             self._warn_or_raise(f"missing footprint {ref!r} for {why}")
             return
+        previous_cluster = self.last_cluster_by_ref.get(actual_ref)
+        if previous_cluster is not None and not why.startswith("cluster "):
+            self.messages.append(Message("warn", f"{actual_ref} moved by cluster {previous_cluster} later refined by {why}"))
         self.placement_attempts[actual_ref] = self.placement_attempts.get(actual_ref, 0) + 1
         old_x, old_y, old_rot = self.positions.get(actual_ref, (0.0, 0.0, self.footprints[actual_ref].rot))
         explicit_rot = rot is not None
@@ -1588,6 +1648,73 @@ class PlacementEngine:
             Message("place", f"place {actual_ref:>16s} -> x={_fmt_num(x):>8s} y={_fmt_num(y):>8s} "
                              f"rot={rot_label:>8s}  {why}{suffix}")
         )
+
+    def _placement_target(self, rule: Mapping[str, Any]) -> Point:
+        typ = str(rule["type"])
+        if typ in {"anchor", "fixed", "corner", "edge"}:
+            if rule.get("relative_to") is not None:
+                bx, by = self.get_pos(str(rule["relative_to"]))
+                return bx + float(rule.get("dx", 0.0)), by + float(rule.get("dy", 0.0))
+            return _board_to_abs(self.model, float(rule["x"]), float(rule["y"]))
+        if typ in {"between", "inline"}:
+            a = self.get_pos(str(rule["a"]))
+            b = self.get_pos(str(rule["b"]))
+            t = float(rule.get("t", 0.5))
+            x = a[0] + (b[0] - a[0]) * t + float(rule.get("dx", 0.0))
+            y = a[1] + (b[1] - a[1]) * t + float(rule.get("dy", 0.0))
+            if rule.get("offset") is not None:
+                vx, vy = b[0] - a[0], b[1] - a[1]
+                length = math.hypot(vx, vy) or 1.0
+                x += (-vy / length) * float(rule["offset"])
+                y += (vx / length) * float(rule["offset"])
+            return x, y
+        if typ == "orbit":
+            cx, cy = self.get_pos(str(rule["parent"]))
+            radius = float(rule["radius"])
+            theta = math.radians(float(rule.get("start_angle", 0.0)) + float(rule.get("step_angle", 0.0)) * int(rule.get("index", 0)))
+            return cx + radius * math.cos(theta), cy + radius * math.sin(theta)
+        raise PlacementError(f"Cluster placement type {typ!r} cannot resolve a coordinate")
+
+    def place_cluster(self, rule: Mapping[str, Any]) -> None:
+        name = str(rule["name"])
+        anchor_ref = self.resolve_ref(str(rule["anchor"]))
+        if anchor_ref is None:
+            raise PlacementError(f"Cluster {name} anchor {rule['anchor']!r} is missing")
+        members: List[str] = []
+        seen_members: Set[str] = set()
+        for duplicate in rule.get("duplicate_members", []):
+            self.messages.append(Message("warn", f"Cluster {name} duplicate member {duplicate!r}; de-duplicated"))
+        for member in rule.get("members", []):
+            actual = self.resolve_ref(str(member))
+            if actual is None:
+                msg = f"Cluster {name} missing member {member!r}"
+                if rule.get("ignore_missing"):
+                    self.messages.append(Message("warn", msg))
+                    continue
+                raise PlacementError(msg)
+            if actual in seen_members:
+                self.messages.append(Message("warn", f"Cluster {name} member {member!r} resolves to duplicate footprint {actual!r}; de-duplicated"))
+                continue
+            seen_members.add(actual)
+            members.append(actual)
+        if anchor_ref not in seen_members:
+            members.insert(0, anchor_ref)
+        old_anchor = self.get_pos(anchor_ref)
+        new_anchor = self._placement_target(rule["placement"])
+        dx = new_anchor[0] - old_anchor[0]
+        dy = new_anchor[1] - old_anchor[1]
+        for actual in members:
+            x, y, rot = self.positions[actual]
+            self.place(actual, x + dx, y + dy, None, f"cluster {name}", rule.get("note"))
+            self.last_cluster_by_ref[actual] = name
+        self.clusters.append({
+            "name": name,
+            "anchor": anchor_ref,
+            "member_count": len(members),
+            "delta": [dx, dy],
+            "old_anchor": [old_anchor[0], old_anchor[1]],
+            "new_anchor": [new_anchor[0], new_anchor[1]],
+        })
 
     def lock(self, ref: str, why: str = "Lock") -> None:
         actual_ref = self.resolve_ref(ref)
@@ -1710,30 +1837,26 @@ class PlacementEngine:
                        avoid_overlap=True, clearance_override=self._clearance_override(rule))
 
     def apply(self) -> None:
-        """Apply rules in deterministic passes.
+        """Apply rules in placement-file order."""
 
-        Absolute rules run first; relationship rules then reference the updated
-        coordinates. Documentation-only rules are reported last.
-        """
-
-        # Absolute pass.
         for rule in self.model.rules:
             typ = rule["type"]
             if typ in {"anchor", "fixed", "corner", "edge"}:
-                if rule.get("relative_to") is not None:
-                    bx, by = self.get_pos(rule["relative_to"])
-                    x = bx + float(rule.get("dx", 0.0))
-                    y = by + float(rule.get("dy", 0.0))
-                else:
-                    x, y = _board_to_abs(self.model, float(rule["x"]), float(rule["y"]))
+                x, y = self._placement_target(rule)
                 self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot")), typ, rule.get("note"),
                            allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
                 if rule.get("lock"):
                     self.lock(rule["ref"], f"{typ} rule")
+
+            elif typ == "cluster":
+                self.place_cluster(rule)
+
             elif typ == "lock":
                 self.lock(rule["ref"], rule.get("note") or "Lock rule")
+
             elif typ in {"array", "row", "column"}:
                 self._apply_linear_collection(rule, typ)
+
             elif typ == "grid":
                 sx, sy = rule["start"]
                 px, py = rule["pitch"]
@@ -1747,20 +1870,10 @@ class PlacementEngine:
                                allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
                                avoid_overlap=True, clearance_override=self._clearance_override(rule))
 
-        # Relational pass.
-        for rule in self.model.rules:
-            typ = rule["type"]
-            if typ in {"between", "inline"}:
+            elif typ in {"between", "inline"}:
                 a = self.get_pos(rule["a"])
                 b = self.get_pos(rule["b"])
-                t = float(rule.get("t", 0.5))
-                x = a[0] + (b[0] - a[0]) * t + float(rule.get("dx", 0.0))
-                y = a[1] + (b[1] - a[1]) * t + float(rule.get("dy", 0.0))
-                if rule.get("offset") is not None:
-                    vx, vy = b[0] - a[0], b[1] - a[1]
-                    length = math.hypot(vx, vy) or 1.0
-                    x += (-vy / length) * float(rule["offset"])
-                    y += (vx / length) * float(rule["offset"])
+                x, y = self._placement_target(rule)
                 self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot"), a, b), typ, rule.get("note"),
                            allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
                            avoid_overlap=True, clearance_override=self._clearance_override(rule))
@@ -1850,10 +1963,7 @@ class PlacementEngine:
                     self.place(dst, x + dx, y + dy, rot, "copy_placement", rule.get("note"),
                                allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
 
-        # Documentation/reporting pass.
-        for rule in self.model.rules:
-            typ = rule["type"]
-            if typ == "keepout":
+            elif typ == "keepout":
                 self.messages.append(Message("note", f"keepout {rule['name']!r}: x={_fmt_num(rule['x'])} "
                                                    f"y={_fmt_num(rule['y'])} w={_fmt_num(rule['w'])} "
                                                    f"h={_fmt_num(rule['h'])} layers={rule['layers']!r} "
@@ -2027,6 +2137,7 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "geometry_source": None if board_geometry is None else board_geometry.source,
         "updated_refs": sorted(engine.updates),
         "placements": [dataclasses.asdict(engine.updates[ref]) for ref in sorted(engine.updates)],
+        "clusters": list(engine.clusters),
         "collisions": collisions,
         "spacing_violations": spacing_violations,
         "bbox_warnings": bbox_warnings,
@@ -2136,6 +2247,22 @@ def print_board(pcb_path: Path, model: Optional[PlacementModel] = None, *, fmt: 
     return 0
 
 
+def print_clusters(model: PlacementModel, *, fmt: str = "text") -> int:
+    clusters = [rule for rule in model.rules if rule.get("type") == "cluster"]
+    payload = [{"name": rule["name"], "anchor": rule["anchor"], "members": list(rule["members"]),
+                "member_count": len(rule["members"])} for rule in clusters]
+    if fmt == "json":
+        print(json.dumps({"clusters": payload}, indent=2, sort_keys=True))
+    else:
+        for item in payload:
+            print(f"Cluster {item['name']}")
+            print(f"  anchor: {item['anchor']}")
+            print(f"  members: {item['member_count']}")
+        if not payload:
+            print("no clusters")
+    return 0
+
+
 def print_generated_uuid_debug(generated_uuids: Sequence[Mapping[str, str] | GeneratedUUID]) -> None:
     for item in generated_uuids:
         if isinstance(item, GeneratedUUID):
@@ -2213,6 +2340,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug-write", action="store_true", help="Print details about generated output objects before writing")
     parser.add_argument("--print-bounds", action="store_true", help="Print input footprint coordinate bounds and board geometry and exit")
     parser.add_argument("--print-board", action="store_true", help="Print authoritative board geometry and exit")
+    parser.add_argument("--print-clusters", action="store_true", help="Print Cluster() declarations from the placement file and exit")
     parser.add_argument("--emit-outline-only", type=Path, metavar="OUTPUT", help="Write only the rectangular Board outline to OUTPUT and exit")
     parser.add_argument("--infer-origin", action="store_true", help="Infer Board origin from input footprint minimum x/y before applying rules")
     parser.add_argument("--validate", action="store_true", help="Run placement validation without writing output")
@@ -2256,13 +2384,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.print_board and args.ppl is None:
         return print_board(args.pcb, None, fmt=args.format)
     if args.ppl is None:
-        parser.error("ppl file is required unless --list-refs, --print-bounds, --print-board, or --list-aliases is used")
+        parser.error("ppl file is required unless --list-refs, --print-bounds, --print-board, --print-clusters, or --list-aliases is used")
     if not args.ppl.exists():
         raise SystemExit(f"PPL file not found: {args.ppl}")
     if args.output and args.in_place:
         parser.error("--output and --in-place are mutually exclusive")
 
     model = load_ppl(args.ppl)
+    if args.print_clusters:
+        return print_clusters(model, fmt=args.format)
     if args.print_board:
         return print_board(args.pcb, model, fmt=args.format)
     if args.emit_outline_only is not None:
