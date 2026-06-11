@@ -8,7 +8,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from pcb_place import apply_placements, import_netlist_aliases, load_ppl, parse_footprints, parse_netlist_aliases
+import pcb_place
+from pcb_place import apply_placements, import_netlist_aliases, is_valid_uuid, load_ppl, parse_footprints, parse_netlist_aliases
 
 
 def test_parse_footprints():
@@ -465,6 +466,82 @@ Anchor("U1", x=10, y=8)
         apply_placements(_pcb_with_edge_rect(), load_ppl(conflict), strict=True)
 
 
+def test_generated_edge_cuts_lines_receive_unique_uuidv4(tmp_path):
+    ppl = tmp_path / "outline-uuid.ppl"
+    ppl.write_text('''
+Board(width=70, height=70, origin_x=140, origin_y=52, emit_outline=True)
+Anchor("U1", x=10, y=8)
+''')
+    out, _messages, report = apply_placements(_pcb_with_at(), load_ppl(ppl), strict=True)
+    generated = report["generated_uuids"]
+    assert len(generated) == 4
+    uuid_values = [item["uuid"] for item in generated]
+    assert [item["object"] for item in generated] == ["gr_line"] * 4
+    assert len(set(uuid_values)) == 4
+    assert all(is_valid_uuid(value) for value in uuid_values)
+    assert all(f'(uuid "{value}")' in out for value in uuid_values)
+
+
+def test_existing_footprint_group_and_pad_uuid_text_preserved(tmp_path):
+    ppl = tmp_path / "preserve-uuid.ppl"
+    ppl.write_text('''
+Board(width=50, height=30)
+Anchor("U1", x=10, y=20)
+''')
+    footprint_uuid = "footprint-existing-uuid-text"
+    pad_uuid = "pad-existing-uuid-text"
+    group_uuid = "group-existing-uuid-text"
+    text = f'''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (uuid "{footprint_uuid}")
+    (at 140 60)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at -1 -1) (size 1 1) (layers "F.Cu") (uuid "{pad_uuid}"))
+  )
+  (group "existing-group" (uuid "{group_uuid}")
+    (members "{footprint_uuid}")
+  )
+)
+'''
+    out, _messages, report = apply_placements(text, load_ppl(ppl), strict=True)
+    assert f'(uuid "{footprint_uuid}")' in out
+    assert f'(uuid "{pad_uuid}")' in out
+    assert f'(uuid "{group_uuid}")' in out
+    assert out.count(f'(uuid "{footprint_uuid}")') == 1
+    assert out.count(f'(uuid "{pad_uuid}")') == 1
+    assert out.count(f'(uuid "{group_uuid}")') == 1
+    assert report["generated_uuids"] == []
+
+
+def test_malformed_generated_uuid_rejected(monkeypatch, tmp_path):
+    ppl = tmp_path / "bad-uuid.ppl"
+    ppl.write_text('''
+Board(width=70, height=70, origin_x=140, origin_y=52, emit_outline=True)
+Anchor("U1", x=10, y=8)
+''')
+    monkeypatch.setattr(pcb_place.uuid, "uuid4", lambda: "not-a-uuid")
+    with pytest.raises(PlacementError, match="valid UUIDv4"):
+        apply_placements(_pcb_with_at(), load_ppl(ppl), strict=True)
+
+
+def test_duplicate_generated_uuid_rejected(monkeypatch, tmp_path):
+    ppl = tmp_path / "duplicate-uuid.ppl"
+    ppl.write_text('''
+Board(width=70, height=70, origin_x=140, origin_y=52, emit_outline=True)
+Anchor("U1", x=10, y=8)
+''')
+    monkeypatch.setattr(pcb_place.uuid, "uuid4", lambda: "550e8400-e29b-41d4-a716-446655440000")
+    with pytest.raises(PlacementError, match="not unique within output file|duplicate generated UUID"):
+        apply_placements(_pcb_with_at(), load_ppl(ppl), strict=True)
+
+
+def test_uuid_validation_helper():
+    assert is_valid_uuid("550e8400-e29b-41d4-a716-446655440000")
+    assert not is_valid_uuid("550e8400-e29b-11d4-a716-446655440000")
+    assert not is_valid_uuid("pcb-place-edge-1")
+    assert not is_valid_uuid("550E8400-E29B-41D4-A716-446655440000")
+
+
 def test_geometry_aware_validation_prefers_edge_cuts(tmp_path):
     ppl = tmp_path / "edge-authoritative.ppl"
     ppl.write_text('''
@@ -514,6 +591,25 @@ Board(width=70, height=70, origin_x=140, origin_y=52, emit_outline=True)
     geometry = BoardGeometry.from_edge_cuts(out.read_text())
     assert geometry is not None
     assert geometry.origin_x == 140.0
+
+
+def test_cli_debug_write_reports_generated_uuids(tmp_path):
+    pcb = tmp_path / "no-edge-debug.kicad_pcb"
+    ppl = tmp_path / "outline-debug.ppl"
+    out = tmp_path / "outline-debug.kicad_pcb"
+    pcb.write_text(_pcb_with_at())
+    ppl.write_text('''
+Board(width=70, height=70, origin_x=140, origin_y=52, emit_outline=True)
+''')
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--emit-outline-only", str(out), "--debug-write"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "generated UUID:" in result.stdout
+    assert "object=gr_line" in result.stdout
+
 
 def _pcb_with_l_shaped_edge_lines() -> str:
     return _pcb_with_at()[:-2] + '''  (gr_line (start 140 52) (end 210 52) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "l1"))
