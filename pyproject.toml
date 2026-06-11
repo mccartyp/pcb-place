@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pcb-place"
-version = "0.9.0"
-description = "Deterministic footprint placement sidecar for KiCad PCB files"
+version = "0.10.0"
+description = "Deterministic footprint placement and heuristic planning sidecars for KiCad PCB files"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -31,20 +31,24 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 pcb-place = "pcb_place:main"
+pcb-plan = "pcb_plan:main"
 
 
 [tool.hatch.build.targets.sdist]
 include = [
   "/LICENSE",
   "/README.md",
+  "/README-plan.md",
+  "/README-place.md",
   "/pcb_place.py",
+  "/pcb_plan.py",
   "/pyproject.toml",
   "/examples",
   "/tests",
 ]
 
 [tool.hatch.build.targets.wheel]
-py-modules = ["pcb_place"]
+py-modules = ["pcb_place", "pcb_plan"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
