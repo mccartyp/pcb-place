@@ -485,4 +485,57 @@ def test_report_quality_metrics_and_nearpad_rule():
     assert payload["clusters_multi_member"] == 1
     assert payload["generated_decoupling_rules"] == 1
     assert payload["generated_pullup_rules"] == 1
-    assert any(rule.kind == "nearpad" for rule in plan.rules)
+    # A single decoupling cap per IC power pin uses Decoupling() directly;
+    # no redundant NearPad() rule is emitted for the same component.
+    assert not any(rule.kind == "nearpad" and rule.refs and rule.refs[0] == "C1" for rule in plan.rules)
+    assert payload["decoupling_groups"] == [
+        {"parent": "U1", "power_net": "3V3", "pad": "1", "members": ["C1"], "primitive": "Decoupling", "grouped": False}
+    ]
+    assert payload["pullup_groups"] == [
+        {"owner": "U1", "members": ["R1"], "primitive": "Pullup", "grouped": False}
+    ]
+    assert payload["duplicate_rules"] == []
+    assert payload["failed_topology_inference"] == []
+    assert payload["cluster_quality_score"] == 1.0
+    assert payload["series_components_validated"] == 0
+    assert payload["primitive_counts"]["Decoupling"] == 1
+    assert payload["primitive_counts"]["Pullup"] == 1
+
+
+def test_grouped_decoupling_and_pullup_arrays_and_series_validation():
+    board, components, nets, warnings = pcb_plan.parse_board(ROOT / "tests/fixtures/grouped_support/layout.kicad_pcb")
+    plan = pcb_plan.generate_plan(board, components, nets, {}, pcb_plan.AliasDiagnostics(), {}, warnings)
+    payload = pcb_plan.report(plan)
+
+    # Three decoupling caps sharing U10's 3V3 pad are grouped into a single
+    # decoupling array using Orbit(), not per-cap Decoupling()/NearPad() rules.
+    assert len(plan.decoupling_groups) == 1
+    decoupling_group = plan.decoupling_groups[0]
+    assert decoupling_group["parent"] == "U10"
+    assert decoupling_group["primitive"] == "Orbit"
+    assert decoupling_group["grouped"] is True
+    assert sorted(decoupling_group["members"]) == ["C31", "C32", "C33"]
+    assert not any(rule.kind in {"decoupling", "nearpad"} for rule in plan.rules if rule.kind != "decoupling_array")
+    assert all(rule.text.startswith("Orbit(") for rule in plan.rules if rule.kind == "decoupling_array")
+
+    # Two pullups on different signal nets owned by the same MCU are grouped
+    # by ownership rather than emitted as context-less Pullup() rules.
+    assert len(plan.pullup_groups) == 1
+    pullup_group = plan.pullup_groups[0]
+    assert pullup_group["owner"] == "U10"
+    assert pullup_group["primitive"] == "Orbit"
+    assert pullup_group["grouped"] is True
+    assert sorted(pullup_group["members"]) == ["R21", "R22"]
+    assert all(rule.text.startswith("Orbit(") for rule in plan.rules if rule.kind == "pullup_array")
+
+    # R10 sits on a true A -> resistor -> B signal path (J1 -> R10 -> U10)
+    # and is validated as a Series() component.
+    assert any(rule.kind == "series" and 'Series("R10", a="J1", b="U10"' in rule.text for rule in plan.rules)
+    assert payload["series_components_validated"] == 1
+
+    # R11 only shares its two nets with other passive support components, so
+    # the connectivity graph rejects the false Series() inference.
+    assert not any(rule.kind == "series" and "R11" in rule.refs for rule in plan.rules)
+    assert any("R11" in failure and "rejected Series()" in failure for failure in payload["failed_topology_inference"])
+
+    assert payload["duplicate_rules"] == []

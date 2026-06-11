@@ -80,10 +80,41 @@ neighborhoods while allowing pin-aware refinements inside them.
 
 Support passives are emitted with semantic placement helpers where possible:
 `Decoupling(...)`, `NearPad(...)`, `ESD(...)`, `Pullup(...)`, `Series(...)`,
-`Satellite(...)`, `Between(...)`, and `Cluster(...)`. Review
+`Satellite(...)`, `Between(...)`, `Cluster(...)`, and `Orbit(...)`. Review
 `unplaced_components` and the planning metrics in `pcb-plan` reports; unplaced
 support parts should be treated as warnings and either given better connectivity
 or explicit placement intent.
+
+The planner builds a lightweight connectivity graph from parsed components and
+nets to validate primitive selection rather than relying on shared-net
+heuristics alone:
+
+- **Decoupling capacitors** that share the same IC and power pin are grouped
+  into a single `Orbit(...)` decoupling array distributed across the IC's
+  legal perimeter sides (avoiding board edges, keepouts, and connector
+  footprints), instead of one `Decoupling(...)`/`NearPad(...)` pair per
+  capacitor. A lone decoupling capacitor for a pin still gets a single
+  `Decoupling(...)` rule.
+- **Pullup/pulldown resistors** are assigned to the component that owns the
+  signal they bias (connector, MCU, transceiver/RF module, other IC, or
+  regulator, in that priority order), determined via the connectivity graph.
+  Multiple pullups/pulldowns owned by the same component are grouped into an
+  `Orbit(...)` array near that owner instead of context-less `Pullup(...)`
+  rules.
+- **Series components** (e.g. damping or filter resistors on a signal path)
+  are only emitted as `Series(...)` if the connectivity graph finds a true
+  A -> component -> B topology: exactly two non-ground nets, each connecting
+  to exactly one other non-passive component. Components that only share nets
+  with other passive support parts (such as two decoupling capacitors) are
+  rejected with a warning and listed in `failed_topology_inference` rather
+  than emitted as a misleading `Series(...)` rule.
+
+Inferred clusters carry a `category` (a semantic label such as "HDMI cluster"
+or "MCU cluster") and a `confidence` ("high" for multi-member clusters, "low"
+for single-member clusters that likely indicate missing connectivity).
+Generated rules are also validated for board-bounds violations, duplicate
+rule text, and duplicate placement ownership of the same component; problems
+surface as `duplicate_rules` and additional `warnings` in `pcb-plan` reports.
 
 ## board.pln Syntax Reference
 
@@ -670,6 +701,24 @@ pcb-plan update \
 
 Reports include inferred roles, inferred interfaces, inferred constraints,
 provenance, confidence, warnings, and review-required items.
+
+`pcb-plan` reports also include placement-quality metrics:
+
+- `primitive_counts`: number of generated rules per placement primitive (e.g.
+  `Decoupling`, `Orbit`, `Pullup`, `Series`, `Cluster`).
+- `decoupling_groups` / `pullup_groups`: per-IC/owner grouping summaries
+  showing which components were grouped into `Orbit(...)` arrays versus given
+  a single `Decoupling(...)`/`Pullup(...)` rule.
+- `series_components_validated`: count of `Series(...)` rules that passed
+  connectivity-graph topology validation.
+- `failed_topology_inference`: components where a series/pullup inference was
+  rejected because the connectivity graph could not establish the required
+  topology.
+- `duplicate_rules`: duplicate rule text or duplicate placement ownership
+  detected across generated rules.
+- `cluster_quality_score`: fraction of inferred clusters that are multi-member
+  (higher is better; single-member clusters likely indicate missing
+  connectivity).
 
 ## Syntax and safety
 
