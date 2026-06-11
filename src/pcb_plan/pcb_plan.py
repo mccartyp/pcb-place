@@ -831,11 +831,26 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     for comp in components.values():
         if "connector" in comp.role:
             members = _cluster_members(comp, components, radius=18.0)
-            edge = "left" if comp.x < board.origin_x + board.width / 3 else "right" if comp.x > board.origin_x + 2 * board.width / 3 else "top"
-            y = max(0.0, min(board.height, comp.y - board.origin_y))
+            local_x = max(0.0, min(board.width, comp.x - board.origin_x))
+            local_y = max(0.0, min(board.height, comp.y - board.origin_y))
+            distances = {
+                "left": local_x,
+                "right": board.width - local_x,
+                "top": local_y,
+                "bottom": board.height - local_y,
+            }
+            edge = min(distances, key=distances.get)
+            edge_span = board.width if edge in ("left", "right") else board.height
+            inset = 2.0
             name = re.sub(r"[^A-Za-z0-9_]+", "_", comp.role.upper() + "_" + comp.ref)
-            text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement=Edge(edge={_q(edge)}, y={y:.3f}, inset=2.0), role={_q(comp.role)})'
-            rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector cluster preserves local geometry and reserves edge access."))
+            if edge_span > 0 and distances[edge] / edge_span <= 0.25 and distances[edge] > inset:
+                along = local_y if edge in ("left", "right") else local_x
+                placement_kw = "y" if edge in ("left", "right") else "x"
+                text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement=Edge(edge={_q(edge)}, {placement_kw}={along:.3f}, inset={inset}), role={_q(comp.role)})'
+                rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector cluster preserves local geometry and reserves edge access."))
+            else:
+                text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement=Anchor(x={local_x:.3f}, y={local_y:.3f}, rot={comp.rot:g}), role={_q(comp.role)})'
+                rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector cluster kept at existing location; not adjacent to a board edge."))
             clusters.append({"name": name, "anchor": comp.ref, "members": members, "role": comp.role})
             explanations.setdefault(comp.ref, {}).update({"role": comp.role, "generated_rule": text})
 
