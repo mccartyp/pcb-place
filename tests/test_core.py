@@ -888,6 +888,20 @@ Cluster("MCU", anchor="U6", members=["R99"], placement=Anchor(x=30, y=20))
         apply_placements(_cluster_pcb(), missing, strict=True)
 
 
+def test_cluster_deduplicates_members_after_alias_resolution(tmp_path):
+    model = _load_inline_ppl(tmp_path, """
+Board(width=80, height=50)
+Alias("MCU.U6", "U6")
+Cluster("MCU", anchor="U6", members=["MCU.U6", "U6", "C5"], placement=Anchor(x=30, y=20))
+""")
+    out, messages, report = apply_placements(_cluster_pcb(), model, strict=True, allow_overlap=True)
+    fps = parse_footprints(out)
+    assert (fps["U6"].x, fps["U6"].y) == (30, 20)
+    assert (fps["C5"].x, fps["C5"].y) == (32, 20)
+    assert report["clusters"][0]["member_count"] == 2
+    assert any("resolves to duplicate footprint 'U6'" in m.text for m in messages)
+
+
 def test_cluster_satellite_refinement_warns_and_report_json_cli(tmp_path):
     pcb = tmp_path / "cluster.kicad_pcb"
     ppl = tmp_path / "cluster.ppl"

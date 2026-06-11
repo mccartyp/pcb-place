@@ -1681,6 +1681,7 @@ class PlacementEngine:
         if anchor_ref is None:
             raise PlacementError(f"Cluster {name} anchor {rule['anchor']!r} is missing")
         members: List[str] = []
+        seen_members: Set[str] = set()
         for duplicate in rule.get("duplicate_members", []):
             self.messages.append(Message("warn", f"Cluster {name} duplicate member {duplicate!r}; de-duplicated"))
         for member in rule.get("members", []):
@@ -1691,8 +1692,12 @@ class PlacementEngine:
                     self.messages.append(Message("warn", msg))
                     continue
                 raise PlacementError(msg)
+            if actual in seen_members:
+                self.messages.append(Message("warn", f"Cluster {name} member {member!r} resolves to duplicate footprint {actual!r}; de-duplicated"))
+                continue
+            seen_members.add(actual)
             members.append(actual)
-        if anchor_ref not in members:
+        if anchor_ref not in seen_members:
             members.insert(0, anchor_ref)
         old_anchor = self.get_pos(anchor_ref)
         new_anchor = self._placement_target(rule["placement"])
