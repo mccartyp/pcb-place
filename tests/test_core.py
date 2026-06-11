@@ -663,3 +663,45 @@ Satellite("C1", parent="U1", side="top", distance=0.1)
     assert "collisions" in payload and "spacing_violations" in payload and "bbox_warnings" in payload and "auto_adjustments" in payload
     assert payload["bbox_warnings"]
     assert "auto_adjustments=" in result.stdout
+
+
+def _two_footprint_pcb(*, r_layer: str = "F.Cu", r_at: str = "10 10 0") -> str:
+    return f'''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (gr_rect (start 0 0) (end 30 30) (stroke (width 0.1) (type default)) (fill none) (layer "Edge.Cuts") (uuid "edge"))
+  (footprint "Pkg:SOIC" (layer "F.Cu")
+    (at 0 0 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at -1 -1) (size 1 1) (layers "F.Cu"))
+    (pad "2" smd rect (at 1 1) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Pkg:R" (layer "{r_layer}")
+    (at {r_at})
+    (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at -0.5 0) (size 0.6 0.8) (layers "{r_layer}"))
+    (pad "2" smd rect (at 0.5 0) (size 0.6 0.8) (layers "{r_layer}"))
+  )
+)
+'''
+
+
+def test_collision_validation_checks_updated_against_existing_footprints(tmp_path):
+    ppl = tmp_path / "subset-overlap.ppl"
+    ppl.write_text('''
+Board(width=30, height=30)
+Anchor("U1", x=10, y=10)
+''')
+    with pytest.raises(PlacementError, match="U1 overlaps R1|R1 overlaps U1"):
+        apply_placements(_two_footprint_pcb(), load_ppl(ppl), strict=True, safe=True)
+
+
+def test_collision_validation_ignores_opposite_board_sides(tmp_path):
+    ppl = tmp_path / "back-to-back.ppl"
+    ppl.write_text('''
+Board(width=30, height=30)
+Anchor("U1", x=10, y=10)
+''')
+    _out, _messages, report = apply_placements(
+        _two_footprint_pcb(r_layer="B.Cu"), load_ppl(ppl), strict=True, safe=True
+    )
+    assert report["collisions"] == []
+    assert report["spacing_violations"] == []

@@ -1263,6 +1263,21 @@ def _part_class_for(model: PlacementModel, ref: str) -> str:
     return model.part_classes.get(ref, infer_part_class(ref))
 
 
+def _physical_side(fp: Footprint) -> str:
+    layer = (fp.layer or "").lower()
+    if layer.startswith("f."):
+        return "front"
+    if layer.startswith("b."):
+        return "back"
+    return "both"
+
+
+def _same_physical_side(a: Footprint, b: Footprint) -> bool:
+    side_a = _physical_side(a)
+    side_b = _physical_side(b)
+    return side_a == "both" or side_b == "both" or side_a == side_b
+
+
 def _rot_point(x: float, y: float, deg: float) -> Point:
     rad = math.radians(deg)
     c, s = math.cos(rad), math.sin(rad)
@@ -1354,11 +1369,14 @@ def _board_contains_bbox(geometry: Optional[BoardGeometry], bbox: BBox, *, eps: 
 
 
 def spacing_analysis(engine: "PlacementEngine", *, refs: Optional[Iterable[str]] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    infos = all_bbox_infos(engine, refs=refs)
+    subject_refs = set(refs) if refs is not None else set(engine.positions)
+    considered_refs = set(engine.positions) if refs is not None and subject_refs else subject_refs
+    infos = all_bbox_infos(engine, refs=considered_refs)
     bbox_warnings = []
     seen_warnings: Set[str] = set()
-    for info in infos.values():
-        if info.warning and info.warning not in seen_warnings:
+    for ref in sorted(subject_refs | set(infos)):
+        info = infos.get(ref)
+        if info is not None and info.warning and info.warning not in seen_warnings:
             bbox_warnings.append({"ref": info.ref, "message": info.warning})
             seen_warnings.add(info.warning)
     collisions: List[Dict[str, Any]] = []
@@ -1366,12 +1384,18 @@ def spacing_analysis(engine: "PlacementEngine", *, refs: Optional[Iterable[str]]
     refs_sorted = sorted(infos)
     for i, a in enumerate(refs_sorted):
         for b in refs_sorted[i + 1:]:
+            if refs is not None and a not in subject_refs and b not in subject_refs:
+                continue
+            if not _same_physical_side(engine.footprints[a], engine.footprints[b]):
+                continue
             ia, ib = infos[a], infos[b]
             ca, cb = _part_class_for(engine.model, a), _part_class_for(engine.model, b)
             required = engine.model.clearance.required_for(ca, cb)
             actual = ia.bbox.clearance_to(ib.bbox)
             item = {"ref_a": a, "ref_b": b, "bbox_a": ia.bbox.as_report(), "bbox_b": ib.bbox.as_report(),
-                    "class_a": ca, "class_b": cb, "required_clearance": required, "actual_clearance": actual}
+                    "class_a": ca, "class_b": cb, "layer_a": engine.footprints[a].layer, "layer_b": engine.footprints[b].layer,
+                    "side_a": _physical_side(engine.footprints[a]), "side_b": _physical_side(engine.footprints[b]),
+                    "required_clearance": required, "actual_clearance": actual}
             if ia.bbox.overlaps(ib.bbox):
                 collisions.append(item)
             elif actual < required - 1e-9:
@@ -1570,9 +1594,9 @@ class PlacementEngine:
         test_info = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model)
         if not _board_contains_bbox(self.board_geometry, test_info.bbox):
             return "would leave board bounds"
-        obstacle_refs = set(self.updates) | set(self.locked)
+        obstacle_refs = set(self.positions)
         for other in sorted(obstacle_refs):
-            if other == ref or other not in self.footprints:
+            if other == ref or other not in self.footprints or not _same_physical_side(self.footprints[ref], self.footprints[other]):
                 continue
             ox, oy, orot = self.positions[other]
             other_info = footprint_bbox_at(self.footprints[other], ox, oy, orot, self.model)
