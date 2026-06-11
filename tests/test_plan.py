@@ -4,7 +4,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
+
+PLAN_CLI = ROOT / "src/pcb-plan/pcb_plan.py"
+PLACE_CLI = ROOT / "src/pcb-place/pcb_place.py"
 
 import pcb_plan
 
@@ -58,7 +61,7 @@ def test_ppl_emission_report_json_and_explain(tmp_path):
     out = tmp_path / "placement.ppl"
     report = tmp_path / "report.json"
     result = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_plan.py"), "--board", str(board_path), "-o", str(out), "--report-json", str(report)],
+        [sys.executable, str(PLAN_CLI), "--board", str(board_path), "-o", str(out), "--report-json", str(report)],
         check=True,
         capture_output=True,
         text=True,
@@ -73,7 +76,7 @@ def test_ppl_emission_report_json_and_explain(tmp_path):
     assert any(rule["kind"] == "esd" for rule in payload["generated_rules"])
 
     explain = subprocess.run(
-        [sys.executable, str(ROOT / "pcb_plan.py"), "--board", str(board_path), "--explain", "U2"],
+        [sys.executable, str(PLAN_CLI), "--board", str(board_path), "--explain", "U2"],
         check=True,
         capture_output=True,
         text=True,
@@ -86,7 +89,7 @@ def test_rf_module_synthesized_keepout_does_not_reject_generated_plan(tmp_path):
     board_path = ROOT / "tests/fixtures/rf_module/layout.kicad_pcb"
     out = tmp_path / "placement.ppl"
     subprocess.run(
-        [sys.executable, str(ROOT / "pcb_plan.py"), "--board", str(board_path), "-o", str(out)],
+        [sys.executable, str(PLAN_CLI), "--board", str(board_path), "-o", str(out)],
         check=True,
         capture_output=True,
         text=True,
@@ -94,7 +97,7 @@ def test_rf_module_synthesized_keepout_does_not_reject_generated_plan(tmp_path):
     ppl = out.read_text()
     assert 'Keepout("U12_ANTENNA", x=42.000, y=0.000, w=12.000, h=7.250, role="rf")' in ppl
     subprocess.run(
-        [sys.executable, str(ROOT / "pcb_place.py"), str(board_path), str(out), "--dry-run", "--strict"],
+        [sys.executable, str(PLACE_CLI), str(board_path), str(out), "--dry-run", "--strict"],
         check=True,
         capture_output=True,
         text=True,
@@ -307,7 +310,7 @@ def test_emit_routing_policy_and_openems_plan_auto_mode(tmp_path):
     subprocess.run(
         [
             sys.executable,
-            str(ROOT / "pcb_plan.py"),
+            str(PLAN_CLI),
             "--board",
             str(board_path),
             "--intent",
@@ -332,3 +335,90 @@ def test_emit_routing_policy_and_openems_plan_auto_mode(tmp_path):
     assert "TMDS0_P" in openems_text
     assert "advisory_warning:" in openems_text
     assert json.loads(report.read_text())["routing"]["high_speed_constraints_complete"] is True
+
+
+def test_plan_init_review_explain_emit_lifecycle(tmp_path):
+    board_path = ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb"
+    pln = tmp_path / "board.pln"
+    init_report = tmp_path / "pcb-plan-init-report.json"
+    subprocess.run(
+        [sys.executable, str(PLAN_CLI), "init", "--board", str(board_path), "-o", str(pln), "--report-json", str(init_report)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    pln_text = pln.read_text()
+    assert "differential_pairs:" in pln_text
+    assert "requires_review:" in pln_text
+    init_payload = json.loads(init_report.read_text())
+    assert init_payload["action"] == "init"
+    assert "routing" in init_payload
+    assert init_payload["review_required_items"]
+
+    review = subprocess.run(
+        [sys.executable, str(PLAN_CLI), "review", "--pln", str(pln)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "board.pln review" in review.stdout
+    assert "Provenance and confidence" in review.stdout
+
+    explain = subprocess.run(
+        [sys.executable, str(PLAN_CLI), "explain", "routing.classes.high_speed_diff", "--pln", str(pln)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "routing.classes.high_speed_diff" in explain.stdout
+    assert "why it exists" in explain.stdout
+
+    ppl = tmp_path / "placement.ppl"
+    subprocess.run(
+        [sys.executable, str(PLAN_CLI), "emit", "--pln", str(pln), "--board", str(board_path), "-o", str(ppl)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "Generated placement plan" in ppl.read_text()
+
+
+def test_plan_update_generates_reviewable_patch(tmp_path):
+    board_path = ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb"
+    pln = tmp_path / "board.pln"
+    subprocess.run(
+        [sys.executable, str(PLAN_CLI), "init", "--board", str(board_path), "-o", str(pln)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    openems_report = tmp_path / "openems-report.json"
+    openems_report.write_text(json.dumps({"suggestion": "increase antenna keepout"}))
+    updated = tmp_path / "board.updated.pln"
+    patch = tmp_path / "board.pln.patch"
+    update_report = tmp_path / "pcb-plan-update-report.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(PLAN_CLI),
+            "update",
+            "--pln",
+            str(pln),
+            "--openems-report",
+            str(openems_report),
+            "-o",
+            str(updated),
+            "--patch",
+            str(patch),
+            "--report-json",
+            str(update_report),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "openems_feedback" in updated.read_text()
+    assert "--- " in patch.read_text()
+    assert "+++ " in patch.read_text()
+    payload = json.loads(update_report.read_text())
+    assert "openems" in payload["reports_consumed"]

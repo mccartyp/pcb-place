@@ -38,17 +38,18 @@ pcb-plan = "pcb_plan:main"
 include = [
   "/LICENSE",
   "/README.md",
-  "/README-plan.md",
-  "/README-place.md",
-  "/pcb_place.py",
-  "/pcb_plan.py",
+  "/src",
   "/pyproject.toml",
   "/examples",
   "/tests",
 ]
 
 [tool.hatch.build.targets.wheel]
-py-modules = ["pcb_place", "pcb_plan"]
+packages = ["src/pcb_place", "src/pcb_plan"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/pcb-place" = "pcb-place"
+"src/pcb-plan" = "pcb-plan"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
