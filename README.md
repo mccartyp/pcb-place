@@ -289,6 +289,12 @@ When `emit_outline=True`, `pcb-place` writes a rectangular `Edge.Cuts` outline o
 pcb-place board.kicad_pcb placement.ppl --emit-outline-only outline.kicad_pcb
 ```
 
+## UUID Preservation
+
+pcb-place preserves all existing KiCad UUID text byte-for-byte, including UUIDs on footprints, pads, groups, tracks, vias, zones, drawings, graphics, text, and dimensions. It is a placement tool, not a UUID management tool, so existing KiCad metadata identifiers are immutable during placement rewrites.
+
+Only newly-created objects receive UUID identifiers. Generated objects such as emitted `Edge.Cuts` graphics are assigned canonical UUIDv4 strings from Python's standard `uuid.uuid4()` path, and those generated UUIDs are validated before writing so pcb-place fails rather than emitting malformed identifiers. This minimizes risk of KiCad metadata corruption.
+
 ## Placement DSL example
 
 ```python
