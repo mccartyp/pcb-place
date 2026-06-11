@@ -52,7 +52,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 Number = float | int
 Point = Tuple[float, float]
@@ -137,6 +137,10 @@ class BBox:
             overlap_y = min(self.max_y, other.max_y) - max(self.min_y, other.min_y)
             return -max(0.0, min(overlap_x, overlap_y))
         return math.hypot(dx, dy)
+
+    def contains_bbox(self, other: "BBox", *, eps: float = 1e-9) -> bool:
+        return (self.min_x - eps <= other.min_x and other.max_x <= self.max_x + eps and
+                self.min_y - eps <= other.min_y and other.max_y <= self.max_y + eps)
 
     def as_report(self) -> Dict[str, float]:
         return dataclasses.asdict(self)
@@ -313,6 +317,8 @@ class PlacementModel:
     imported_aliases: Dict[str, str] = dataclasses.field(default_factory=dict)
     alias_diagnostics: AliasDiagnostics = dataclasses.field(default_factory=AliasDiagnostics)
     regions: Dict[str, Dict[str, Any]] = dataclasses.field(default_factory=dict)
+    priority_refs: Dict[str, float] = dataclasses.field(default_factory=dict)
+    soft_refs: Set[str] = dataclasses.field(default_factory=set)
     clearance: ClearanceRules = dataclasses.field(default_factory=ClearanceRules)
     policy: PlacementPolicy = dataclasses.field(default_factory=PlacementPolicy)
     part_classes: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -326,14 +332,14 @@ class PlacementModel:
         self.aliases[name] = ref
 
     def region(self, name: str, *, x: Number, y: Number, w: Number, h: Number,
-               role: Optional[str] = None, note: Optional[str] = None) -> None:
+               role: Optional[str] = None, note: Optional[str] = None, priority: Optional[Number] = None) -> None:
         if not name:
             raise PlacementError("Region(name, ...) requires a non-empty name")
         if w <= 0 or h <= 0:
             raise PlacementError("Region(w=..., h=...) must be positive")
         self.regions[name] = {
             "name": name, "x": float(x), "y": float(y), "w": float(w), "h": float(h),
-            "role": role, "note": note,
+            "role": role, "note": note, "priority": None if priority is None else float(priority),
         }
 
 
@@ -716,10 +722,11 @@ def load_ppl(path: Path) -> PlacementModel:
         model.alias(str(name), str(ref))
 
     def Region(name: str, *, x: Number, y: Number, w: Number, h: Number,
-               role: Optional[str] = None, note: Optional[str] = None, **kwargs: Any) -> None:
+               role: Optional[str] = None, note: Optional[str] = None,
+               priority: Optional[Number] = None, **kwargs: Any) -> None:
         if kwargs:
             raise PlacementError(f"Region() unknown parameter(s): {', '.join(sorted(kwargs))}")
-        model.region(str(name), x=x, y=y, w=w, h=h, role=role, note=note)
+        model.region(str(name), x=x, y=y, w=w, h=h, role=role, note=note, priority=priority)
 
     def Spacing(*, default: Number = 0.25, passive_to_passive: Number = 0.20,
                 passive_to_ic: Number = 0.50, ic_to_ic: Number = 0.75,
@@ -758,6 +765,20 @@ def load_ppl(path: Path) -> PlacementModel:
         if kwargs:
             raise PlacementError(f"Lock() unknown parameter(s): {', '.join(sorted(kwargs))}")
         model.add("lock", ref=_normalize_ref(ref), note=note or reason)
+
+    def Priority(ref: str, value: Number, **kwargs: Any) -> None:
+        if kwargs:
+            raise PlacementError(f"Priority() unknown parameter(s): {', '.join(sorted(kwargs))}")
+        normalized = _normalize_ref(ref)
+        model.priority_refs[normalized] = float(value)
+        model.add("priority", ref=normalized, value=float(value))
+
+    def Soft(ref: str, **kwargs: Any) -> None:
+        if kwargs:
+            raise PlacementError(f"Soft() unknown parameter(s): {', '.join(sorted(kwargs))}")
+        normalized = _normalize_ref(ref)
+        model.soft_refs.add(normalized)
+        model.add("soft", ref=normalized)
 
     def Anchor(ref: Optional[str] = None, *, x: Optional[Number] = None, y: Optional[Number] = None,
                at: Optional[Point] = None, rot: Optional[Number | str] = None,
@@ -891,6 +912,44 @@ def load_ppl(path: Path) -> PlacementModel:
                   index=int(index), pitch=float(pitch), dx=float(dx), dy=float(dy),
                   rot=_rot_or_none(rot), role=role, note=note, extra=dict(kwargs))
 
+    def NearPad(ref: str, *, parent: str, pad: str | Sequence[str], distance: Number = 1.5,
+                side: str = "auto", clearance: Optional[Number] = None, role: Optional[str] = None,
+                priority: Optional[Number] = None, rot: Optional[Number | str] = None,
+                note: Optional[str] = None, **kwargs: Any) -> None:
+        model.add("near_pad", ref=_normalize_ref(ref), parent=_normalize_ref(parent), pad=pad,
+                  distance=float(distance), side=side.lower().replace("-", "_"),
+                  clearance=None if clearance is None else float(clearance), role=role,
+                  priority=None if priority is None else float(priority), rot=_rot_or_none(rot),
+                  note=note, extra=dict(kwargs))
+
+    def Decoupling(ref: str, *, parent: str, power_net: Optional[str] = None, ground_net: Optional[str] = None,
+                   pad: Optional[str | Sequence[str]] = None, distance: Number = 1.5,
+                   role: str = "decoupling", priority: Number = 90, **kwargs: Any) -> None:
+        kwargs.setdefault("power_net", power_net)
+        kwargs.setdefault("ground_net", ground_net)
+        if pad is not None:
+            NearPad(ref, parent=parent, pad=pad, distance=distance, role=role, priority=priority, **kwargs)
+        else:
+            Satellite(ref, parent=parent, side="auto", distance=distance, role=role, priority=priority, **kwargs)
+
+    def Pullup(ref: str, *, parent: str, net: Optional[str] = None, pad: Optional[str | Sequence[str]] = None,
+               distance: Number = 3.0, role: str = "pullup", priority: Number = 60, **kwargs: Any) -> None:
+        kwargs.setdefault("net", net)
+        if pad is not None:
+            NearPad(ref, parent=parent, pad=pad, distance=distance, role=role, priority=priority, **kwargs)
+        else:
+            Satellite(ref, parent=parent, side="auto", distance=distance, role=role, priority=priority, **kwargs)
+
+    def Series(ref: str, *, a: str, b: str, t: Number = 0.5, offset: Number = 0,
+               clearance: Optional[Number] = None, role: str = "series", priority: Number = 70,
+               **kwargs: Any) -> None:
+        Between(ref, a=a, b=b, t=t, offset=offset, role=role, priority=priority, clearance=clearance, **kwargs)
+
+    def ESD(ref: str, *, connector: str, protected: str, t: Number = 0.2, offset: Number = 0,
+            clearance: Optional[Number] = None, role: str = "esd", priority: Number = 80,
+            **kwargs: Any) -> None:
+        Between(ref, a=connector, b=protected, t=t, dy=offset, role=role, priority=priority, clearance=clearance, **kwargs)
+
     def Orbit(*, refs: Optional[Sequence[str]] = None, parent: str, radius: Number = 3,
               start_angle: Number = 0, step_angle: Optional[Number] = None,
               index: int = 0, angle: Optional[Number] = None,
@@ -985,9 +1044,10 @@ def load_ppl(path: Path) -> PlacementModel:
 
     def Keepout(name: str, *, x: Number, y: Number, w: Number, h: Number,
                 layers: str = "all", role: Optional[str] = None, note: Optional[str] = None,
+                emit: bool = False,
                 **kwargs: Any) -> None:
         model.add("keepout", name=str(name), x=float(x), y=float(y), w=float(w), h=float(h),
-                  layers=str(layers), role=role, note=note, extra=dict(kwargs))
+                  layers=str(layers), role=role, note=note, emit=bool(emit), extra=dict(kwargs))
 
     def Corridor(name: str, *, a: str, b: str, width: Number,
                  clearance: Number = 0, role: Optional[str] = None,
@@ -1050,6 +1110,8 @@ def load_ppl(path: Path) -> PlacementModel:
         "PlacementPolicy": PlacementPolicyDsl,
         "PartClass": PartClass,
         "Lock": Lock,
+        "Priority": Priority,
+        "Soft": Soft,
         "Component": Component,
         "Anchor": Anchor,
         "Fixed": Fixed,
@@ -1058,6 +1120,11 @@ def load_ppl(path: Path) -> PlacementModel:
         "Between": Between,
         "Inline": Inline,
         "Satellite": Satellite,
+        "NearPad": NearPad,
+        "Decoupling": Decoupling,
+        "Pullup": Pullup,
+        "Series": Series,
+        "ESD": ESD,
         "Orbit": Orbit,
         "Cluster": Cluster,
         "Array": Array,
@@ -1431,6 +1498,23 @@ def _parse_fp_local_bbox(fp: Footprint) -> Optional[BBox]:
     return _bbox_from_points(points) if points else None
 
 
+def _parse_pad_local_centers(fp: Footprint) -> Dict[str, Point]:
+    """Return KiCad pad names/numbers mapped to footprint-local pad centers."""
+
+    pads: Dict[str, Point] = {}
+    for match in re.finditer(r'\(pad\b', fp.text):
+        block = fp.text[match.start():_find_matching_paren(fp.text, fp.text.find("(", match.start()))]
+        name_match = re.match(r'\(pad\s+("(?:[^"\\]|\\.)*"|[^\s()]+)', block)
+        at = re.search(r'\(at\s+' + _NUM + r'\s+' + _NUM + r'(?:\s+' + _NUM + r')?\)', block)
+        if not name_match or not at:
+            continue
+        name = name_match.group(1)
+        if name.startswith('"') and name.endswith('"'):
+            name = name[1:-1]
+        pads[name] = (float(at.group(1)), float(at.group(2)))
+    return pads
+
+
 def _fallback_local_bbox(fp: Footprint, cls: str) -> Tuple[BBox, str]:
     sizes = {
         "passive": (1.6, 0.8),
@@ -1476,6 +1560,27 @@ def _board_contains_bbox(geometry: Optional[BoardGeometry], bbox: BBox, *, eps: 
             geometry.min_y - eps <= bbox.min_y and bbox.max_y <= geometry.max_y + eps)
 
 
+def _rect_to_abs_bbox(model: PlacementModel, item: Mapping[str, Any]) -> BBox:
+    x0, y0 = _board_to_abs(model, float(item["x"]), float(item["y"]))
+    return BBox(x0, y0, x0 + float(item["w"]), y0 + float(item["h"]))
+
+
+def keepout_rules(model: PlacementModel) -> List[Dict[str, Any]]:
+    return [rule for rule in model.rules if rule.get("type") == "keepout"]
+
+
+def keepout_report(model: PlacementModel) -> List[Dict[str, Any]]:
+    out = []
+    for rule in keepout_rules(model):
+        bbox = _rect_to_abs_bbox(model, rule)
+        out.append({k: v for k, v in rule.items() if k != "extra"} | {"bbox": bbox.as_report(), "emit": bool(rule.get("emit", False))})
+    return out
+
+
+def regions_report(model: PlacementModel) -> Dict[str, Dict[str, Any]]:
+    return {name: dict(region) | {"bbox": _rect_to_abs_bbox(model, region).as_report()} for name, region in model.regions.items()}
+
+
 def spacing_analysis(engine: "PlacementEngine", *, refs: Optional[Iterable[str]] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     subject_refs = set(refs) if refs is not None else set(engine.positions)
     considered_refs = set(engine.positions) if refs is not None and subject_refs else subject_refs
@@ -1510,6 +1615,62 @@ def spacing_analysis(engine: "PlacementEngine", *, refs: Optional[Iterable[str]]
                 violations.append(item)
     return collisions, violations, bbox_warnings
 
+
+def keepout_violations(engine: "PlacementEngine", *, refs: Optional[Iterable[str]] = None,
+                       allow_keepout_overlap: bool = False) -> List[Dict[str, Any]]:
+    if allow_keepout_overlap:
+        return []
+    subject_refs = set(refs) if refs is not None else set(engine.positions)
+    infos = all_bbox_infos(engine, refs=subject_refs)
+    allowed_refs: Set[str] = set()
+    for rule in engine.model.rules:
+        if rule.get("ref") and bool(rule.get("allow_keepout_overlap", rule.get("extra", {}).get("allow_keepout_overlap", False))):
+            actual = engine.resolve_ref(str(rule["ref"]))
+            if actual:
+                allowed_refs.add(actual)
+    out: List[Dict[str, Any]] = []
+    for keepout in keepout_rules(engine.model):
+        if bool(keepout.get("extra", {}).get("allow_keepout_overlap", False)):
+            continue
+        kb = _rect_to_abs_bbox(engine.model, keepout)
+        for ref, info in sorted(infos.items()):
+            if ref in allowed_refs:
+                continue
+            if info.bbox.overlaps(kb):
+                out.append({"ref": ref, "keepout": keepout["name"], "bbox": info.bbox.as_report(),
+                            "keepout_bbox": kb.as_report(), "role": keepout.get("role")})
+    return out
+
+
+def region_violations(engine: "PlacementEngine", *, refs: Optional[Iterable[str]] = None,
+                      allow_outside_region: bool = False) -> List[Dict[str, Any]]:
+    if allow_outside_region:
+        return []
+    subject_refs = set(refs) if refs is not None else set(engine.updates)
+    infos = all_bbox_infos(engine, refs=subject_refs)
+    out: List[Dict[str, Any]] = []
+    rule_region_by_ref: Dict[str, str] = {}
+    allowed_refs: Set[str] = set()
+    for rule in engine.model.rules:
+        if rule.get("ref") and bool(rule.get("allow_outside_region", rule.get("extra", {}).get("allow_outside_region", False))):
+            actual = engine.resolve_ref(str(rule["ref"]))
+            if actual:
+                allowed_refs.add(actual)
+        if rule.get("region") and rule.get("ref"):
+            actual = engine.resolve_ref(str(rule["ref"]))
+            if actual:
+                rule_region_by_ref[actual] = str(rule["region"])
+    for ref, region_name in sorted(rule_region_by_ref.items()):
+        if ref in allowed_refs:
+            continue
+        if ref not in infos or region_name not in engine.model.regions:
+            continue
+        rb = _rect_to_abs_bbox(engine.model, engine.model.regions[region_name])
+        if not rb.contains_bbox(infos[ref].bbox):
+            out.append({"ref": ref, "region": region_name, "bbox": infos[ref].bbox.as_report(),
+                        "region_bbox": rb.as_report()})
+    return out
+
 # ---------------------------------------------------------------------------
 # Placement engine
 # ---------------------------------------------------------------------------
@@ -1535,6 +1696,11 @@ class PlacementEngine:
         self.placement_attempts: Dict[str, int] = {}
         self.ref_cache: Dict[str, str] = {}
         self.locked: Dict[str, str] = {}
+        self.applied_priority: Dict[str, float] = {}
+        self.applied_rule_index: Dict[str, int] = {}
+        self.priority_conflicts: List[Dict[str, Any]] = []
+        self.overridden_rules: List[Dict[str, Any]] = []
+        self.locked_move_attempts: List[Dict[str, Any]] = []
         self.auto_adjustments: List[AutoAdjustment] = []
         self.clusters: List[Dict[str, Any]] = []
         self.last_cluster_by_ref: Dict[str, str] = {}
@@ -1597,11 +1763,30 @@ class PlacementEngine:
 
     def place(self, ref: str, x: float, y: float, rot: Optional[float], why: str, note: Optional[str] = None,
               *, allow_arbitrary_rotation: bool = False, avoid_overlap: bool = False,
-              clearance_override: Optional[float] = None, candidate_sides: Optional[Sequence[str]] = None) -> None:
+              clearance_override: Optional[float] = None, candidate_sides: Optional[Sequence[str]] = None,
+              rule: Optional[Mapping[str, Any]] = None) -> None:
         actual_ref = self.resolve_ref(ref)
         if actual_ref is None:
             self._warn_or_raise(f"missing footprint {ref!r} for {why}")
             return
+        rule = rule or {}
+        priority = self._rule_priority(rule, actual_ref)
+        index = int(rule.get("_index", -1))
+        if actual_ref in self.updates:
+            prev_priority = self.applied_priority.get(actual_ref, 0.0)
+            prev_index = self.applied_rule_index.get(actual_ref, -1)
+            if priority < prev_priority:
+                self.overridden_rules.append({"ref": actual_ref, "ignored_by": why, "ignored_priority": priority,
+                                              "winning_priority": prev_priority, "reason": "lower_priority"})
+                self.messages.append(Message("warn", f"{actual_ref} placement by {why} ignored: priority {_fmt_num(priority)} is below existing {_fmt_num(prev_priority)}"))
+                return
+            if abs(priority - prev_priority) <= 1e-9:
+                self.priority_conflicts.append({"ref": actual_ref, "previous_rule_index": prev_index,
+                                                "new_rule_index": index, "priority": priority, "winner": "later"})
+                self.messages.append(Message("warn", f"{actual_ref} has same-priority placement conflict at {_fmt_num(priority)}; later rule wins"))
+            else:
+                self.overridden_rules.append({"ref": actual_ref, "overridden_priority": prev_priority,
+                                              "winning_priority": priority, "reason": "higher_priority"})
         previous_cluster = self.last_cluster_by_ref.get(actual_ref)
         if previous_cluster is not None and not why.startswith("cluster "):
             self.messages.append(Message("warn", f"{actual_ref} moved by cluster {previous_cluster} later refined by {why}"))
@@ -1617,12 +1802,16 @@ class PlacementEngine:
         if actual_ref in self.locked:
             changed = (abs(old_x - x) > 1e-9 or abs(old_y - y) > 1e-9 or abs(old_rot - new_rot) > 1e-9)
             if changed:
+                self.locked_move_attempts.append({"ref": actual_ref, "by": why, "locked_by": self.locked[actual_ref]})
                 self._warn_or_raise(f"locked footprint {actual_ref!r} cannot be moved by {why}; locked by {self.locked[actual_ref]}")
                 return
-        if avoid_overlap and self.model.policy.avoid_overlap:
+        soft = self._rule_soft(rule, actual_ref)
+        if (avoid_overlap or soft) and self.model.policy.avoid_overlap:
             placed = self._find_non_overlapping_position(actual_ref, float(x), float(y), float(new_rot),
                                                          clearance_override=clearance_override,
-                                                         candidate_sides=candidate_sides)
+                                                         candidate_sides=candidate_sides,
+                                                         region=self._region_bbox(rule.get("region")),
+                                                         allow_keepout_overlap=self._rule_flag(rule, "allow_keepout_overlap", False))
             if placed is None:
                 raise PlacementError(f"{actual_ref!r} could not be placed by {why} without violating clearance or board bounds; requested x={_fmt_num(x)} y={_fmt_num(y)}")
             px, py, reason = placed
@@ -1641,6 +1830,8 @@ class PlacementEngine:
             delta_x=float(x) - fp.x, delta_y=float(y) - fp.y,
         )
         self.updates[actual_ref] = update
+        self.applied_priority[actual_ref] = priority
+        self.applied_rule_index[actual_ref] = index
         self.positions[actual_ref] = (float(x), float(y), float(new_rot))
         suffix = f"  # {note}" if note else ""
         rot_label = _fmt_num(new_rot) if explicit_rot else "preserve"
@@ -1768,12 +1959,88 @@ class PlacementEngine:
             value = rule.get("extra", {}).get("clearance")
         return None if value is None else float(value)
 
-    def _collides_at(self, ref: str, x: float, y: float, rot: float, *, clearance_override: Optional[float] = None) -> Optional[str]:
+    def _rule_flag(self, rule: Mapping[str, Any], name: str, default: bool = False) -> bool:
+        return bool(rule.get(name, rule.get("extra", {}).get(name, default)))
+
+    def _rule_priority(self, rule: Mapping[str, Any], actual_ref: str) -> float:
+        value = rule.get("priority")
+        if value is None:
+            value = rule.get("extra", {}).get("priority")
+        if value is None:
+            value = self.model.priority_refs.get(actual_ref)
+        return 0.0 if value is None else float(value)
+
+    def _rule_soft(self, rule: Mapping[str, Any], actual_ref: str) -> bool:
+        return self._rule_flag(rule, "soft", False) or actual_ref in {self.resolve_ref(r) or r for r in self.model.soft_refs}
+
+    def _region_bbox(self, name: Optional[str]) -> Optional[BBox]:
+        if name is None:
+            return None
+        if name not in self.model.regions:
+            raise PlacementError(f"unknown region {name!r}")
+        return _rect_to_abs_bbox(self.model, self.model.regions[name])
+
+    def _near_point_candidates(self, x: float, y: float, distance: float, side: str) -> List[Tuple[str, float, float]]:
+        vectors = {"right": (1.0, 0.0), "left": (-1.0, 0.0), "top": (0.0, -1.0), "bottom": (0.0, 1.0)}
+        sides = ["top", "right", "bottom", "left"] if side == "auto" else [side]
+        bad = [s for s in sides if s not in vectors]
+        if bad:
+            raise PlacementError(f"Unknown side {bad[0]!r}")
+        return [(s, x + vectors[s][0] * distance, y + vectors[s][1] * distance) for s in sides]
+
+    def _pad_centroid(self, parent_ref: str, pads: str | Sequence[str]) -> Point:
+        actual_parent = self.resolve_ref(parent_ref)
+        if actual_parent is None or actual_parent not in self.footprints:
+            raise PlacementError(f"NearPad parent {parent_ref!r} is missing")
+        names = [str(pads)] if isinstance(pads, str) else [str(p) for p in pads]
+        if not names:
+            raise PlacementError("NearPad(pad=...) requires at least one pad")
+        centers = _parse_pad_local_centers(self.footprints[actual_parent])
+        missing = [name for name in names if name not in centers]
+        if missing:
+            available = ", ".join(sorted(centers)) or "none"
+            raise PlacementError(f"NearPad parent {actual_parent!r} has no pad {missing[0]!r}; available pads: {available}")
+        px, py, prot = self.positions[actual_parent]
+        abs_centers = []
+        for name in names:
+            rx, ry = _rot_point(centers[name][0], centers[name][1], prot)
+            abs_centers.append((px + rx, py + ry))
+        return (sum(p[0] for p in abs_centers) / len(abs_centers),
+                sum(p[1] for p in abs_centers) / len(abs_centers))
+
+    def _place_near_point(self, rule: Mapping[str, Any], origin: Point, why: str) -> None:
+        side = str(rule.get("side", "auto"))
+        distance = float(rule.get("distance", 1.5))
+        last_error: Optional[Exception] = None
+        for candidate_side, x, y in self._near_point_candidates(origin[0], origin[1], distance, side):
+            try:
+                self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot")), why, rule.get("note"),
+                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
+                           avoid_overlap=True, clearance_override=self._clearance_override(dict(rule)),
+                           candidate_sides=[candidate_side], rule=rule)
+                return
+            except PlacementError as exc:
+                last_error = exc
+                if side != "auto":
+                    raise
+        if last_error is not None:
+            raise last_error
+
+    def _collides_at(self, ref: str, x: float, y: float, rot: float, *, clearance_override: Optional[float] = None,
+                    region: Optional[BBox] = None, allow_keepout_overlap: bool = False) -> Optional[str]:
         if ref not in self.footprints:
             return None
         test_info = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model)
         if not _board_contains_bbox(self.board_geometry, test_info.bbox):
             return "would leave board bounds"
+        if region is not None and not region.contains_bbox(test_info.bbox):
+            return "would leave region"
+        if not allow_keepout_overlap:
+            for keepout in keepout_rules(self.model):
+                if bool(keepout.get("extra", {}).get("allow_keepout_overlap", False)):
+                    continue
+                if test_info.bbox.overlaps(_rect_to_abs_bbox(self.model, keepout)):
+                    return f"avoided keepout {keepout['name']!r}"
         obstacle_refs = set(self.positions)
         for other in sorted(obstacle_refs):
             if other == ref or other not in self.footprints or not _same_physical_side(self.footprints[ref], self.footprints[other]):
@@ -1789,8 +2056,10 @@ class PlacementEngine:
 
     def _find_non_overlapping_position(self, ref: str, x: float, y: float, rot: float,
                                        *, clearance_override: Optional[float],
-                                       candidate_sides: Optional[Sequence[str]]) -> Optional[Tuple[float, float, str]]:
-        first = self._collides_at(ref, x, y, rot, clearance_override=clearance_override)
+                                       candidate_sides: Optional[Sequence[str]], region: Optional[BBox] = None,
+                                       allow_keepout_overlap: bool = False) -> Optional[Tuple[float, float, str]]:
+        first = self._collides_at(ref, x, y, rot, clearance_override=clearance_override,
+                                  region=region, allow_keepout_overlap=allow_keepout_overlap)
         if first is None:
             return (x, y, "requested location is legal")
         step = self.model.policy.search_step
@@ -1820,7 +2089,8 @@ class PlacementEngine:
             if key in seen:
                 continue
             seen.add(key)
-            if self._collides_at(ref, cx, cy, rot, clearance_override=clearance_override) is None:
+            if self._collides_at(ref, cx, cy, rot, clearance_override=clearance_override,
+                                 region=region, allow_keepout_overlap=allow_keepout_overlap) is None:
                 return (cx, cy, first)
         return None
 
@@ -1834,18 +2104,19 @@ class PlacementEngine:
             x, y = _board_to_abs(self.model, sx + px * i, sy + py * i)
             self.place(ref, x, y, self.resolve_rot(rule.get("rot")), why, rule.get("note"),
                        allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
-                       avoid_overlap=True, clearance_override=self._clearance_override(rule))
+                       avoid_overlap=True, clearance_override=self._clearance_override(rule), rule=rule)
 
     def apply(self) -> None:
         """Apply rules in placement-file order."""
 
-        for rule in self.model.rules:
+        for rule_index, rule in enumerate(self.model.rules):
+            rule["_index"] = rule_index
             typ = rule["type"]
             if typ in {"anchor", "fixed", "corner", "edge"}:
                 x, y = self._placement_target(rule)
                 self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot")), typ, rule.get("note"),
-                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
-                if rule.get("lock"):
+                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule), rule=rule)
+                if rule.get("lock") or self._rule_flag(rule, "locked", False):
                     self.lock(rule["ref"], f"{typ} rule")
 
             elif typ == "cluster":
@@ -1853,6 +2124,18 @@ class PlacementEngine:
 
             elif typ == "lock":
                 self.lock(rule["ref"], rule.get("note") or "Lock rule")
+
+            elif typ == "priority":
+                actual = self.resolve_ref(rule["ref"])
+                if actual is not None:
+                    self.model.priority_refs[actual] = float(rule["value"])
+                self.messages.append(Message("note", f"priority {rule['ref']!r}={_fmt_num(rule['value'])}"))
+
+            elif typ == "soft":
+                actual = self.resolve_ref(rule["ref"])
+                if actual is not None:
+                    self.model.soft_refs.add(actual)
+                self.messages.append(Message("note", f"soft placement enabled for {rule['ref']!r}"))
 
             elif typ in {"array", "row", "column"}:
                 self._apply_linear_collection(rule, typ)
@@ -1868,7 +2151,7 @@ class PlacementEngine:
                     self.place(ref, x, y,
                                self.resolve_rot(rule.get("rot")), "grid", rule.get("note"),
                                allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
-                               avoid_overlap=True, clearance_override=self._clearance_override(rule))
+                               avoid_overlap=True, clearance_override=self._clearance_override(rule), rule=rule)
 
             elif typ in {"between", "inline"}:
                 a = self.get_pos(rule["a"])
@@ -1876,11 +2159,14 @@ class PlacementEngine:
                 x, y = self._placement_target(rule)
                 self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot"), a, b), typ, rule.get("note"),
                            allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
-                           avoid_overlap=True, clearance_override=self._clearance_override(rule))
+                           avoid_overlap=True, clearance_override=self._clearance_override(rule), rule=rule)
 
             elif typ == "satellite":
                 px, py = self.get_pos(rule["parent"])
                 side = rule.get("side", "right")
+                if side == "auto":
+                    self._place_near_point(rule, (px, py), typ)
+                    continue
                 dist = float(rule.get("distance", 2.0))
                 idx = int(rule.get("index", 0))
                 pitch = float(rule.get("pitch", 1.5))
@@ -1899,7 +2185,11 @@ class PlacementEngine:
                 self.place(rule["ref"], x + dx, y + dy, self.resolve_rot(rule.get("rot")), typ, rule.get("note"),
                            allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
                            avoid_overlap=True, clearance_override=self._clearance_override(rule),
-                           candidate_sides=[side] if side in {"top", "right", "bottom", "left"} else None)
+                           candidate_sides=[side] if side in {"top", "right", "bottom", "left"} else None, rule=rule)
+
+            elif typ == "near_pad":
+                origin = self._pad_centroid(str(rule["parent"]), rule["pad"])
+                self._place_near_point(rule, origin, "near_pad")
 
             elif typ == "orbit":
                 cx, cy = self.get_pos(rule["parent"])
@@ -1912,7 +2202,7 @@ class PlacementEngine:
                     y = cy + radius * math.sin(theta)
                     self.place(ref, x, y, self.resolve_rot(rule.get("rot")), "orbit", rule.get("note"),
                                allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
-                               avoid_overlap=True, clearance_override=self._clearance_override(rule))
+                               avoid_overlap=True, clearance_override=self._clearance_override(rule), rule=rule)
 
             elif typ == "mirror":
                 sx, sy = self.get_pos(rule["source"])
@@ -1934,7 +2224,7 @@ class PlacementEngine:
                 self.place(rule["ref"], x, y,
                            self.resolve_rot(rule.get("rot"), source_rot=source_rot, mirror_axis=axis),
                            "mirror", rule.get("note"),
-                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
+                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule), rule=rule)
 
             elif typ == "copy_placement":
                 source_prefix = rule["source_prefix"]
@@ -1961,13 +2251,15 @@ class PlacementEngine:
                     source_rot = self.get_rot(src)
                     rot = self.resolve_rot(rule.get("rot"), source_rot=source_rot)
                     self.place(dst, x + dx, y + dy, rot, "copy_placement", rule.get("note"),
-                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule))
+                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule), rule=rule)
 
             elif typ == "keepout":
                 self.messages.append(Message("note", f"keepout {rule['name']!r}: x={_fmt_num(rule['x'])} "
                                                    f"y={_fmt_num(rule['y'])} w={_fmt_num(rule['w'])} "
                                                    f"h={_fmt_num(rule['h'])} layers={rule['layers']!r} "
                                                    "parsed but not emitted yet"))
+                if rule.get("emit"):
+                    self.messages.append(Message("warn", f"keepout {rule['name']!r} emit=True is not implemented yet"))
             elif typ == "corridor":
                 self.messages.append(Message("note", f"corridor {rule['name']!r}: {rule['a']} -> {rule['b']} "
                                                    f"width={_fmt_num(rule['width'])} "
@@ -1976,7 +2268,9 @@ class PlacementEngine:
 
 def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
                         allow_overlap: bool = False, warn_overlap: bool = False,
-                        allow_outside_board: bool = False) -> List[Message]:
+                        allow_outside_board: bool = False,
+                        allow_keepout_overlap: bool = False,
+                        allow_outside_region: bool = False) -> List[Message]:
     """Run lightweight, CI-friendly placement validation.
 
     KiCad footprints can have complex outlines.  This first validator uses
@@ -2009,15 +2303,10 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
                 messages.append(Message("warn" if (allow_overlap or warn_overlap) else "error",
                                         f"{a!r} and {b!r} have overlapping/near-coincident origins"))
 
-    for rule in engine.model.rules:
-        if rule["type"] != "keepout":
-            continue
-        x0, y0 = float(rule["x"]), float(rule["y"])
-        x1, y1 = x0 + float(rule["w"]), y0 + float(rule["h"])
-        for ref in sorted(engine.updates):
-            x, y, _rot = engine.positions[ref]
-            if x0 <= x <= x1 and y0 <= y <= y1:
-                messages.append(Message("error", f"{ref!r} origin lies inside keepout {rule['name']!r}"))
+    for item in keepout_violations(engine, refs=engine.updates, allow_keepout_overlap=allow_keepout_overlap):
+        messages.append(Message("error", f"{item['ref']!r} bbox overlaps keepout {item['keepout']!r}"))
+    for item in region_violations(engine, refs=engine.updates, allow_outside_region=allow_outside_region):
+        messages.append(Message("error", f"{item['ref']!r} bbox is outside region {item['region']!r}"))
 
     collisions, violations, bbox_warnings = spacing_analysis(engine, refs=engine.updates)
     for warning in bbox_warnings:
@@ -2053,7 +2342,7 @@ def validate_safe_placements(engine: PlacementEngine, *, allow_large_move: bool 
 
     for ref, count in sorted(engine.placement_attempts.items()):
         if count > 1:
-            messages.append(Message("error", f"duplicate resolved placement for {ref!r}; {count} rules target the same footprint"))
+            messages.append(Message("warn", f"duplicate resolved placement for {ref!r}; {count} rules target the same footprint; priority/later-rule semantics selected the winner"))
 
     for message in engine.messages:
         lower = message.text.lower()
@@ -2076,7 +2365,9 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
                      allow_suffix_match: bool = True, validate: bool = False, safe: bool = False,
                      allow_large_move: bool = False, allow_outside_board: bool = False,
                      cardinal_rotations: bool = False, safety_fatal: bool = True,
-                     allow_overlap: bool = False, warn_overlap: bool = False) -> Tuple[str, List[Message], Dict[str, Any]]:
+                     allow_overlap: bool = False, warn_overlap: bool = False,
+                     allow_keepout_overlap: bool = False,
+                     allow_outside_region: bool = False) -> Tuple[str, List[Message], Dict[str, Any]]:
     """Apply placement rules and return rewritten KiCad text plus diagnostics."""
 
     footprints = parse_footprints(text)
@@ -2094,7 +2385,9 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
                              cardinal_rotations=cardinal_rotations, board_geometry=board_geometry)
     engine.apply()
     collision_messages = validate_placements(engine, allow_overlap=allow_overlap, warn_overlap=warn_overlap,
-                                             allow_outside_board=allow_outside_board)
+                                             allow_outside_board=allow_outside_board,
+                                             allow_keepout_overlap=allow_keepout_overlap,
+                                             allow_outside_region=allow_outside_region)
     validation_messages = collision_messages if (validate or safe) else []
     safety_messages = validate_safe_placements(engine, allow_large_move=allow_large_move,
                                                allow_outside_board=allow_outside_board) if safe else []
@@ -2105,6 +2398,8 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
     if safe and safety_fatal and any(m.level == "error" for m in engine.messages):
         raise PlacementError("validation failed: " + "; ".join(m.text for m in engine.messages if m.level == "error"))
     collisions, spacing_violations, bbox_warnings = spacing_analysis(engine, refs=engine.updates)
+    ko_violations = keepout_violations(engine, refs=engine.updates, allow_keepout_overlap=allow_keepout_overlap)
+    reg_violations = region_violations(engine, refs=engine.updates, allow_outside_region=allow_outside_region)
     generated_uuids: List[GeneratedUUID] = []
     rewritten = text
     if model.board.emit_outline and defined_geometry is not None:
@@ -2122,7 +2417,7 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "imported_aliases": dict(model.imported_aliases),
         "effective_aliases": engine.alias_map(),
         "alias_diagnostics": dataclasses.asdict(model.alias_diagnostics),
-        "regions": dict(model.regions),
+        "regions": regions_report(model),
         "clearance_rules": dataclasses.asdict(model.clearance),
         "placement_policy": dataclasses.asdict(model.policy),
         "part_classes": {ref: _part_class_for(model, ref) for ref in sorted(footprints)},
@@ -2138,6 +2433,12 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "updated_refs": sorted(engine.updates),
         "placements": [dataclasses.asdict(engine.updates[ref]) for ref in sorted(engine.updates)],
         "clusters": list(engine.clusters),
+        "keepouts": keepout_report(model),
+        "keepout_violations": ko_violations,
+        "region_violations": reg_violations,
+        "priority_conflicts": list(engine.priority_conflicts),
+        "overridden_rules": list(engine.overridden_rules),
+        "locked_move_attempts": list(engine.locked_move_attempts),
         "collisions": collisions,
         "spacing_violations": spacing_violations,
         "bbox_warnings": bbox_warnings,
@@ -2263,6 +2564,18 @@ def print_clusters(model: PlacementModel, *, fmt: str = "text") -> int:
     return 0
 
 
+def print_regions(model: PlacementModel, *, fmt: str = "text") -> int:
+    payload = regions_report(model)
+    if fmt == "json":
+        print(json.dumps({"regions": payload}, indent=2, sort_keys=True))
+    else:
+        for name, item in payload.items():
+            print(f"Region {name}: x={_fmt_num(item['x'])} y={_fmt_num(item['y'])} w={_fmt_num(item['w'])} h={_fmt_num(item['h'])}")
+        if not payload:
+            print("no regions")
+    return 0
+
+
 def print_generated_uuid_debug(generated_uuids: Sequence[Mapping[str, str] | GeneratedUUID]) -> None:
     for item in generated_uuids:
         if isinstance(item, GeneratedUUID):
@@ -2341,6 +2654,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--print-bounds", action="store_true", help="Print input footprint coordinate bounds and board geometry and exit")
     parser.add_argument("--print-board", action="store_true", help="Print authoritative board geometry and exit")
     parser.add_argument("--print-clusters", action="store_true", help="Print Cluster() declarations from the placement file and exit")
+    parser.add_argument("--print-regions", action="store_true", help="Print Region() declarations from the placement file and exit")
     parser.add_argument("--emit-outline-only", type=Path, metavar="OUTPUT", help="Write only the rectangular Board outline to OUTPUT and exit")
     parser.add_argument("--infer-origin", action="store_true", help="Infer Board origin from input footprint minimum x/y before applying rules")
     parser.add_argument("--validate", action="store_true", help="Run placement validation without writing output")
@@ -2352,6 +2666,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-large-move", action="store_true", help="Allow placements far outside original footprint bounds")
     parser.add_argument("--allow-outside-board", action="store_true", help="Allow placements outside declared Board bounds")
     parser.add_argument("--allow-overlap", action="store_true", help="Allow footprint overlaps and spacing violations after reporting them")
+    parser.add_argument("--allow-keepout-overlap", action="store_true", help="Allow footprint bounding boxes to overlap Keepout() rectangles")
+    parser.add_argument("--allow-outside-region", action="store_true", help="Allow placements with region=... to leave that Region() rectangle")
     parser.add_argument("--warn-overlap", action="store_true", help="Report footprint overlaps and spacing violations as warnings")
     parser.add_argument("--cardinal-rotations", action="store_true", help="Round explicit rotations to nearest 0/90/180/270 unless a rule allows arbitrary rotation")
     parser.add_argument("--no-suffix-match", action="store_true", help="Disable hierarchical suffix reference matching")
@@ -2384,7 +2700,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.print_board and args.ppl is None:
         return print_board(args.pcb, None, fmt=args.format)
     if args.ppl is None:
-        parser.error("ppl file is required unless --list-refs, --print-bounds, --print-board, --print-clusters, or --list-aliases is used")
+        parser.error("ppl file is required unless --list-refs, --print-bounds, --print-board, --print-clusters, --print-regions, or --list-aliases is used")
     if not args.ppl.exists():
         raise SystemExit(f"PPL file not found: {args.ppl}")
     if args.output and args.in_place:
@@ -2393,6 +2709,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     model = load_ppl(args.ppl)
     if args.print_clusters:
         return print_clusters(model, fmt=args.format)
+    if args.print_regions:
+        return print_regions(model, fmt=args.format)
     if args.print_board:
         return print_board(args.pcb, model, fmt=args.format)
     if args.emit_outline_only is not None:
@@ -2421,7 +2739,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                                                   cardinal_rotations=bool(args.cardinal_rotations),
                                                   safety_fatal=not bool(args.dry_run),
                                                   allow_overlap=bool(args.allow_overlap),
-                                                  warn_overlap=bool(args.warn_overlap))
+                                                  warn_overlap=bool(args.warn_overlap),
+                                                  allow_keepout_overlap=bool(args.allow_keepout_overlap),
+                                                  allow_outside_region=bool(args.allow_outside_region))
     for message in messages:
         print(message)
     if args.debug_write:

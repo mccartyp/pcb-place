@@ -356,8 +356,9 @@ Board(width=300, height=200)
 Anchor("U1", x=1, y=2)
 Anchor("U1", x=3, y=4)
 ''')
-    with pytest.raises(PlacementError, match="duplicate resolved"):
-        apply_placements(text, load_ppl(dup_ppl), strict=False, safe=True)
+    _out, messages, report = apply_placements(text, load_ppl(dup_ppl), strict=False, safe=True)
+    assert report["priority_conflicts"]
+    assert any("same-priority placement conflict" in m.text for m in messages)
 
     locked_ppl = tmp_path / "locked-safe.ppl"
     locked_ppl.write_text('''
@@ -944,3 +945,143 @@ Cluster("MCU", anchor="U6", members=["U6", "C5"], placement=Anchor(x=40, y=10))
 ''')
     _out, _messages, report = apply_placements(_cluster_pcb(), model, strict=False, validate=True)
     assert any(item["ref_a"] == "J1" or item["ref_b"] == "J1" for item in report["collisions"])
+
+
+def _pad_pcb(rot: float = 0) -> str:
+    return f'''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 10 10 {rot})
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 2 0) (size 1 1) (layers "F.Cu"))
+    (pad "2" smd rect (at 4 0) (size 1 1) (layers "F.Cu"))
+    (pad "SCL" smd rect (at 0 3) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C" (layer "F.Cu")
+    (at 30 30 45)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:R" (layer "F.Cu")
+    (at 35 35 0)
+    (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:D" (layer "F.Cu")
+    (at 40 40 0)
+    (property "Reference" "D1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:J" (layer "F.Cu")
+    (at 2 2 0)
+    (property "Reference" "J1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+)'''
+
+
+def _load_inline(tmp_path, body: str):
+    ppl = tmp_path / "inline.ppl"
+    ppl.write_text(body)
+    return load_ppl(ppl)
+
+
+def test_nearpad_places_pad_centroid_and_rotation(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=100, height=100)
+NearPad("C1", parent="U1", pad="1", distance=6, side="right")
+NearPad("R1", parent="U1", pad=["1", "2"], distance=6, side="bottom")
+''')
+    out, _messages, _report = apply_placements(_pad_pcb(), model, strict=True)
+    assert '(at 18 10 45)' in out  # pad 1 absolute x=12 plus 6; C1 rotation preserved
+    assert '(at 13 16 0)' in out   # centroid x=13, y=10 plus bottom distance
+
+    model = _load_inline(tmp_path, '''
+Board(width=100, height=100)
+NearPad("C1", parent="U1", pad="1", distance=6, side="right")
+''')
+    out, _messages, _report = apply_placements(_pad_pcb(90), model, strict=True)
+    assert '(at 16 12 45)' in out  # local pad (2,0) rotates to (0,2), then right 6
+
+
+def test_nearpad_missing_pad_fails_clearly(tmp_path):
+    model = _load_inline(tmp_path, 'Board(width=100, height=100)\nNearPad("C1", parent="U1", pad="99")\n')
+    with pytest.raises(PlacementError, match="no pad '99'"):
+        apply_placements(_pad_pcb(), model, strict=True)
+
+
+def test_semantic_helpers_expand(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=100, height=100)
+Decoupling("C1", parent="U1", pad="1", side="right")
+Pullup("R1", parent="U1", pad="SCL", side="bottom")
+Series("D1", a="J1", b="U1", t=0.5, offset=0)
+ESD("J1", connector="U1", protected="C1", t=0.2, offset=-1)
+''')
+    _out, _messages, report = apply_placements(_pad_pcb(), model, strict=True)
+    assert report["placements_applied"] == 4
+    assert any(p["why"] == "near_pad" and p["ref"] == "C1" for p in report["placements"])
+    assert any(p["why"] == "between" and p["ref"] == "D1" for p in report["placements"])
+
+
+def test_keepout_region_priority_soft_and_cli(tmp_path):
+    pcb = tmp_path / "pad.kicad_pcb"
+    pcb.write_text(_pad_pcb())
+    ppl = tmp_path / "rules.ppl"
+    ppl.write_text('''
+Board(width=100, height=100)
+Region("CONTROL", x=0, y=0, w=20, h=20)
+Keepout("ANT", x=13.5, y=9.5, w=3, h=3, role="rf")
+Anchor("C1", x=14, y=10, region="CONTROL", soft=True)
+Anchor("R1", x=80, y=80, priority=1)
+Anchor("R1", x=5, y=5, priority=2)
+Anchor("D1", x=3, y=3, priority=2)
+Anchor("D1", x=4, y=4, priority=2)
+''')
+    out, messages, report = apply_placements(pcb.read_text(), load_ppl(ppl), strict=True)
+    assert report["keepouts"] and report["regions"]["CONTROL"]
+    assert report["auto_adjustments"]  # soft C1 is moved away from keepout
+    assert any(item["reason"] == "higher_priority" for item in report["overridden_rules"])
+    assert report["priority_conflicts"]
+    assert '(at 5 5 0)' in out
+    result = subprocess.run([sys.executable, str(ROOT / "pcb_place.py"), str(pcb), str(ppl), "--print-regions"], check=True, capture_output=True, text=True)
+    assert "Region CONTROL" in result.stdout
+
+
+def test_keepout_and_region_violations_reported(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=100, height=100)
+Region("CONTROL", x=0, y=0, w=5, h=5)
+Keepout("ANT", x=13.5, y=9.5, w=3, h=3)
+Anchor("C1", x=14, y=10, region="CONTROL")
+''')
+    _out, messages, report = apply_placements(_pad_pcb(), model, strict=False, validate=True)
+    assert report["keepout_violations"]
+    assert report["region_violations"]
+    assert any(m.level == "error" and "keepout" in m.text for m in messages)
+
+
+def test_lock_and_hard_anchor_semantics(tmp_path):
+    locked = _load_inline(tmp_path, '''
+Board(width=100, height=100)
+Anchor("C1", x=10, y=10, lock=True)
+Anchor("C1", x=12, y=12, priority=1)
+''')
+    with pytest.raises(PlacementError, match="locked footprint"):
+        apply_placements(_pad_pcb(), locked, strict=True)
+
+    hard = _load_inline(tmp_path, '''
+Board(width=100, height=100)
+Keepout("ANT", x=13.5, y=9.5, w=3, h=3)
+Anchor("C1", x=14, y=10)
+''')
+    _out, _messages, report = apply_placements(_pad_pcb(), hard, strict=False, validate=True)
+    assert not report["auto_adjustments"]
+    assert report["keepout_violations"]
+
+    allowed = _load_inline(tmp_path, '''
+Board(width=100, height=100)
+Keepout("ANT", x=13.5, y=9.5, w=3, h=3)
+Anchor("C1", x=14, y=10, allow_keepout_overlap=True)
+''')
+    _out, _messages, report = apply_placements(_pad_pcb(), allowed, strict=True, validate=True, allow_keepout_overlap=True, allow_overlap=True)
+    assert report["keepout_violations"] == []
