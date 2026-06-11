@@ -136,23 +136,85 @@ pcb-place board.kicad_pcb placement.ppl --print-clusters
 pcb-place board.kicad_pcb placement.ppl --report-json report.json --dry-run
 ```
 
+
+## Planner-Friendly Primitives
+
+`pcb-place` remains a deterministic placement executor: it applies the `.ppl` language to a KiCad board and does not infer intent, route traces, or run a global optimizer. Future tools such as `pcb-plan` can read richer design artifacts and emit `.ppl` rules that target these deterministic primitives.
+
+Example planner-oriented floorplan:
+
+```python
+Board(width=74, height=74, origin_x=140.23, origin_y=52.465)
+
+Region("HIGH_SPEED", x=0,  y=0,  w=74, h=25)
+Region("CONTROL",    x=0,  y=25, w=74, h=30)
+Region("POWER",      x=0,  y=55, w=74, h=19)
+
+Keepout("ANTENNA", x=55, y=5, w=12, h=18, role="rf")
+
+NearPad("C5", parent="U6", pad="12", distance=1.5, region="CONTROL")
+Decoupling("C6", parent="U6", pad="13", region="CONTROL")
+ESD("U2", connector="J1", protected="U10", t=0.2, offset=-3)
+Pullup("R17", parent="U10", pad="SCL")
+
+Priority("J1", 100)
+Lock("J1")
+```
+
+### NearPad
+
+`NearPad(ref, parent, pad, distance=1.5, side="auto", clearance=None, role=None, priority=None)` places a footprint near a specific pad on another footprint. Both `ref` and `parent` use the normal alias resolver, so semantic names imported from a Zener/pcb netlist work the same as raw KiCad references.
+
+`pcb-place` parses pad centers from the parent footprint in the KiCad board, transforms those centers through the parent's current position and rotation, and places `ref` near the selected pad. If `pad` is a list such as `pad=["12", "13"]`, the target is the centroid of those pads. `side="top"`, `"right"`, `"bottom"`, or `"left"` uses that direction; `side="auto"` tries deterministic cardinal sides while respecting board bounds, overlap clearance, keepouts, and any requested region.
+
+### Semantic Helpers
+
+Semantic helpers are deterministic wrappers that expand to existing primitives. They make planner output and human-authored `.ppl` files easier to read without adding netlist inference to `pcb-place`:
+
+- `Decoupling(ref, parent, pad=None, distance=1.5, role="decoupling", priority=90)` uses `NearPad` when `pad` is supplied, otherwise `Satellite(..., side="auto")`.
+- `Pullup(ref, parent, pad=None, distance=3.0, role="pullup", priority=60)` uses `NearPad` when `pad` is supplied, otherwise `Satellite(..., side="auto")`.
+- `Series(ref, a, b, t=0.5, offset=0, role="series", priority=70)` expands to a between/inline-style placement between `a` and `b`.
+- `ESD(ref, connector, protected, t=0.2, offset=0, role="esd", priority=80)` expands to `Between(ref, a=connector, b=protected, t=t, dy=offset)`.
+
+These helpers preserve rotation unless a rule explicitly supplies `rot=...`.
+
+### Keepouts and Regions
+
+`Keepout(name, x, y, w, h, layers="all", role=None, emit=False)` declares a board-local rectangular exclusion area. Placement validation rejects footprint bounding boxes that overlap keepouts unless `allow_keepout_overlap=True` is supplied globally (`--allow-keepout-overlap`) or on the rule. Collision avoidance also treats keepouts as obstacles. `emit=True` is accepted but currently reports a clear warning rather than writing KiCad keepout graphics.
+
+`Region(name, x, y, w, h, priority=None)` declares a board-local rectangle that a rule can target with `region="NAME"`. A region-constrained placement must keep the footprint bounding box inside that region unless `allow_outside_region=True` is supplied globally (`--allow-outside-region`) or via API. Collision search for that rule is constrained to the region. Use `--print-regions` or `--report-json` to inspect declared regions.
+
+### Priority and Soft Placement
+
+Rules may specify `priority=...`, `locked=True`, and `soft=True`. You can also use standalone helpers:
+
+```python
+Priority("J1", 100)
+Soft("R17")
+Lock("J1")
+```
+
+Higher-priority rules for the same footprint win. If two rules have the same priority, the later rule wins and `pcb-place` emits a warning. Locked footprints cannot be moved by later rules or collision avoidance. Soft placements may be nudged by collision avoidance to find a legal location; hard `Anchor` placements are not auto-adjusted unless `soft=True` is set.
+
+JSON reports include `regions`, `region_violations`, `keepouts`, `keepout_violations`, `priority_conflicts`, `overridden_rules`, and `locked_move_attempts` for planner and CI consumption.
+
 ## Scope
 
 Implemented today:
 
 - KiCad `.kicad_pcb` footprint parsing and rewriting
-- Deterministic footprint placement
+- Deterministic footprint placement, including planner-friendly NearPad and semantic helper primitives
 - Cluster-based floorplanning for moving functional PCB neighborhoods while preserving internal geometry
 - Python/Starlark-like `.ppl` placement DSL
 - Exact and hierarchical suffix reference matching
 - Optional Zener/pcb netlist alias imports for semantic instance paths
-- JSON reports with board geometry, geometry source, footprint bounds, placement bounds, and per-placement delta information
-- Dry-run, check, validation, print-bounds, print-board, emit-outline-only, and list-refs modes
+- JSON reports with board geometry, regions, keepouts, violations, priority conflicts, footprint bounds, placement bounds, and per-placement delta information
+- Dry-run, check, validation, print-bounds, print-board, print-regions, emit-outline-only, and list-refs modes
 - Conservative KiCad rewriting that only changes matched footprint-level `(at ...)` expressions
 - Rotation preservation by default, with explicit opt-in for path-aligned/computed rotations
 - Safe-by-default pre-write validation for non-finite coordinates, large moves, outside-board placement, duplicate targets, unresolved aliases, and locked footprint movement
 - Atomic output writes and post-write parser sanity checks
-- Validation for board-boundary, keepout-origin, footprint bounding-box collisions, spacing rules, and near-coincident placed footprints
+- Validation for board-boundary, keepout bounding-box, region bounding-box, footprint bounding-box collisions, spacing rules, and near-coincident placed footprints
 
 Not implemented yet:
 
