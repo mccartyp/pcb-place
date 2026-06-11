@@ -32,6 +32,17 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 pcb-place = "pcb_place:main"
 
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/LICENSE",
+  "/README.md",
+  "/pcb_place.py",
+  "/pyproject.toml",
+  "/examples",
+  "/tests",
+]
+
 [tool.hatch.build.targets.wheel]
 py-modules = ["pcb_place"]
 
