@@ -242,5 +242,5 @@ pcb-plan update --pln board.pln --board layout.kicad_pcb \
 # review board.pln.patch with the user before applying
 ```
 
-See [`src/pcb-plan/README.md`](../../src/pcb-plan/README.md) for the full
+See [`src/pcb_plan/README.md`](../../src/pcb_plan/README.md) for the full
 `board.pln` syntax reference, CLI flags, and reports.

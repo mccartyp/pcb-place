@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-PLACE_CLI = ROOT / "src/pcb-place/pcb_place.py"
+PLACE_CLI = ROOT / "src/pcb_place/pcb_place.py"
 
 import pcb_place
 from pcb_place import apply_placements, import_netlist_aliases, is_valid_uuid, load_ppl, parse_footprints, parse_netlist_aliases

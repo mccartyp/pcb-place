@@ -212,5 +212,5 @@ pcb-place --netlist .pcb/build/default.net --list-aliases
 pcb-place layout.kicad_pcb placement.ppl --netlist .pcb/build/default.net --dry-run
 ```
 
-See [`src/pcb-place/README.md`](../../src/pcb-place/README.md) for the full
+See [`src/pcb_place/README.md`](../../src/pcb_place/README.md) for the full
 placement DSL, rule reference, and safety/validation model.

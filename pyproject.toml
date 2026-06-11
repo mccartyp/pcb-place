@@ -47,9 +47,6 @@ include = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/pcb_place", "src/pcb_plan"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/pcb-place" = "pcb-place"
-"src/pcb-plan" = "pcb-plan"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
