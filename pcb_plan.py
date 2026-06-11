@@ -38,6 +38,11 @@ _POWER_RE = re.compile(r"^(?:\+?(?:1V[0-9]|1V[0-9]|[0-9]+V[0-9]*|VCC|VDD|VBAT|VI
 _GROUND_RE = re.compile(r"^(?:GND|AGND|DGND|PGND|GNDA|GNDD)$", re.I)
 _HIGHSPEED_RE = re.compile(r"(?:TMDS|HDMI|USB|DP|DN|D\+|D-|SSTX|SSRX|PCIE|PCIe|LVDS|CLK|MIPI|ETH|RX|TX)", re.I)
 
+_ALLOWED_VIA_POLICIES = {"avoid", "allow", "constrained", "forbid"}
+_ALLOWED_ROUTING_MODES = {"low_speed_only", "all_nets_constrained", "experimental_high_speed"}
+_HIGH_SPEED_CLASS_HINTS = ("high_speed", "diff", "rf", "clock", "hdmi", "usb", "pcie", "lvds")
+
+
 
 @dataclasses.dataclass
 class PlanPad:
@@ -107,6 +112,16 @@ class Plan:
     keepouts: List[Dict[str, Any]]
     clusters: List[Dict[str, Any]]
     differential_pairs: List[DifferentialPair]
+    stackup: Dict[str, Any]
+    routing: Dict[str, Any]
+    declared_differential_pairs: Dict[str, Dict[str, Any]]
+    net_classes: Dict[str, Any]
+    routing_overrides: Dict[str, Dict[str, Any]]
+    simulation: Dict[str, Any]
+    routing_warnings: List[str]
+    stackup_warnings: List[str]
+    simulation_warnings: List[str]
+    high_speed_constraints_complete: bool
     rules: List[PlanRule]
     warnings: List[str]
     uncertain_inferences: List[str]
@@ -363,6 +378,197 @@ def _parse_simple_yaml(text: str) -> Dict[str, Any]:
     return root
 
 
+
+def _as_mapping(value: Any) -> Dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _as_list(value: Any) -> List[Any]:
+    return list(value) if isinstance(value, list) else []
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_positive_number(value: Any) -> bool:
+    return _is_number(value) and float(value) > 0.0
+
+
+def _field_values(spec: Mapping[str, Any], singular: str, plural: str) -> List[Any]:
+    values: List[Any] = []
+    if singular in spec:
+        values.append(spec[singular])
+    if plural in spec:
+        plural_value = spec[plural]
+        values.extend(plural_value if isinstance(plural_value, list) else [plural_value])
+    return values
+
+
+def _stackup_layer_names(stackup: Mapping[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for layer in _as_list(stackup.get("layers")):
+        if isinstance(layer, Mapping) and layer.get("name") is not None:
+            names.add(str(layer["name"]))
+    return names
+
+
+def _stackup_reference_planes(stackup: Mapping[str, Any]) -> List[str]:
+    planes: List[str] = []
+    for layer in _as_list(stackup.get("layers")):
+        if not isinstance(layer, Mapping) or layer.get("name") is None:
+            continue
+        layer_type = str(layer.get("type", "")).lower()
+        if layer_type == "plane" or layer.get("net") is not None:
+            planes.append(str(layer["name"]))
+    return planes
+
+
+def _routing_class_is_high_speed(name: str, spec: Mapping[str, Any]) -> bool:
+    lname = name.lower()
+    if any(hint in lname for hint in _HIGH_SPEED_CLASS_HINTS):
+        return True
+    if bool(spec.get("differential")) or spec.get("impedance_ohms") is not None:
+        return True
+    if spec.get("max_skew_mm") is not None or spec.get("max_length_mismatch_mm") is not None:
+        return True
+    return False
+
+
+def _simulation_openems_enabled(openems: Mapping[str, Any]) -> bool:
+    enabled = openems.get("enabled", False)
+    triggers = _as_list(openems.get("trigger_on"))
+    if isinstance(enabled, str) and enabled.lower() == "auto":
+        return bool(triggers)
+    return bool(enabled)
+
+
+def _validate_layer_refs(spec: Mapping[str, Any], label: str, layer_names: set[str], warnings: List[str]) -> None:
+    if not layer_names:
+        return
+    for layer in _field_values(spec, "preferred_layer", "preferred_layers"):
+        if str(layer) not in layer_names:
+            warnings.append(f"{label} references missing preferred layer {layer!r}.")
+    ref_plane = spec.get("reference_plane")
+    if ref_plane is not None and str(ref_plane) not in layer_names:
+        warnings.append(f"{label} reference plane {ref_plane!r} is not present in stackup.")
+
+
+def validate_routing_intent(intent: Mapping[str, Any], nets: Mapping[str, PlanNet]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Any], List[str], List[str], List[str], bool]:
+    """Validate optional .pln routing/SI intent without turning it into placement primitives."""
+
+    stackup = _as_mapping(intent.get("stackup"))
+    routing = _as_mapping(intent.get("routing"))
+    declared_pairs = {str(k): _as_mapping(v) for k, v in _as_mapping(intent.get("differential_pairs")).items()}
+    net_classes = _as_mapping(intent.get("net_classes"))
+    routing_overrides = {str(k): _as_mapping(v) for k, v in _as_mapping(intent.get("routing_overrides")).items()}
+    simulation = _as_mapping(intent.get("simulation"))
+
+    stackup_warnings: List[str] = []
+    routing_warnings: List[str] = []
+    simulation_warnings: List[str] = []
+
+    layer_names = _stackup_layer_names(stackup)
+    reference_planes = set(_stackup_reference_planes(stackup))
+
+    for layer in _as_list(stackup.get("layers")):
+        if isinstance(layer, Mapping) and not layer.get("name"):
+            stackup_warnings.append("Stackup layer is missing a name.")
+    for dielectric in _as_list(stackup.get("dielectric")):
+        if not isinstance(dielectric, Mapping):
+            continue
+        between = dielectric.get("between")
+        if isinstance(between, list):
+            for layer in between:
+                if layer_names and str(layer) not in layer_names:
+                    stackup_warnings.append(f"Dielectric references missing layer {layer!r}.")
+        thickness = dielectric.get("thickness_mm")
+        if thickness is not None and not _is_positive_number(thickness):
+            stackup_warnings.append("Dielectric thickness_mm must be positive.")
+        er = dielectric.get("er")
+        if er is not None and not _is_positive_number(er):
+            stackup_warnings.append("Dielectric er must be positive.")
+
+    has_routing_intent = bool(routing or declared_pairs or net_classes or routing_overrides)
+    mode = routing.get("mode")
+    if mode is not None and str(mode) not in _ALLOWED_ROUTING_MODES:
+        routing_warnings.append(f"Routing mode {mode!r} is not supported; expected one of {sorted(_ALLOWED_ROUTING_MODES)}.")
+
+    class_specs: Dict[str, Mapping[str, Any]] = {}
+    defaults = _as_mapping(routing.get("defaults"))
+    if defaults:
+        class_specs["routing.defaults"] = defaults
+    for name, spec in _as_mapping(routing.get("classes")).items():
+        class_specs[f"routing.classes.{name}"] = _as_mapping(spec)
+
+    high_speed_requested = False
+    for label, spec in class_specs.items():
+        class_name = label.rsplit(".", 1)[-1]
+        high_speed = _routing_class_is_high_speed(class_name, spec)
+        high_speed_requested = high_speed_requested or high_speed
+        _validate_layer_refs(spec, label, layer_names, routing_warnings)
+        ref_plane = spec.get("reference_plane")
+        if ref_plane is not None:
+            if not layer_names or str(ref_plane) not in layer_names:
+                routing_warnings.append(f"{label} reference plane {ref_plane!r} is missing.")
+            elif str(ref_plane) not in reference_planes:
+                routing_warnings.append(f"{label} reference plane {ref_plane!r} exists but is not marked as a plane layer.")
+        via_policy = spec.get("via_policy")
+        if via_policy is not None and str(via_policy) not in _ALLOWED_VIA_POLICIES:
+            routing_warnings.append(f"{label} via_policy {via_policy!r} is not supported; expected one of {sorted(_ALLOWED_VIA_POLICIES)}.")
+        for field in ("trace_width_mm", "clearance_mm", "trace_spacing_mm", "max_skew_mm", "max_length_mismatch_mm"):
+            if field in spec and not _is_positive_number(spec[field]):
+                routing_warnings.append(f"{label} {field} must be positive.")
+        if "impedance_ohms" in spec and not _is_number(spec["impedance_ohms"]):
+            routing_warnings.append(f"{label} impedance_ohms must be numeric.")
+        if spec.get("impedance_ohms") is not None and (spec.get("trace_width_mm") is None or (spec.get("trace_spacing_mm") is None and bool(spec.get("differential")))):
+            routing_warnings.append(f"{label} has an impedance target but no complete trace width/spacing.")
+        if high_speed and spec.get("via_policy") == "allow" and spec.get("max_vias") is None:
+            routing_warnings.append(f"{label} is high-speed but allows vias without explicit max_vias.")
+
+    for net, spec in routing_overrides.items():
+        _validate_layer_refs(spec, f"routing_overrides.{net}", layer_names, routing_warnings)
+        via_policy = spec.get("via_policy")
+        if via_policy is not None and str(via_policy) not in _ALLOWED_VIA_POLICIES:
+            routing_warnings.append(f"routing_overrides.{net} via_policy {via_policy!r} is not supported.")
+        for field in ("trace_width_mm", "clearance_mm", "trace_spacing_mm", "max_skew_mm", "max_length_mismatch_mm"):
+            if field in spec and not _is_positive_number(spec[field]):
+                routing_warnings.append(f"routing_overrides.{net} {field} must be positive.")
+
+    if high_speed_requested and not stackup:
+        routing_warnings.append("High-speed routing constraints were requested without a stackup.")
+
+    known_nets = set(nets)
+    classes = _as_mapping(routing.get("classes"))
+    for pair_name, pair in declared_pairs.items():
+        p_net = pair.get("p")
+        n_net = pair.get("n")
+        cls = pair.get("class")
+        if not p_net or not n_net:
+            routing_warnings.append(f"Differential pair {pair_name} has missing P/N net.")
+        if known_nets:
+            if p_net and str(p_net) not in known_nets:
+                routing_warnings.append(f"Differential pair {pair_name} P net {p_net!r} is not present in the netlist/board connectivity.")
+            if n_net and str(n_net) not in known_nets:
+                routing_warnings.append(f"Differential pair {pair_name} N net {n_net!r} is not present in the netlist/board connectivity.")
+        if cls and str(cls) not in classes:
+            routing_warnings.append(f"Differential pair {pair_name} references unknown routing class {cls!r}.")
+
+    openems = _as_mapping(simulation.get("openems"))
+    triggers = [str(t) for t in _as_list(openems.get("trigger_on"))]
+    enabled_value = openems.get("enabled")
+    openems_active = _simulation_openems_enabled(openems)
+    if openems_active and not any(any(token in t.lower() for token in ("high_speed", "rf", "switching")) for t in triggers):
+        simulation_warnings.append("OpenEMS is enabled but no high-speed/RF/switching trigger exists.")
+    if enabled_value not in (None, True, False) and not (isinstance(enabled_value, str) and enabled_value.lower() == "auto"):
+        simulation_warnings.append("simulation.openems.enabled should be true, false, or auto.")
+
+    high_speed_constraints_complete = not routing_warnings and not stackup_warnings
+    if high_speed_requested:
+        high_speed_constraints_complete = high_speed_constraints_complete and bool(stackup)
+    return stackup, routing, declared_pairs, net_classes, routing_overrides, simulation, routing_warnings, stackup_warnings, simulation_warnings, high_speed_constraints_complete
+
+
 def infer_roles(components: Dict[str, PlanComponent], intent: Mapping[str, Any]) -> None:
     intent_roles = {str(k): str(v) for k, v in (intent.get("roles") or {}).items()} if isinstance(intent.get("roles"), dict) else {}
     for comp in components.values():
@@ -560,6 +766,21 @@ def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanCompone
 def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], nets: Dict[str, PlanNet], aliases: Dict[str, str], alias_diagnostics: AliasDiagnostics, intent: Mapping[str, Any], warnings: List[str]) -> Plan:
     infer_roles(components, intent)
     pairs = detect_differential_pairs(nets)
+    (
+        stackup,
+        routing,
+        declared_pairs,
+        net_classes,
+        routing_overrides,
+        simulation,
+        routing_warnings,
+        stackup_warnings,
+        simulation_warnings,
+        high_speed_constraints_complete,
+    ) = validate_routing_intent(intent, nets)
+    warnings.extend(routing_warnings)
+    warnings.extend(stackup_warnings)
+    warnings.extend(simulation_warnings)
     rules: List[PlanRule] = []
     explanations: Dict[str, Dict[str, Any]] = {}
     uncertain: List[str] = []
@@ -678,7 +899,198 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             explanations[r.ref] = {"role": r.role, "nets": r.nets, "generated_rule": text}
 
     roles = {ref: c.role for ref, c in components.items()}
-    return Plan(board, components, nets, aliases, alias_diagnostics, roles, regions, keepouts, clusters, pairs, rules, warnings, uncertain, explanations)
+    return Plan(
+        board,
+        components,
+        nets,
+        aliases,
+        alias_diagnostics,
+        roles,
+        regions,
+        keepouts,
+        clusters,
+        pairs,
+        stackup,
+        routing,
+        declared_pairs,
+        net_classes,
+        routing_overrides,
+        simulation,
+        routing_warnings,
+        stackup_warnings,
+        simulation_warnings,
+        high_speed_constraints_complete,
+        rules,
+        warnings,
+        uncertain,
+        explanations,
+    )
+
+
+
+def _routing_class_for_pair(plan: Plan, pair: Mapping[str, Any]) -> Dict[str, Any]:
+    class_name = pair.get("class")
+    classes = _as_mapping(plan.routing.get("classes"))
+    return _as_mapping(classes.get(class_name)) if class_name else {}
+
+
+def routing_summary_comments(plan: Plan) -> List[str]:
+    comments: List[str] = []
+    if not (plan.routing or plan.declared_differential_pairs):
+        return comments
+    comments.append("# Routing constraints from board.pln:")
+    mode = plan.routing.get("mode")
+    if mode:
+        comments.append(f"# routing mode: {mode}")
+    for name, pair in sorted(plan.declared_differential_pairs.items()):
+        cls = _routing_class_for_pair(plan, pair)
+        bits: List[str] = []
+        impedance = cls.get("impedance_ohms") or pair.get("impedance_ohms")
+        if impedance is not None:
+            bits.append(f"{impedance:g} ohm differential" if _is_number(impedance) else f"{impedance} ohm differential")
+        layer = cls.get("preferred_layer") or pair.get("preferred_layer")
+        if layer is None:
+            layers = cls.get("preferred_layers") or pair.get("preferred_layers")
+            if isinstance(layers, list) and layers:
+                layer = layers[0]
+        ref_plane = cls.get("reference_plane") or pair.get("reference_plane")
+        if layer and ref_plane:
+            bits.append(f"{layer} over {ref_plane}")
+        elif layer:
+            bits.append(f"preferred layer {layer}")
+        skew = cls.get("max_skew_mm") or pair.get("max_skew_mm")
+        if skew is not None:
+            bits.append(f"max skew {skew:g} mm" if _is_number(skew) else f"max skew {skew} mm")
+        mismatch = cls.get("max_length_mismatch_mm") or pair.get("max_length_mismatch_mm")
+        if mismatch is not None and mismatch != skew:
+            bits.append(f"max mismatch {mismatch:g} mm" if _is_number(mismatch) else f"max mismatch {mismatch} mm")
+        nets = f"{pair.get('p', '?')}/{pair.get('n', '?')}"
+        comments.append(f"# {name}: {', '.join(bits) if bits else 'differential pair'} ({nets})")
+    comments.append("# Routing performed later by orchestrator/KiCadRoutingTools.")
+    comments.append("")
+    return comments
+
+
+def _json_safe(value: Any) -> Any:
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _yaml_scalar(value: Any) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{value:g}"
+    text = str(value)
+    if not text or re.search(r"[:#\[\]{},&*!|>'\"%@`\s]", text):
+        return json.dumps(text)
+    return text
+
+
+def _emit_yaml(value: Any, indent: int = 0) -> List[str]:
+    sp = " " * indent
+    value = _json_safe(value)
+    if isinstance(value, Mapping):
+        lines: List[str] = []
+        if not value:
+            return [sp + "{}"]
+        for key, item in value.items():
+            if isinstance(item, (Mapping, list)):
+                lines.append(f"{sp}{key}:")
+                lines.extend(_emit_yaml(item, indent + 2))
+            else:
+                lines.append(f"{sp}{key}: {_yaml_scalar(item)}")
+        return lines
+    if isinstance(value, list):
+        if not value:
+            return [sp + "[]"]
+        lines = []
+        for item in value:
+            item = _json_safe(item)
+            if isinstance(item, Mapping):
+                lines.append(f"{sp}-")
+                lines.extend(_emit_yaml(item, indent + 2))
+            elif isinstance(item, list):
+                lines.append(f"{sp}-")
+                lines.extend(_emit_yaml(item, indent + 2))
+            else:
+                lines.append(f"{sp}- {_yaml_scalar(item)}")
+        return lines
+    return [sp + _yaml_scalar(value)]
+
+
+def emit_yaml(value: Any) -> str:
+    return "\n".join(_emit_yaml(value)) + "\n"
+
+
+def emit_routing_policy(plan: Plan, board_path: Path) -> str:
+    payload = {
+        "source": "pcb-plan .pln routing intent",
+        "board_file": str(board_path),
+        "routing": plan.routing,
+        "net_classes": plan.net_classes,
+        "routing_overrides": plan.routing_overrides,
+        "differential_pairs": plan.declared_differential_pairs,
+        "stackup": plan.stackup,
+        "warnings": plan.routing_warnings + plan.stackup_warnings,
+        "handoff": {
+            "consumer": "pcb-automation-orchestrator/KiCadRoutingTools",
+            "route_traces": False,
+            "advisory": "pcb-plan preserves routing intent only; downstream tools perform routing.",
+        },
+    }
+    return emit_yaml(payload)
+
+
+def openems_plan_should_emit(plan: Plan) -> bool:
+    openems = _as_mapping(plan.simulation.get("openems"))
+    return _simulation_openems_enabled(openems)
+
+
+def emit_openems_plan(plan: Plan, board_path: Path) -> str:
+    openems = _as_mapping(plan.simulation.get("openems"))
+    classes = _as_mapping(plan.routing.get("classes"))
+    critical_nets = sorted({
+        str(net)
+        for pair in plan.declared_differential_pairs.values()
+        for net in (pair.get("p"), pair.get("n"))
+        if net
+    })
+    for pattern, spec in plan.net_classes.items():
+        if isinstance(spec, Mapping):
+            class_name = str(spec.get("class", ""))
+            class_spec = _as_mapping(classes.get(class_name))
+            if _routing_class_is_high_speed(class_name, class_spec) or class_name.lower() in {"rf", "switching_power"}:
+                critical_nets.append(str(pattern))
+    regions = sorted(set(str(region) for spec in classes.values() if isinstance(spec, Mapping) for region in _as_list(spec.get("avoid_regions"))))
+    payload = {
+        "board_file": str(board_path),
+        "stackup_summary": plan.stackup,
+        "critical_nets": sorted(set(critical_nets)),
+        "differential_pairs": plan.declared_differential_pairs,
+        "regions_of_interest": regions,
+        "simulation_goal": "Advisory SI/EMI exploration for high-speed, RF, and switching-power constraints captured by pcb-plan.",
+        "openems": {
+            "enabled": openems.get("enabled"),
+            "triggers": _as_list(openems.get("trigger_on")),
+            "export_dir": openems.get("export_dir", "simulation/openems"),
+            "notes": openems.get("notes", "advisory_only"),
+        },
+        "advisory_warning": "pcb-plan does not route traces or run OpenEMS; this plan is a handoff hook for simulation automation.",
+        "warnings": plan.simulation_warnings + plan.routing_warnings + plan.stackup_warnings,
+    }
+    return emit_yaml(payload)
 
 
 def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
@@ -691,11 +1103,14 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
         f"# Source board: {board_path}",
         f"# Source netlist: {netlist_path if netlist_path else 'none'}",
         "",
+    ]
+    lines.extend(routing_summary_comments(plan))
+    lines.extend([
         f"Board(width={plan.board.width:.6g}, height={plan.board.height:.6g}, origin_x={plan.board.origin_x:.6g}, origin_y={plan.board.origin_y:.6g})",
         "Spacing(default=0.25, passive_to_ic=0.50, connector=1.00)",
         "PlacementPolicy(avoid_overlap=True, allow_anchor_move=False, max_search_radius=5, search_step=0.5)",
         "",
-    ]
+    ])
     sections = [
         ("Regions and keepouts", {"region", "keepout"}),
         ("Fixed mechanical placement", {"corner", "fixed"}),
@@ -727,6 +1142,7 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
 
 
 def report(plan: Plan) -> Dict[str, Any]:
+    openems = _as_mapping(plan.simulation.get("openems"))
     return {
         "components_parsed": len(plan.components),
         "nets_parsed": len(plan.nets),
@@ -739,6 +1155,28 @@ def report(plan: Plan) -> Dict[str, Any]:
         "warnings": plan.warnings,
         "unplaced_components": [ref for ref in plan.components if not any(ref in r.refs for r in plan.rules)],
         "uncertain_inferences": plan.uncertain_inferences,
+        "routing": {
+            "mode": plan.routing.get("mode"),
+            "classes": _as_mapping(plan.routing.get("classes")),
+            "defaults": _as_mapping(plan.routing.get("defaults")),
+            "differential_pairs": plan.declared_differential_pairs,
+            "net_classes": plan.net_classes,
+            "routing_overrides": plan.routing_overrides,
+            "warnings": plan.routing_warnings,
+            "high_speed_constraints_complete": plan.high_speed_constraints_complete,
+        },
+        "stackup": {
+            "layers": _as_list(plan.stackup.get("layers")),
+            "dielectric": _as_list(plan.stackup.get("dielectric")),
+            "reference_planes": _stackup_reference_planes(plan.stackup),
+            "warnings": plan.stackup_warnings,
+        },
+        "simulation": {
+            "openems_enabled": _simulation_openems_enabled(openems),
+            "triggers": _as_list(openems.get("trigger_on")),
+            "export_dir": openems.get("export_dir"),
+            "warnings": plan.simulation_warnings,
+        },
     }
 
 
@@ -763,6 +1201,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--intent", type=Path, help="Optional .pln board-plan file (YAML subset or JSON content)")
     parser.add_argument("-o", "--output", type=Path, help="Output placement.ppl path")
     parser.add_argument("--report-json", type=Path, help="Write planner report JSON")
+    parser.add_argument("--emit-routing-policy", type=Path, help="Write routing-policy.yaml handoff from .pln routing constraints")
+    parser.add_argument("--emit-openems-plan", type=Path, help="Write OpenEMS handoff plan when simulation.openems is enabled")
     parser.add_argument("--explain", help="Print inference explanation for a reference")
     parser.add_argument("--version", action="version", version=f"pcb-plan {__version__}")
     return parser
@@ -786,6 +1226,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     plan = generate_plan(board, components, nets, aliases, alias_diag, intent, warnings)
     if args.report_json:
         args.report_json.write_text(json.dumps(report(plan), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if args.emit_routing_policy:
+        args.emit_routing_policy.parent.mkdir(parents=True, exist_ok=True)
+        args.emit_routing_policy.write_text(emit_routing_policy(plan, args.board), encoding="utf-8")
+    if args.emit_openems_plan and openems_plan_should_emit(plan):
+        args.emit_openems_plan.parent.mkdir(parents=True, exist_ok=True)
+        args.emit_openems_plan.write_text(emit_openems_plan(plan, args.board), encoding="utf-8")
     if args.explain:
         sys.stdout.write(explain_text(plan, args.explain))
         return 0

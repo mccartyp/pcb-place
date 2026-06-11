@@ -207,6 +207,163 @@ Fields:
 
 Use keepouts for antenna areas, cable clearances, high-voltage clearances, switching-node noise areas, and other locations where footprints should not be planned.
 
+
+## `.pln` Routing Constraints
+
+`.pln` files may also carry optional routing and signal-integrity intent. `pcb-plan` parses, validates, reports, and preserves this data for downstream tools, but it does **not** route traces and does not emit executable routing primitives in `placement.ppl`.
+
+Supported top-level routing/SI keys are:
+
+| Key | Purpose |
+| --- | --- |
+| `stackup` | Declares copper layers, plane layers, copper weight, and dielectric relationships. |
+| `routing` | Declares routing mode, defaults, and named routing classes. |
+| `differential_pairs` | Names P/N net pairs and associates them with routing classes. |
+| `net_classes` | Maps net-name patterns to routing classes. |
+| `routing_overrides` | Applies per-net routing overrides such as preferred layer or max vias. |
+| `simulation` | Captures OpenEMS/simulation handoff hints. |
+
+Valid routing modes are `low_speed_only`, `all_nets_constrained`, and `experimental_high_speed`. Valid via policies are `avoid`, `allow`, `constrained`, and `forbid`.
+
+```yaml
+routing:
+  mode: all_nets_constrained
+  defaults:
+    trace_width_mm: 0.15
+    clearance_mm: 0.15
+    via_policy: allow
+    preferred_layers: [F.Cu, B.Cu]
+  classes:
+    high_speed_diff:
+      differential: true
+      impedance_ohms: 100
+      trace_width_mm: 0.12
+      trace_spacing_mm: 0.15
+      preferred_layer: F.Cu
+      reference_plane: In1.GND
+      max_skew_mm: 0.25
+      max_length_mismatch_mm: 0.25
+      via_policy: avoid
+      max_vias: 0
+```
+
+When routing constraints are present, `placement.ppl` remains placement-focused and only receives review comments such as:
+
+```text
+# Routing constraints from board.pln:
+# HDMI_TMDS0: 100 ohm differential, F.Cu over In1.GND, max skew 0.25 mm
+# Routing performed later by orchestrator/KiCadRoutingTools.
+```
+
+Use `--emit-routing-policy routing-policy.yaml` to generate a YAML handoff containing the routing classes, stackup, differential pairs, net classes, overrides, and validation warnings for automation/orchestrator/KiCadRoutingTools consumers.
+
+## Stackup
+
+`stackup.layers` is a list of copper layers. Signal layers normally set `type: signal`; plane layers set `type: plane` and often include the associated `net`.
+
+```yaml
+stackup:
+  layers:
+    - name: F.Cu
+      type: signal
+      copper_oz: 1
+    - name: In1.GND
+      type: plane
+      net: GND
+    - name: In2.PWR
+      type: plane
+      net: 3V3
+    - name: B.Cu
+      type: signal
+  dielectric:
+    - between: [F.Cu, In1.GND]
+      material: FR4
+      thickness_mm: 0.18
+      er: 4.2
+```
+
+The validator checks that referenced layers exist, dielectric `between` entries name known layers, dielectric thickness is positive, and reference planes used by routing classes are present in the stackup.
+
+## Differential Pairs
+
+`differential_pairs` declares named P/N nets and optionally binds each pair to a routing class:
+
+```yaml
+differential_pairs:
+  HDMI_TMDS0:
+    p: TMDS0_P
+    n: TMDS0_N
+    class: high_speed_diff
+```
+
+When board or netlist connectivity is available, `pcb-plan` warns if the declared P or N net is missing. It also warns when a pair references an unknown routing class.
+
+## High-Speed Routing Parameters
+
+Routing classes may define impedance, width, spacing, clearance, layer, skew, length matching, return plane, and via policy constraints:
+
+```yaml
+routing:
+  classes:
+    clock:
+      trace_width_mm: 0.15
+      preferred_layer: F.Cu
+      reference_plane: In1.GND
+      via_policy: avoid
+      max_vias: 0
+```
+
+Validation includes:
+
+- referenced preferred layers and reference planes exist in `stackup`
+- impedance targets are numeric
+- width, spacing, clearance, skew, length-mismatch, and dielectric values are positive
+- high-speed classes using `via_policy: allow` specify `max_vias`
+- high-speed routing intent includes a stackup
+
+The `pcb-plan-report.json` output includes:
+
+```json
+{
+  "routing": {
+    "mode": "all_nets_constrained",
+    "classes": {},
+    "differential_pairs": {},
+    "warnings": [],
+    "high_speed_constraints_complete": true
+  },
+  "stackup": {
+    "layers": [],
+    "reference_planes": [],
+    "warnings": []
+  }
+}
+```
+
+## OpenEMS Simulation Hooks
+
+OpenEMS hints live under `simulation.openems`:
+
+```yaml
+simulation:
+  openems:
+    enabled: auto
+    trigger_on:
+      - high_speed_diff
+      - rf
+      - switching_power_near_high_speed
+    export_dir: simulation/openems
+    notes: advisory_only
+```
+
+Use `--emit-openems-plan simulation/openems/openems-plan.yaml` to create an OpenEMS handoff plan. The file is emitted when `enabled: true`, or when `enabled: auto` and triggers are present. It contains the source board file, stackup summary, critical nets, differential pairs, regions of interest, simulation goal, and an advisory warning that `pcb-plan` does not run simulation.
+
+`pcb-plan` warns if OpenEMS is enabled but the trigger list contains no high-speed, RF, or switching-power trigger.
+
+## Relationship to pcb-place and KiCadRoutingTools
+
+`pcb-plan` owns intent parsing, validation, reports, placement-plan generation, and optional routing/simulation handoff files. `pcb-place` remains a deterministic placement executor for `.ppl` primitives and should not be expected to understand routing constraints unless support is added there later. KiCadRoutingTools or an automation orchestrator can consume `routing-policy.yaml` and `openems-plan.yaml` to perform routing or simulation in later workflow stages.
+
 ## Output
 
 `pcb-plan` emits a `.ppl` part-placement file organized for review:
