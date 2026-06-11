@@ -162,3 +162,173 @@ def test_fixture_expected_fragments_are_documented(tmp_path):
         if "aliases_recovered" in expected_fields:
             for alias, ref in expected_fields["aliases_recovered"].items():
                 assert payload["aliases_recovered"][alias] == ref
+
+
+def _routing_intent_text(**overrides):
+    p_net = overrides.get("p_net", "TMDS0_P")
+    n_net = overrides.get("n_net", "TMDS0_N")
+    ref_plane = overrides.get("ref_plane", "In1.GND")
+    impedance = overrides.get("impedance", "100")
+    width = overrides.get("width", "0.12")
+    spacing = overrides.get("spacing", "0.15")
+    return f"""
+board:
+  width: 74
+  height: 74
+  origin_x: 140.23
+  origin_y: 52.465
+  units: mm
+stackup:
+  layers:
+    - name: F.Cu
+      type: signal
+      copper_oz: 1
+    - name: In1.GND
+      type: plane
+      net: GND
+    - name: In2.PWR
+      type: plane
+      net: 3V3
+    - name: B.Cu
+      type: signal
+  dielectric:
+    - between: [F.Cu, In1.GND]
+      material: FR4
+      thickness_mm: 0.18
+      er: 4.2
+routing:
+  mode: all_nets_constrained
+  defaults:
+    trace_width_mm: 0.15
+    clearance_mm: 0.15
+    via_policy: allow
+    preferred_layers: [F.Cu, B.Cu]
+  classes:
+    low_speed:
+      trace_width_mm: 0.15
+      clearance_mm: 0.15
+      preferred_layers: [F.Cu, B.Cu]
+      via_policy: allow
+    high_speed_diff:
+      differential: true
+      impedance_ohms: {impedance}
+      trace_width_mm: {width}
+      trace_spacing_mm: {spacing}
+      preferred_layer: F.Cu
+      reference_plane: {ref_plane}
+      max_skew_mm: 0.25
+      max_length_mismatch_mm: 0.25
+      via_policy: avoid
+      max_vias: 0
+    switching_power:
+      route: constrained
+      keep_short: true
+      avoid_regions: [HIGH_SPEED, RF]
+      via_policy: avoid
+differential_pairs:
+  HDMI_TMDS0:
+    p: {p_net}
+    n: {n_net}
+    class: high_speed_diff
+net_classes:
+  TMDS*:
+    class: high_speed_diff
+  SW_NODE*:
+    class: switching_power
+routing_overrides:
+  TMDS0_P:
+    preferred_layer: F.Cu
+    max_vias: 0
+simulation:
+  openems:
+    enabled: auto
+    trigger_on:
+      - high_speed_diff
+      - switching_power_near_high_speed
+    export_dir: simulation/openems
+    notes: advisory_only
+"""
+
+
+def _plan_from_intent(tmp_path, text):
+    intent_path = tmp_path / "board.pln"
+    intent_path.write_text(text)
+    board, components, nets, warnings = pcb_plan.parse_board(ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb")
+    intent = pcb_plan.load_intent(intent_path)
+    return pcb_plan.generate_plan(board, components, nets, {}, pcb_plan.AliasDiagnostics(), intent, warnings)
+
+
+def test_pln_parses_stackup_routing_classes_and_differential_pairs(tmp_path):
+    plan = _plan_from_intent(tmp_path, _routing_intent_text())
+    assert [layer["name"] for layer in plan.stackup["layers"]] == ["F.Cu", "In1.GND", "In2.PWR", "B.Cu"]
+    assert plan.routing["mode"] == "all_nets_constrained"
+    assert plan.routing["classes"]["high_speed_diff"]["impedance_ohms"] == 100
+    assert plan.declared_differential_pairs["HDMI_TMDS0"]["p"] == "TMDS0_P"
+    assert plan.high_speed_constraints_complete is True
+
+
+def test_pln_warns_for_missing_reference_plane_and_missing_pair_net(tmp_path):
+    plan = _plan_from_intent(tmp_path, _routing_intent_text(ref_plane="In9.MISSING", n_net="TMDS9_N"))
+    warnings = "\n".join(plan.warnings)
+    assert "reference plane 'In9.MISSING'" in warnings
+    assert "N net 'TMDS9_N'" in warnings
+    assert plan.high_speed_constraints_complete is False
+
+
+def test_pln_validates_impedance_width_spacing(tmp_path):
+    plan = _plan_from_intent(tmp_path, _routing_intent_text(impedance="fast", width="0", spacing="-0.1"))
+    warnings = "\n".join(plan.warnings)
+    assert "impedance_ohms must be numeric" in warnings
+    assert "trace_width_mm must be positive" in warnings
+    assert "trace_spacing_mm must be positive" in warnings
+
+
+def test_routing_report_json_and_ppl_comments(tmp_path):
+    plan = _plan_from_intent(tmp_path, _routing_intent_text())
+    payload = pcb_plan.report(plan)
+    assert payload["routing"]["mode"] == "all_nets_constrained"
+    assert payload["routing"]["differential_pairs"]["HDMI_TMDS0"]["class"] == "high_speed_diff"
+    assert payload["stackup"]["reference_planes"] == ["In1.GND", "In2.PWR"]
+    assert payload["simulation"]["openems_enabled"] is True
+    ppl = pcb_plan.emit_ppl(plan, ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb", None)
+    assert "# Routing constraints from board.pln:" in ppl
+    assert "# HDMI_TMDS0: 100 ohm differential, F.Cu over In1.GND, max skew 0.25 mm" in ppl
+    assert "Routing performed later by orchestrator/KiCadRoutingTools." in ppl
+
+
+def test_emit_routing_policy_and_openems_plan_auto_mode(tmp_path):
+    intent_path = tmp_path / "board.pln"
+    intent_path.write_text(_routing_intent_text())
+    board_path = ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb"
+    out = tmp_path / "placement.ppl"
+    report = tmp_path / "pcb-plan-report.json"
+    policy = tmp_path / "routing-policy.yaml"
+    openems = tmp_path / "simulation/openems/openems-plan.yaml"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "pcb_plan.py"),
+            "--board",
+            str(board_path),
+            "--intent",
+            str(intent_path),
+            "-o",
+            str(out),
+            "--report-json",
+            str(report),
+            "--emit-routing-policy",
+            str(policy),
+            "--emit-openems-plan",
+            str(openems),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "route_traces: false" in policy.read_text()
+    assert "KiCadRoutingTools" in policy.read_text()
+    openems_text = openems.read_text()
+    assert "critical_nets:" in openems_text
+    assert "TMDS0_P" in openems_text
+    assert "advisory_warning:" in openems_text
+    assert json.loads(report.read_text())["routing"]["high_speed_constraints_complete"] is True
