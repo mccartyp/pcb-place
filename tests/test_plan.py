@@ -6,8 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-PLAN_CLI = ROOT / "src/pcb-plan/pcb_plan.py"
-PLACE_CLI = ROOT / "src/pcb-place/pcb_place.py"
+PLAN_CLI = ROOT / "src/pcb_plan/pcb_plan.py"
+PLACE_CLI = ROOT / "src/pcb_place/pcb_place.py"
 
 import pcb_plan
 

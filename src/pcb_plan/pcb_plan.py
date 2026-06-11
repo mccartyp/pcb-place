@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-# Allow this implementation file to run directly from src/pcb-plan while
+# Allow this implementation file to run directly from src/pcb_plan while
 # still resolving the import package used by installed console scripts.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC_ROOT = _REPO_ROOT / "src"

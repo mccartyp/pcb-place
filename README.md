@@ -3,11 +3,11 @@
 This repository contains two complementary command-line tools for reviewable PCB
 planning and placement workflows:
 
-- [`pcb-plan`](src/pcb-plan/README.md) owns `board.pln` planning intent. It can
+- [`pcb-plan`](src/pcb_plan/README.md) owns `board.pln` planning intent. It can
   initialize, update, review, and explain `board.pln`; infer placement, routing,
   and simulation intent; and emit deterministic `placement.ppl` files for
   execution.
-- [`pcb-place`](src/pcb-place/README.md) is the deterministic placement executor.
+- [`pcb-place`](src/pcb_place/README.md) is the deterministic placement executor.
   It consumes `placement.ppl`, validates placement rules, applies footprint
   placement to KiCad `.kicad_pcb` files, and writes placed boards.
 
@@ -23,24 +23,24 @@ netlists or own `board.pln`.
 ├── README.md                  # Repository overview and structure
 ├── pyproject.toml             # Packaging and console-script metadata
 ├── src/
-│   ├── pcb-plan/
+│   ├── pcb_plan/
 │   │   ├── README.md          # pcb-plan and board.pln documentation
+│   │   ├── __init__.py        # Import package for console scripts
 │   │   ├── pcb_plan.py        # pcb-plan implementation
 │   │   └── pcb_plan_facades/  # Internal migration/facade modules
-│   ├── pcb-place/
-│   │   ├── README.md          # pcb-place DSL and executor documentation
-│   │   └── pcb_place.py       # pcb-place implementation
-│   ├── pcb_plan/              # Import package for console scripts
-│   └── pcb_place/             # Import package for console scripts
+│   └── pcb_place/
+│       ├── README.md          # pcb-place DSL and executor documentation
+│       ├── __init__.py        # Import package for console scripts
+│       └── pcb_place.py       # pcb-place implementation
 ├── examples/                  # Example placement workflows and inputs
 └── tests/                     # Unit and CLI integration tests
 ```
 
 There are no root-level `pcb_plan.py` or `pcb_place.py` compatibility entry
-points. The canonical executable implementations live beside their READMEs in
-`src/pcb-plan/` and `src/pcb-place/`. Small import packages under
-`src/pcb_plan/` and `src/pcb_place/` provide normal Python entry point targets
-for installed console scripts.
+points and no hyphenated tool directories under `src/`. The canonical
+executable implementations live beside their READMEs in the importable packages
+`src/pcb_plan/` and `src/pcb_place/`, which also provide the normal Python entry
+point targets for installed console scripts.
 
 ## Overall workflow
 
@@ -118,7 +118,7 @@ Planner output is meant to be reviewed, edited, diffed, and re-run. It does
 **not** route traces, tune differential pairs, validate impedance, certify EMI
 behavior, or claim production readiness.
 
-See [`src/pcb-plan/README.md`](src/pcb-plan/README.md) for planner CLI details,
+See [`src/pcb_plan/README.md`](src/pcb_plan/README.md) for planner CLI details,
 `board.pln` syntax, provenance, reports, routing/SI hooks, simulation hooks,
 heuristics, and limitations.
 
@@ -133,7 +133,7 @@ Executor behavior should remain predictable and independent of planner
 heuristics. It does **not** infer placement strategy from netlists and does
 **not** route traces.
 
-See [`src/pcb-place/README.md`](src/pcb-place/README.md) for the placement DSL,
+See [`src/pcb_place/README.md`](src/pcb_place/README.md) for the placement DSL,
 safety checks, CLI reference, and executor-specific examples.
 
 ## Installation
@@ -176,10 +176,10 @@ Both tools are sidecars around KiCad files:
 
 ## Documentation map
 
-- [`src/pcb-plan/README.md`](src/pcb-plan/README.md): planner-specific
+- [`src/pcb_plan/README.md`](src/pcb_plan/README.md): planner-specific
   documentation for `board.pln`, lifecycle commands, routing/SI constraints,
   simulation hooks, reports, and `.ppl` generation.
-- [`src/pcb-place/README.md`](src/pcb-place/README.md): executor-specific
+- [`src/pcb_place/README.md`](src/pcb_place/README.md): executor-specific
   documentation for applying `.ppl` files to KiCad boards.
 - [`examples/`](examples): example placement workflows and input files.
 - [`tests/`](tests): unit and CLI integration tests for both tools.
