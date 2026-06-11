@@ -422,3 +422,67 @@ def test_plan_update_generates_reviewable_patch(tmp_path):
     assert "+++ " in patch.read_text()
     payload = json.loads(update_report.read_text())
     assert "openems" in payload["reports_consumed"]
+
+
+def test_zener_sexp_default_net_connectivity_and_aliases(tmp_path):
+    board, components, nets, warnings = pcb_plan.parse_board(ROOT / "tests/fixtures/zener_generated_board/layout.kicad_pcb")
+    netlist = tmp_path / "default.net"
+    netlist.write_text(
+        '''(netlist
+  (components
+    (component (path "HDMI.J_IN") (ref "J1") (value "HDMI_IN"))
+    (component (path "HDMI.U_ESD") (ref "U2") (value "ESD"))
+    (component (path "HDMI.U_RETIMER") (ref "U10") (value "HDMI Retimer")))
+  (nets
+    (net (code "1") (name "TMDS0_P")
+      (node (ref "J1") (pin "1"))
+      (node (ref "U2") (pin "1"))
+      (node (ref "U10") (pin "1")))
+    (net (code "2") (name "TMDS0_N")
+      (node (ref "J1") (pin "2"))
+      (node (ref "U2") (pin "2"))
+      (node (ref "U10") (pin "2")))))
+''',
+        encoding="utf-8",
+    )
+    aliases, diagnostics, net_warnings = pcb_plan.import_netlist(netlist, components, nets)
+    warnings.extend(net_warnings)
+    plan = pcb_plan.generate_plan(board, components, nets, aliases, diagnostics, {}, warnings)
+    payload = pcb_plan.report(plan)
+    assert diagnostics.parser == "sexp"
+    assert aliases["HDMI.J_IN"] == "J1"
+    assert payload["nets_parsed"] > 0
+    assert payload["clusters_multi_member"] >= 1
+    assert payload["diff_pairs_inferred"] == 1
+
+
+def test_board_pln_geometry_overrides_edge_cuts_and_footprint_fallback(tmp_path):
+    source = (ROOT / "tests/fixtures/simple_mcu/layout.kicad_pcb").read_text(encoding="utf-8")
+    no_edge = tmp_path / "layout.kicad_pcb"
+    no_edge.write_text("\n".join(line for line in source.splitlines() if "Edge.Cuts" not in line), encoding="utf-8")
+    pln = tmp_path / "board.pln"
+    pln.write_text("""
+board:
+  width: 74
+  height: 74
+  origin_x: 0
+  origin_y: 0
+""", encoding="utf-8")
+    plan, _ = pcb_plan._load_plan_from_inputs(no_edge, None, pln)
+    payload = pcb_plan.report(plan)
+    assert plan.board.width == 74
+    assert plan.board.height == 74
+    assert plan.board.source == "board.pln"
+    assert not any("footprint extents" in warning for warning in payload["warnings"])
+
+
+def test_report_quality_metrics_and_nearpad_rule():
+    board, components, nets, warnings = pcb_plan.parse_board(ROOT / "tests/fixtures/simple_mcu/layout.kicad_pcb")
+    plan = pcb_plan.generate_plan(board, components, nets, {}, pcb_plan.AliasDiagnostics(), {}, warnings)
+    payload = pcb_plan.report(plan)
+    assert payload["components_placed"] == 3
+    assert payload["components_unplaced"] == 0
+    assert payload["clusters_multi_member"] == 1
+    assert payload["generated_decoupling_rules"] == 1
+    assert payload["generated_pullup_rules"] == 1
+    assert any(rule.kind == "nearpad" for rule in plan.rules)

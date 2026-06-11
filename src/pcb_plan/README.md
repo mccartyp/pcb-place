@@ -49,6 +49,42 @@ impedance_ohms:
 Before generating `placement.ppl`, `pcb-plan emit` unwraps these provenance
 objects into ordinary values for the existing placement generator.
 
+
+## Connectivity-aware placement planning notes
+
+`pcb-plan init` creates a starting point for engineering review, not final
+engineering truth. The generated `board.pln` records inferred values with
+provenance wherever practical so reviewers can keep, override, or delete them.
+
+Board geometry is resolved in a strict priority order during planning:
+
+1. explicit `board.width`, `board.height`, and origin fields in `board.pln`;
+2. KiCad `Edge.Cuts` rectangular geometry;
+3. footprint extents as a last-resort fallback.
+
+The footprint-extents fallback is intentionally noisy because it is not a real
+board outline. If that warning appears, add explicit `board` geometry to
+`board.pln` or fix the KiCad outline before trusting region sizes.
+
+Good placement plans require connectivity. Supplying Zener/pcb `default.net` (or
+another supported JSON, XML, or S-expression netlist artifact) lets the planner
+recover component refs, pin-to-net connectivity, semantic aliases, differential
+pairs, and support-part relationships. Without this graph, clusters and passive
+placement rules are necessarily weaker.
+
+The planner uses connectivity, proximity, role inference, existing physical
+neighborhoods, and semantic/module aliases to build multi-member clusters such
+as connector/ESD/interface groups, MCU support islands, regulator power stages,
+and RF-module neighborhoods. These clusters preserve useful generated-layout
+neighborhoods while allowing pin-aware refinements inside them.
+
+Support passives are emitted with semantic placement helpers where possible:
+`Decoupling(...)`, `NearPad(...)`, `ESD(...)`, `Pullup(...)`, `Series(...)`,
+`Satellite(...)`, `Between(...)`, and `Cluster(...)`. Review
+`unplaced_components` and the planning metrics in `pcb-plan` reports; unplaced
+support parts should be treated as warnings and either given better connectivity
+or explicit placement intent.
+
 ## board.pln Syntax Reference
 
 A `.pln` file is a planner-input file, not an executable placement file. It

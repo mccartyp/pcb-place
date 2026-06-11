@@ -118,6 +118,14 @@ Planner output is meant to be reviewed, edited, diffed, and re-run. It does
 **not** route traces, tune differential pairs, validate impedance, certify EMI
 behavior, or claim production readiness.
 
+Planner quality depends on real board geometry and connectivity. Explicit
+`board.pln` geometry overrides KiCad `Edge.Cuts`, and `Edge.Cuts` overrides the
+last-resort footprint-extents fallback. Supplying a netlist lets `pcb-plan` build
+multi-member connectivity clusters, infer differential pairs, and place support
+passives with semantic helpers such as `Decoupling`, `NearPad`, `ESD`, `Pullup`,
+`Series`, `Satellite`, and `Between`; review any `unplaced_components` in the
+report.
+
 See [`src/pcb_plan/README.md`](src/pcb_plan/README.md) for planner CLI details,
 `board.pln` syntax, provenance, reports, routing/SI hooks, simulation hooks,
 heuristics, and limitations.

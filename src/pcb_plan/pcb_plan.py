@@ -13,6 +13,7 @@ import json
 import math
 import re
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -212,10 +213,13 @@ def _parse_pads(fp: Any) -> List[PlanPad]:
 def parse_board(path: Path) -> Tuple[BoardGeometry, Dict[str, PlanComponent], Dict[str, PlanNet], List[str]]:
     text = path.read_text(encoding="utf-8")
     fps = parse_footprints(text)
-    board = parse_edge_cuts_geometry(text) or infer_geometry_from_footprints(fps)
+    edge_board = parse_edge_cuts_geometry(text)
     warnings: List[str] = []
-    if parse_edge_cuts_geometry(text) is None:
-        warnings.append("No Edge.Cuts rectangle found; inferred board geometry from footprint extents.")
+    if edge_board is not None:
+        board = edge_board
+    else:
+        board = infer_geometry_from_footprints(fps)
+        warnings.append("WARNING: No board.pln geometry or Edge.Cuts rectangle was available while parsing the board; using footprint extents only as a last-resort board-size fallback. Supply board.width/height/origin in board.pln for authoritative dimensions.")
     components: Dict[str, PlanComponent] = {}
     nets: Dict[str, PlanNet] = {}
     for ref, fp in sorted(fps.items()):
@@ -277,15 +281,245 @@ def _extract_connectivity_from_json_obj(obj: Any, components: Dict[str, PlanComp
             _extract_connectivity_from_json_obj(item, components, nets)
 
 
+
+def _clear_imported_net_connectivity(nets: Dict[str, PlanNet]) -> None:
+    """Remove duplicate net entries before an external netlist re-populates pads."""
+    for net in nets.values():
+        seen: set[Tuple[str, str]] = set()
+        unique: List[Tuple[str, str]] = []
+        for ref, pin in net.pads:
+            key = (_normalize_ref(ref), str(pin))
+            if key not in seen:
+                seen.add(key)
+                unique.append(key)
+        net.pads = unique
+
+
+def _connect_pin(components: Dict[str, PlanComponent], nets: Dict[str, PlanNet], net_name: str, ref: Any, pin: Any) -> bool:
+    if not net_name or ref is None or pin is None:
+        return False
+    ref_norm = _normalize_ref(str(ref))
+    pin_text = str(pin).strip('"')
+    if ref_norm not in components:
+        return False
+    net = nets.setdefault(str(net_name), PlanNet(str(net_name)))
+    node = (ref_norm, pin_text)
+    if node not in net.pads:
+        net.pads.append(node)
+    comp = components[ref_norm]
+    matched = False
+    for pad in comp.pads:
+        if pad.number == pin_text or pad.name == pin_text:
+            pad.net = str(net_name)
+            matched = True
+    return matched or True
+
+
+def _detect_netlist_format(text: str) -> str:
+    stripped = text.lstrip()
+    if stripped.startswith(('{', '[')):
+        return 'json'
+    if stripped.startswith('<'):
+        return 'xml'
+    if stripped.startswith('('):
+        return 'sexp'
+    return 'unknown'
+
+
+def _add_component_metadata(components: Dict[str, PlanComponent], ref: Any, *, value: Any = None, footprint: Any = None) -> None:
+    if ref is None:
+        return
+    ref_norm = _normalize_ref(str(ref))
+    comp = components.get(ref_norm)
+    if not comp:
+        return
+    if value and not comp.value:
+        comp.value = str(value)
+    if footprint and not comp.footprint:
+        comp.footprint = str(footprint)
+
+
+def _extract_json_netlist(obj: Any, components: Dict[str, PlanComponent], nets: Dict[str, PlanNet]) -> None:
+    if isinstance(obj, dict):
+        ref = obj.get('ref') or obj.get('reference') or obj.get('designator')
+        _add_component_metadata(components, ref, value=obj.get('value'), footprint=obj.get('footprint'))
+        pinmap = obj.get('pins') or obj.get('pin_to_net') or obj.get('pinToNet') or obj.get('pads')
+        if ref and isinstance(pinmap, dict):
+            for pin, net in pinmap.items():
+                if isinstance(net, str):
+                    _connect_pin(components, nets, net, ref, pin)
+        net_name = obj.get('name') or obj.get('net') or obj.get('net_name')
+        nodes = obj.get('nodes') or (obj.get('pins') if isinstance(obj.get('pins'), list) else None) or obj.get('connections')
+        if isinstance(net_name, str) and isinstance(nodes, list):
+            for node in nodes:
+                if isinstance(node, dict):
+                    _connect_pin(components, nets, net_name, node.get('ref') or node.get('reference') or node.get('component'), node.get('pin') or node.get('pad') or node.get('number'))
+                elif isinstance(node, (list, tuple)) and len(node) >= 2:
+                    _connect_pin(components, nets, net_name, node[0], node[1])
+        for value2 in obj.values():
+            _extract_json_netlist(value2, components, nets)
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract_json_netlist(item, components, nets)
+
+
+def _xml_attr_or_child(elem: ET.Element, *names: str) -> Optional[str]:
+    lowered = {k.lower(): v for k, v in elem.attrib.items()}
+    for name in names:
+        if name in elem.attrib:
+            return elem.attrib[name]
+        if name.lower() in lowered:
+            return lowered[name.lower()]
+    for child in list(elem):
+        tag = child.tag.rsplit('}', 1)[-1].lower()
+        if tag in {n.lower() for n in names}:
+            return (child.text or '').strip() or child.attrib.get('value') or child.attrib.get('name')
+    return None
+
+
+def _extract_xml_netlist(text: str, components: Dict[str, PlanComponent], nets: Dict[str, PlanNet]) -> None:
+    root = ET.fromstring(text)
+    for elem in root.iter():
+        tag = elem.tag.rsplit('}', 1)[-1].lower()
+        if tag in {'comp', 'component', 'part'}:
+            ref = _xml_attr_or_child(elem, 'ref', 'reference', 'designator')
+            value = _xml_attr_or_child(elem, 'value')
+            footprint = _xml_attr_or_child(elem, 'footprint')
+            for prop in elem.findall('.//property'):
+                pname = (prop.attrib.get('name') or prop.attrib.get('key') or '').lower()
+                pval = prop.attrib.get('value') or (prop.text or '').strip()
+                if pname in {'value'}:
+                    value = value or pval
+                if pname in {'footprint'}:
+                    footprint = footprint or pval
+            _add_component_metadata(components, ref, value=value, footprint=footprint)
+        if tag == 'net':
+            net_name = _xml_attr_or_child(elem, 'name', 'net')
+            if not net_name:
+                continue
+            for node in elem.iter():
+                node_tag = node.tag.rsplit('}', 1)[-1].lower()
+                if node_tag in {'node', 'pin', 'pad'}:
+                    _connect_pin(components, nets, net_name, _xml_attr_or_child(node, 'ref', 'reference', 'component'), _xml_attr_or_child(node, 'pin', 'pad', 'number', 'num'))
+
+
+def _sexp_tokens_plan(text: str) -> List[str]:
+    tokens: List[str] = []
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c.isspace():
+            i += 1
+            continue
+        if c == ';':
+            j = text.find('\n', i)
+            i = len(text) if j < 0 else j + 1
+            continue
+        if c in '()':
+            tokens.append(c); i += 1; continue
+        if c == '"':
+            j = i + 1; buf = []
+            while j < len(text):
+                if text[j] == '\\' and j + 1 < len(text):
+                    buf.append(text[j + 1]); j += 2; continue
+                if text[j] == '"':
+                    break
+                buf.append(text[j]); j += 1
+            tokens.append(''.join(buf)); i = j + 1
+            continue
+        j = i
+        while j < len(text) and not text[j].isspace() and text[j] not in '();':
+            j += 1
+        tokens.append(text[i:j]); i = j
+    return tokens
+
+
+def _parse_sexp_plan(tokens: List[str]) -> Any:
+    def parse_at(i: int) -> Tuple[Any, int]:
+        if tokens[i] != '(':
+            return tokens[i], i + 1
+        out: List[Any] = []
+        i += 1
+        while i < len(tokens) and tokens[i] != ')':
+            item, i = parse_at(i)
+            out.append(item)
+        return out, i + 1
+    items: List[Any] = []
+    i = 0
+    while i < len(tokens):
+        item, i = parse_at(i)
+        items.append(item)
+    return items[0] if len(items) == 1 else items
+
+
+def _walk_forms(node: Any) -> Iterable[List[Any]]:
+    if isinstance(node, list):
+        if node and isinstance(node[0], str):
+            yield node
+        for child in node:
+            yield from _walk_forms(child)
+
+
+def _form_values(form: List[Any]) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    for item in form[1:]:
+        if isinstance(item, list) and len(item) >= 2 and isinstance(item[0], str) and not isinstance(item[1], list):
+            values[item[0].lower()] = str(item[1])
+    return values
+
+
+def _extract_sexp_netlist(text: str, components: Dict[str, PlanComponent], nets: Dict[str, PlanNet]) -> None:
+    tree = _parse_sexp_plan(_sexp_tokens_plan(text))
+    for form in _walk_forms(tree):
+        head = str(form[0]).lower() if form else ''
+        values = _form_values(form)
+        if head in {'component', 'comp', 'part'}:
+            _add_component_metadata(components, values.get('ref') or values.get('reference'), value=values.get('value'), footprint=values.get('footprint'))
+        if head == 'net':
+            net_name = values.get('name') or values.get('net') or values.get('code')
+            # Prefer the explicit (name ...) child; code is only a fallback for unusual artifacts.
+            if values.get('name'):
+                net_name = values['name']
+            if not net_name:
+                continue
+            for child in form[1:]:
+                if isinstance(child, list) and child and str(child[0]).lower() in {'node', 'pin', 'pad'}:
+                    nv = _form_values(child)
+                    _connect_pin(components, nets, net_name, nv.get('ref') or nv.get('reference') or nv.get('component'), nv.get('pin') or nv.get('pad') or nv.get('number') or nv.get('num'))
+
+
+def _import_connectivity_by_format(fmt: str, text: str, components: Dict[str, PlanComponent], nets: Dict[str, PlanNet]) -> List[str]:
+    before = sum(len(n.pads) for n in nets.values())
+    warnings: List[str] = []
+    try:
+        if fmt == 'json':
+            _extract_json_netlist(json.loads(text), components, nets)
+        elif fmt == 'xml':
+            _extract_xml_netlist(text, components, nets)
+        elif fmt == 'sexp':
+            _extract_sexp_netlist(text, components, nets)
+        else:
+            warnings.append('Could not detect netlist format; connectivity import skipped.')
+    except Exception as exc:
+        warnings.append(f'Failed to parse {fmt} netlist connectivity: {exc}')
+    after = sum(len(n.pads) for n in nets.values())
+    if fmt != 'unknown' and after <= before and not any(n.pads for n in nets.values()):
+        warnings.append(f'{fmt} netlist parsed no pin-to-net connectivity; generated plan quality will be poor.')
+    return warnings
+
 def import_netlist(path: Optional[Path], components: Dict[str, PlanComponent], nets: Dict[str, PlanNet]) -> Tuple[Dict[str, str], AliasDiagnostics, List[str]]:
     if path is None:
         return {}, AliasDiagnostics(), []
     aliases, diagnostics = parse_netlist_aliases(path)
     warnings = list(diagnostics.warnings)
     text = path.read_text(encoding="utf-8")
-    if text.lstrip().startswith(("{", "[")):
-        data = json.loads(text)
-        _extract_connectivity_from_json_obj(data, components, nets)
+    fmt = _detect_netlist_format(text)
+    if diagnostics.parser is None and fmt != "unknown":
+        diagnostics.parser = fmt
+    warnings.extend(_import_connectivity_by_format(fmt, text, components, nets))
+    _clear_imported_net_connectivity(nets)
+    if not any(net.pads for net in nets.values()):
+        warnings.append("Netlist import produced zero connected nets; check that default.net includes component ref/pin nodes.")
     return aliases, diagnostics, warnings
 
 
@@ -619,35 +853,67 @@ def infer_roles(components: Dict[str, PlanComponent], intent: Mapping[str, Any])
             else:
                 comp.role = "resistor"; comp.role_reasons.append("reference prefix indicates resistor")
         elif pref == "U":
-            if "ESP32" in fp or "WIFI" in fp or "ANT" in fp:
-                comp.role = "rf_module"; comp.role_reasons.append("footprint suggests RF/module antenna")
-            elif "BUCK" in fp or "REG" in fp or "LDO" in fp or "REG" in value:
-                comp.role = "power_regulator"; comp.role_reasons.append("value/footprint suggests regulator")
+            if "ESP32" in fp or "WIFI" in fp or "ANT" in fp or "RF" in fp or "MODULE" in fp or any("ANT" in n.upper() for n in nets):
+                comp.role = "rf_module"; comp.role_reasons.append("footprint/net names suggest RF/module antenna")
+            elif "BUCK" in fp or "REG" in fp or "LDO" in fp or "REG" in value or "PMIC" in value or any(n.upper() in {"SW", "FB", "VIN", "VOUT"} for n in nets):
+                comp.role = "power_regulator"; comp.role_reasons.append("value/footprint/nets suggest regulator")
+            elif "MCU" in fp or "MCU" in value or "STM32" in fp or "STM32" in value or "NRF" in value:
+                comp.role = "mcu"; comp.role_reasons.append("value/footprint suggests MCU")
+            elif "HDMI" in fp or "RETIMER" in value or any("TMDS" in n.upper() for n in nets):
+                comp.role = "hdmi_retimer"; comp.role_reasons.append("high-speed TMDS/HDMI nets suggest retimer/interface IC")
             else:
                 comp.role = "ic"; comp.role_reasons.append("reference prefix indicates IC")
         else:
             comp.role = "unknown"; comp.role_reasons.append("no strong role heuristic matched")
 
 
+def _canonical_net(text: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", text.upper()).strip("_")
+
+
+def _diff_pair_key(name: str) -> Optional[Tuple[str, str]]:
+    raw = name.strip()
+    candidates = [(raw, raw.upper()), (_canonical_net(raw), _canonical_net(raw))]
+    patterns = [
+        (r"^(?P<base>.+?)(?:_|-)?P$", "p"),
+        (r"^(?P<base>.+?)(?:_|-)?N$", "n"),
+        (r"^(?P<base>.+?)(?:_|-)?DP$", "p"),
+        (r"^(?P<base>.+?)(?:_|-)?DN$", "n"),
+        (r"^(?P<base>.+?)\+$", "p"),
+        (r"^(?P<base>.+?)-$", "n"),
+        (r"^(?P<base>HDMI.*TMDS.*D[0-2])P$", "p"),
+        (r"^(?P<base>HDMI.*TMDS.*D[0-2])N$", "n"),
+        (r"^(?P<base>TMDS[0-2])P$", "p"),
+        (r"^(?P<base>TMDS[0-2])N$", "n"),
+        (r"^(?P<base>TMDS(?:CLK|CLOCK))P$", "p"),
+        (r"^(?P<base>TMDS(?:CLK|CLOCK))N$", "n"),
+    ]
+    for original, upper in candidates:
+        for pat, polarity in patterns:
+            m = re.match(pat, upper)
+            if m:
+                return re.sub(r"_+$", "", m.group("base")), polarity
+    return None
+
+
 def detect_differential_pairs(nets: Mapping[str, PlanNet]) -> List[DifferentialPair]:
-    names = set(nets)
-    pairs: List[DifferentialPair] = []
-    suffixes = [("_P", "_N"), ("+", "-"), ("P", "N"), ("DP", "DN")]
-    used: set[str] = set()
-    for name in sorted(names):
-        if name in used:
+    grouped: Dict[str, Dict[str, str]] = {}
+    for name in nets:
+        key = _diff_pair_key(name)
+        if not key:
             continue
-        for ps, ns in suffixes:
-            if not name.upper().endswith(ps.upper()):
-                continue
-            base = name[:-len(ps)]
-            candidates = [base + ns, base + ns.lower()]
-            mate = next((c for c in candidates if c in names), None)
-            if mate and (is_high_speed(name) or is_high_speed(mate)):
-                comps = sorted({r for r, _ in nets[name].pads} | {r for r, _ in nets[mate].pads})
-                pairs.append(DifferentialPair(base.rstrip("_+-"), name, mate, comps))
-                used.update({name, mate})
-                break
+        base, polarity = key
+        grouped.setdefault(base, {})[polarity] = name
+    pairs: List[DifferentialPair] = []
+    used: set[str] = set()
+    for base, pn in sorted(grouped.items()):
+        if "p" not in pn or "n" not in pn or pn["p"] in used or pn["n"] in used:
+            continue
+        if not (is_high_speed(pn["p"]) or is_high_speed(pn["n"]) or any(tok in base for tok in ("TMDS", "USB", "HDMI", "DP", "LVDS", "PCIE"))):
+            continue
+        comps = sorted({r for r, _ in nets[pn["p"]].pads} | {r for r, _ in nets[pn["n"]].pads})
+        pairs.append(DifferentialPair(base, pn["p"], pn["n"], comps))
+        used.update({pn["p"], pn["n"]})
     return pairs
 
 
@@ -763,14 +1029,42 @@ def _nearest_pad(parent: PlanComponent, nets: set[str]) -> Optional[str]:
     return pads[0] if pads else None
 
 
-def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanComponent], radius: float = 12.0) -> List[str]:
+def _connected_refs(anchor: PlanComponent, nets: Mapping[str, PlanNet]) -> set[str]:
+    refs: set[str] = set()
+    for net_name in anchor.nets:
+        if is_ground(net_name):
+            continue
+        for ref, _pin in nets.get(net_name, PlanNet(net_name)).pads:
+            if ref != anchor.ref:
+                refs.add(ref)
+    return refs
+
+
+def _alias_groups(aliases: Mapping[str, str]) -> Dict[str, set[str]]:
+    groups: Dict[str, set[str]] = {}
+    for alias, ref in aliases.items():
+        parts = re.split(r"[/.]+", alias.strip("/"))
+        if parts and ref:
+            groups.setdefault(parts[0].upper(), set()).add(_normalize_ref(ref))
+    return groups
+
+
+def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanComponent], nets: Optional[Mapping[str, PlanNet]] = None, aliases: Optional[Mapping[str, str]] = None, radius: float = 12.0) -> List[str]:
     shared = set(anchor.nets)
+    connected = _connected_refs(anchor, nets or {}) if nets else set()
+    alias_refs = set()
+    for refs in _alias_groups(aliases or {}).values():
+        if anchor.ref in refs:
+            alias_refs |= refs
+    support_roles = {"decoupling", "esd_protection", "pullup_pulldown", "series", "clock", "testpoint", "inductor", "ferrite", "capacitor", "resistor"}
     members = [anchor.ref]
     for comp in components.values():
         if comp.ref == anchor.ref or comp.role == "mechanical":
             continue
         dist = math.hypot(anchor.x - comp.x, anchor.y - comp.y)
-        if dist <= radius and (shared & set(comp.nets) or comp.role in {"decoupling", "esd_protection", "pullup_pulldown", "series"}):
+        has_shared_signal = bool((shared & set(comp.nets)) - {n for n in shared if is_ground(n)})
+        is_support = comp.role in support_roles and dist <= radius
+        if comp.ref in connected or comp.ref in alias_refs or has_shared_signal or is_support or (dist <= radius / 2.0 and comp.role != "unknown"):
             members.append(comp.ref)
     return sorted(set(members), key=lambda r: (r != anchor.ref, r))
 
@@ -830,7 +1124,7 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     # Connector/high-speed clusters.
     for comp in components.values():
         if "connector" in comp.role:
-            members = _cluster_members(comp, components, radius=18.0)
+            members = _cluster_members(comp, components, nets, aliases, radius=18.0)
             local_x = max(0.0, min(board.width, comp.x - board.origin_x))
             local_y = max(0.0, min(board.height, comp.y - board.origin_y))
             distances = {
@@ -842,7 +1136,7 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             edge = min(distances, key=distances.get)
             edge_span = board.width if edge in ("left", "right") else board.height
             inset = 2.0
-            name = re.sub(r"[^A-Za-z0-9_]+", "_", comp.role.upper() + "_" + comp.ref)
+            name = re.sub(r"[^A-Za-z0-9_]+", "_", (("IC" if comp.role == "mcu" else comp.role.upper()) + "_" + comp.ref))
             if edge_span > 0 and distances[edge] / edge_span <= 0.25 and distances[edge] > inset:
                 along = local_y if edge in ("left", "right") else local_x
                 placement_kw = "y" if edge in ("left", "right") else "x"
@@ -883,9 +1177,9 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     # IC and power clusters.
     for comp in components.values():
         if comp.role in {"ic", "mcu", "power_regulator", "rf_module", "hdmi_retimer"}:
-            members = _cluster_members(comp, components, radius=12.0)
+            members = _cluster_members(comp, components, nets, aliases, radius=12.0)
             region = "POWER" if comp.role == "power_regulator" and "POWER" in regions else "RF" if comp.role == "rf_module" and "RF" in regions else "CONTROL" if comp.role != "rf_module" and "CONTROL" in regions else None
-            name = re.sub(r"[^A-Za-z0-9_]+", "_", comp.role.upper() + "_" + comp.ref)
+            name = re.sub(r"[^A-Za-z0-9_]+", "_", (("IC" if comp.role == "mcu" else comp.role.upper()) + "_" + comp.ref))
             placement = f'Anchor(x={comp.x - board.origin_x:.3f}, y={comp.y - board.origin_y:.3f}' + (f', region={_q(region)}' if region else '') + ')'
             text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement={placement}, role={_q(comp.role)})'
             rules.append(PlanRule("cluster", text, members, f"{comp.ref} {comp.role} support cluster preserves coarse neighborhood before pin-aware refinements."))
@@ -907,6 +1201,9 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             else:
                 text = f'Decoupling({_q(cap.ref)}, parent={_q(parent.ref)}, distance=2.0, power_net={_q(next(iter(power_nets), None))}, ground_net="GND")'
             rules.append(PlanRule("decoupling", text, [cap.ref, parent.ref], f"{cap.ref} inferred as decoupling: connects {', '.join(cap.nets)} near {parent.ref}."))
+            if pad:
+                near_text = f'NearPad({_q(cap.ref)}, parent={_q(parent.ref)}, pad={_q(pad)}, distance=1.5, role="decoupling")'
+                rules.append(PlanRule("nearpad", near_text, [cap.ref, parent.ref], f"{cap.ref} explicit near-pad refinement for reviewable pin-aware placement."))
             explanations[cap.ref] = {"role": cap.role, "nets": cap.nets, "parent_candidate": parent.ref, "generated_rule": text}
         else:
             uncertain.append(f"{cap.ref} is power-to-ground capacitor but no parent IC candidate was found.")
@@ -920,10 +1217,46 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             explanations[r.ref] = {"role": r.role, "nets": r.nets, "parent_candidate": parent.ref, "generated_rule": text}
     for r in [c for c in components.values() if c.role == "series"]:
         peers = [components[ref] for n in r.nets for ref, _ in nets.get(n, PlanNet(n)).pads if ref in components and ref != r.ref and components[ref].role not in {"resistor", "capacitor"}]
-        if len(peers) >= 2:
-            text = f'Series({_q(r.ref)}, a={_q(peers[0].ref)}, b={_q(peers[1].ref)}, t=0.5, offset=0)'
-            rules.append(PlanRule("series", text, [r.ref, peers[0].ref, peers[1].ref], f"{r.ref} inferred as series component between {peers[0].ref} and {peers[1].ref}."))
+        unique_peers = []
+        for peer in peers:
+            if peer.ref not in {p.ref for p in unique_peers}:
+                unique_peers.append(peer)
+        if len(unique_peers) >= 2:
+            text = f'Series({_q(r.ref)}, a={_q(unique_peers[0].ref)}, b={_q(unique_peers[1].ref)}, t=0.5, offset=0)'
+            rules.append(PlanRule("series", text, [r.ref, unique_peers[0].ref, unique_peers[1].ref], f"{r.ref} inferred as series component between {unique_peers[0].ref} and {unique_peers[1].ref}."))
             explanations[r.ref] = {"role": r.role, "nets": r.nets, "generated_rule": text}
+
+    placed_refs = {ref for rule in rules for ref in rule.refs}
+    anchor_candidates = [c for c in components.values() if c.role in {"ic", "mcu", "hdmi_retimer", "rf_module", "power_regulator", "connector", "high_speed_connector"}]
+    for comp in components.values():
+        if comp.ref in placed_refs or comp.role in {"mechanical", "unknown"}:
+            continue
+        signal_nets = {n for n in comp.nets if not is_ground(n)}
+        parent = _nearest_parent(comp, anchor_candidates, signal_nets) or _nearest_parent(comp, anchor_candidates)
+        if not parent:
+            continue
+        pad = _nearest_pad(parent, signal_nets)
+        if comp.role in {"testpoint", "clock"} and pad:
+            text = f'NearPad({_q(comp.ref)}, parent={_q(parent.ref)}, pad={_q(pad)}, distance=2.0, role={_q(comp.role)})'
+            rules.append(PlanRule("nearpad", text, [comp.ref, parent.ref], f"{comp.ref} support component placed near {parent.ref} pad {pad} from shared connectivity."))
+        elif comp.role in {"inductor", "ferrite"}:
+            peers = [components[ref] for n in signal_nets for ref, _ in nets.get(n, PlanNet(n)).pads if ref in components and ref != comp.ref and components[ref].role not in {"inductor", "ferrite", "capacitor", "resistor"}]
+            if len(peers) >= 2:
+                text = f'Between({_q(comp.ref)}, a={_q(peers[0].ref)}, b={_q(peers[1].ref)}, t=0.5, offset=0, role={_q(comp.role)})'
+                rules.append(PlanRule("between", text, [comp.ref, peers[0].ref, peers[1].ref], f"{comp.ref} inferred as inline magnetic/filter element."))
+            else:
+                text = f'Satellite({_q(comp.ref)}, parent={_q(parent.ref)}, side="auto", distance=2.0, role={_q(comp.role)})'
+                rules.append(PlanRule("satellite", text, [comp.ref, parent.ref], f"{comp.ref} support magnetic/filter element kept near {parent.ref}."))
+        elif comp.role in {"capacitor", "resistor"}:
+            text = f'Satellite({_q(comp.ref)}, parent={_q(parent.ref)}, side="auto", distance=2.5, role={_q(comp.role)})'
+            rules.append(PlanRule("satellite", text, [comp.ref, parent.ref], f"{comp.ref} generic support passive kept near connected anchor {parent.ref}."))
+        if comp.ref in {ref for rule in rules for ref in rule.refs}:
+            explanations.setdefault(comp.ref, {"role": comp.role, "nets": comp.nets, "parent_candidate": parent.ref, "generated_rule": rules[-1].text})
+
+    placed_refs = {ref for rule in rules for ref in rule.refs}
+    unplaced_support = [c.ref for c in components.values() if c.ref not in placed_refs and c.role not in {"mechanical", "unknown"}]
+    if unplaced_support:
+        warnings.append("Support components without generated placement rules require review: " + ", ".join(sorted(unplaced_support)))
 
     roles = {ref: c.role for ref, c in components.items()}
     return Plan(
@@ -1142,8 +1475,8 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
         ("Regions and keepouts", {"region", "keepout"}),
         ("Fixed mechanical placement", {"corner", "fixed"}),
         ("Clusters and routing corridors", {"cluster", "corridor"}),
-        ("Critical pin-aware refinements", {"decoupling", "esd"}),
-        ("Low-priority refinements", {"pullup", "series"}),
+        ("Critical pin-aware refinements", {"decoupling", "esd", "nearpad", "between"}),
+        ("Low-priority refinements", {"pullup", "series", "satellite"}),
     ]
     emitted: set[int] = set()
     for title, kinds in sections:
@@ -1170,17 +1503,34 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
 
 def report(plan: Plan) -> Dict[str, Any]:
     openems = _as_mapping(plan.simulation.get("openems"))
+    placed_refs = {ref for rule in plan.rules for ref in rule.refs if ref in plan.components}
+    unplaced = [ref for ref in plan.components if ref not in placed_refs]
+    single_clusters = sum(1 for c in plan.clusters if len(c.get("members", [])) <= 1)
+    multi_clusters = sum(1 for c in plan.clusters if len(c.get("members", [])) > 1)
+    rule_count = lambda kind: sum(1 for r in plan.rules if r.kind == kind)
+    quality_warnings = list(plan.warnings)
+    if plan.components and len(unplaced) / len(plan.components) > 0.5:
+        quality_warnings.append(f"Most components are unplaced ({len(unplaced)}/{len(plan.components)}); review connectivity and semantic intent.")
     return {
         "components_parsed": len(plan.components),
         "nets_parsed": len(plan.nets),
+        "components_placed": len(placed_refs),
+        "components_unplaced": len(unplaced),
+        "clusters_single_member": single_clusters,
+        "clusters_multi_member": multi_clusters,
+        "diff_pairs_inferred": len(plan.differential_pairs),
+        "generated_decoupling_rules": rule_count("decoupling"),
+        "generated_esd_rules": rule_count("esd"),
+        "generated_pullup_rules": rule_count("pullup"),
+        "generated_series_rules": rule_count("series"),
         "aliases_recovered": plan.aliases,
         "alias_diagnostics": dataclasses.asdict(plan.alias_diagnostics),
         "inferred_roles": plan.roles,
         "inferred_clusters": plan.clusters,
         "inferred_differential_pairs": [dataclasses.asdict(p) for p in plan.differential_pairs],
         "generated_rules": [dataclasses.asdict(r) for r in plan.rules],
-        "warnings": plan.warnings,
-        "unplaced_components": [ref for ref in plan.components if not any(ref in r.refs for r in plan.rules)],
+        "warnings": quality_warnings,
+        "unplaced_components": unplaced,
         "uncertain_inferences": plan.uncertain_inferences,
         "routing": {
             "mode": plan.routing.get("mode"),
@@ -1542,7 +1892,12 @@ def _load_plan_from_inputs(board_path: Path, netlist_path: Optional[Path], pln_p
     intent = unwrap_provenance(raw_intent)
     if isinstance(intent.get("board"), dict):
         b = intent["board"]
-        board = BoardGeometry(width=float(b.get("width", board.width)), height=float(b.get("height", board.height)), origin_x=float(b.get("origin_x", board.origin_x)), origin_y=float(b.get("origin_y", board.origin_y)), source="intent")
+        ox = b.get("origin_x", board.origin_x)
+        oy = b.get("origin_y", board.origin_y)
+        if isinstance(b.get("origin"), list) and len(b["origin"]) >= 2:
+            ox, oy = b["origin"][0], b["origin"][1]
+        board = BoardGeometry(origin_x=float(ox), origin_y=float(oy), width=float(b.get("width", board.width)), height=float(b.get("height", board.height)), source="board.pln")
+        warnings = [w for w in warnings if "footprint extents" not in w]
     plan = generate_plan(board, components, nets, aliases, alias_diag, intent, warnings)
     return plan, raw_intent
 
