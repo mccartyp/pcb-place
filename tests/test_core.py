@@ -1570,3 +1570,66 @@ DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", pad="1", side="auto", dist
     assert "expanded parent bbox" in message
     assert "sides tried" in message
     assert "candidate arrays tried" in message
+
+
+def _scored_candidate_pcb() -> str:
+    def fp(ref: str, kind: str, x: float, y: float, body: float = 1.6, pad: bool = False) -> str:
+        pad_text = '    (pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "F.Cu"))\n' if pad else ''
+        return f'''  (footprint "Test:{kind}" (layer "F.Cu")
+    (at {x} {y} 0)
+    (property "Reference" "{ref}" (at 0 0 0) (layer "F.SilkS"))
+    (fp_rect (start {-body/2} {-body/2}) (end {body/2} {body/2}) (stroke (width 0.1) (type solid)) (fill none) (layer "F.SilkS"))
+{pad_text}  )
+'''
+    return '(kicad_pcb (version 20240108) (generator "pcb-place-test")\n' + ''.join([
+        fp('U1', 'U', 1.5, 10, body=2.0, pad=True),
+        fp('C1', 'C', 0, 0),
+        fp('C2', 'C', 0, 0),
+        fp('C3', 'C', 0, 0),
+        fp('C4', 'C', 0, 0),
+        fp('C5', 'C', 0, 0),
+    ]) + ')\n'
+
+
+def test_scored_auto_chooses_inward_side_near_board_edge(tmp_path):
+    ppl = tmp_path / "inward.ppl"
+    ppl.write_text('''
+Board(width=20, height=20)
+Anchor("U1", x=1.5, y=10, rot=0)
+Satellite("C1", parent="U1", side="auto", distance=2.0, rot=0)
+''')
+    _out, _messages, report = apply_placements(_scored_candidate_pcb(), load_ppl(ppl), strict=True)
+    placement = next(p for p in report["placements"] if p["ref"] == "C1")
+    assert placement["x"] > 1.5
+    search = report["placement_search"]["C1"]
+    assert search["winning_score"] == search["chosen"]["score"]
+    assert search["top_rejected_candidates"]
+
+
+def test_scored_decoupling_array_chooses_staggered_dense_layout(tmp_path):
+    ppl = tmp_path / "dense.ppl"
+    ppl.write_text('''
+Board(width=9, height=20)
+Anchor("U1", x=4.5, y=6, rot=0)
+DecouplingArray(["C1", "C2", "C3", "C4"], parent="U1", side="bottom", distance=0.4, spacing=2.5, stagger=True, rot=0)
+''')
+    _out, _messages, report = apply_placements(_scored_candidate_pcb(), load_ppl(ppl), strict=True)
+    search = report["placement_search"]["C1"]
+    assert search["chosen"]["metadata"]["shape"] == "stagger"
+    assert search["chosen"]["metadata"]["side"] == "bottom"
+    assert {"side", "distance", "shift", "shape", "staggered"} <= set(search["chosen"]["metadata"])
+
+
+def test_scored_search_avoids_parent_bbox(tmp_path):
+    ppl = tmp_path / "parent_bbox.ppl"
+    ppl.write_text('''
+Board(width=25, height=25)
+Anchor("U1", x=10, y=10, rot=0)
+Satellite("C1", parent="U1", side="right", distance=0.1, rot=0)
+''')
+    _out, _messages, report = apply_placements(_scored_candidate_pcb().replace('(at 1.5 10 0)', '(at 10 10 0)'), load_ppl(ppl), strict=True)
+    u = next(p for p in report["placements"] if p["ref"] == "U1")
+    c = next(p for p in report["placements"] if p["ref"] == "C1")
+    assert abs(c["x"] - u["x"]) > 1.0
+    rejected_reasons = [item["reason"] for item in report["placement_search"]["C1"]["rejected_candidates"]]
+    assert any("parent bbox" in str(reason) or "collision with U1" in str(reason) for reason in rejected_reasons)

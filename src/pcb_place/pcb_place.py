@@ -211,9 +211,14 @@ class SearchCandidate:
     clearance_margin: Optional[float]
     edge_distance: Optional[float]
     score: float
+    routing_penalty: float = 0.0
+    region_penalty: float = 0.0
+    shape_penalty: float = 0.0
+    high_speed_penalty: float = 0.0
+    metadata: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def as_report(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "x": round(self.x, 6),
             "y": round(self.y, 6),
             "label": self.label,
@@ -222,8 +227,15 @@ class SearchCandidate:
             "distance": round(self.distance, 6),
             "clearance_margin": None if self.clearance_margin is None else round(self.clearance_margin, 6),
             "edge_distance": None if self.edge_distance is None else round(self.edge_distance, 6),
+            "routing_penalty": round(self.routing_penalty, 6),
+            "region_penalty": round(self.region_penalty, 6),
+            "shape_penalty": round(self.shape_penalty, 6),
+            "high_speed_penalty": round(self.high_speed_penalty, 6),
             "score": round(self.score, 6),
         }
+        if self.metadata:
+            payload["metadata"] = self.metadata
+        return payload
 
 
 @dataclasses.dataclass
@@ -256,8 +268,10 @@ class SearchOutcome:
         return {
             "target": {"x": self.target[0], "y": self.target[1]},
             "chosen": None if self.chosen is None else self.chosen.as_report(),
+            "winning_score": None if self.chosen is None else round(self.chosen.score, 6),
             "attempted_candidates": [c.as_report() for c in self.attempted],
             "rejected_candidates": [c.as_report() for c in self.rejected],
+            "top_rejected_candidates": [c.as_report() for c in sorted(self.rejected, key=lambda c: c.score)[:5]],
             "best_candidate": None if best is None else best.as_report(),
             "nearest_legal_location": None if nearest is None else nearest.as_report(),
             "search_radius_used": self.search_radius_used,
@@ -1677,6 +1691,35 @@ def _board_contains_bbox(geometry: Optional[BoardGeometry], bbox: BBox, *, eps: 
             geometry.min_y - eps <= bbox.min_y and bbox.max_y <= geometry.max_y + eps)
 
 
+def _point_segment_distance(point: Point, a: Point, b: Point) -> float:
+    px, py = point
+    ax, ay = a
+    bx, by = b
+    vx, vy = bx - ax, by - ay
+    length_sq = vx * vx + vy * vy
+    if length_sq <= 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * vx + (py - ay) * vy) / length_sq))
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def _bbox_intrudes_corridor(bbox: BBox, a: Point, b: Point, width: float) -> bool:
+    """Conservative bbox-vs-segment corridor test used as a soft routing penalty."""
+
+    if width <= 0:
+        return False
+    half = width / 2.0
+    corners = [(bbox.min_x, bbox.min_y), (bbox.min_x, bbox.max_y),
+               (bbox.max_x, bbox.min_y), (bbox.max_x, bbox.max_y)]
+    if any(_point_segment_distance(corner, a, b) <= half for corner in corners):
+        return True
+    if bbox.min_x <= a[0] <= bbox.max_x and bbox.min_y <= a[1] <= bbox.max_y:
+        return True
+    if bbox.min_x <= b[0] <= bbox.max_x and bbox.min_y <= b[1] <= bbox.max_y:
+        return True
+    return False
+
+
 def _rect_to_abs_bbox(model: PlacementModel, item: Mapping[str, Any]) -> BBox:
     x0, y0 = _board_to_abs(model, float(item["x"]), float(item["y"]))
     return BBox(x0, y0, x0 + float(item["w"]), y0 + float(item["h"]))
@@ -2127,7 +2170,7 @@ class PlacementEngine:
     # Unit vectors for the four cardinal placement sides. "top"/"bottom" point toward
     # decreasing/increasing y because KiCad y increases downward on the board.
     _SIDE_VECTORS: Dict[str, Point] = {"right": (1.0, 0.0), "left": (-1.0, 0.0), "top": (0.0, -1.0), "bottom": (0.0, 1.0)}
-    _NEARPAD_OFFSETS: Tuple[float, ...] = (0.0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0)
+    _NEARPAD_OFFSETS: Tuple[float, ...] = (0.0, 0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0, 3.0, -3.0)
 
     def _edge_distance(self, bbox: BBox) -> Optional[float]:
         """Distance from bbox to the nearest board edge, or None if board geometry is unknown."""
@@ -2138,7 +2181,8 @@ class PlacementEngine:
         return min(bbox.min_x - g.min_x, g.max_x - bbox.max_x, bbox.min_y - g.min_y, g.max_y - bbox.max_y)
 
     def _clearance_margin(self, ref: str, x: float, y: float, rot: float,
-                          clearance_override: Optional[float], allow_keepout_overlap: bool) -> Optional[float]:
+                          clearance_override: Optional[float], allow_keepout_overlap: bool,
+                          forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None) -> Optional[float]:
         """Smallest clearance margin to obstacles, keepouts, and the board edge (positive is safe)."""
 
         if ref not in self.footprints:
@@ -2157,6 +2201,9 @@ class PlacementEngine:
             if required is None:
                 required = self.model.clearance.required_for(_part_class_for(self.model, ref), _part_class_for(self.model, other))
             margins.append(info.bbox.clearance_to(other_info.bbox) - required)
+        if forbidden_bboxes:
+            for _name, bbox in forbidden_bboxes:
+                margins.append(info.bbox.clearance_to(bbox))
         if not allow_keepout_overlap:
             for keepout in keepout_rules(self.model):
                 if bool(keepout.get("extra", {}).get("allow_keepout_overlap", False)):
@@ -2164,27 +2211,96 @@ class PlacementEngine:
                 margins.append(info.bbox.clearance_to(_rect_to_abs_bbox(self.model, keepout)))
         return min(margins) if margins else None
 
+    def _corridor_penalty(self, ref: str, bbox: BBox) -> float:
+        """Soft penalty for entering declared high-speed corridors unless this part is protection."""
+
+        roles = {_part_class_for(self.model, ref).lower()}
+        for rule in self.model.rules:
+            rule_refs: List[str] = []
+            if rule.get("ref") is not None:
+                rule_refs.append(str(rule.get("ref")))
+            rule_refs.extend(str(r) for r in rule.get("refs", []) or [])
+            if ref in {self.resolve_ref(r) or r for r in rule_refs}:
+                role_value = rule.get("role") or rule.get("extra", {}).get("role")
+                if role_value is not None:
+                    roles.add(str(role_value).lower().replace("-", "_"))
+        if roles & {"esd", "protection", "tvs", "surge_protection"}:
+            return 0.0
+        ref_upper = ref.upper()
+        if ref_upper.startswith(("D", "TVS", "ESD")):
+            return 0.0
+        penalty = 0.0
+        for rule in self.model.rules:
+            if rule.get("type") != "corridor":
+                continue
+            marker = " ".join(str(rule.get(k, "")) for k in ("name", "role", "note")).lower()
+            if not any(token in marker for token in ("high", "hs", "usb", "diff", "rf")):
+                continue
+            a_ref = self.resolve_ref(str(rule.get("a")))
+            b_ref = self.resolve_ref(str(rule.get("b")))
+            if a_ref not in self.positions or b_ref not in self.positions:
+                continue
+            ax, ay, _ = self.positions[a_ref]
+            bx, by, _ = self.positions[b_ref]
+            width = float(rule.get("width", 0.0)) + 2.0 * float(rule.get("clearance", 0.0))
+            if _bbox_intrudes_corridor(bbox, (ax, ay), (bx, by), width):
+                penalty += 25.0
+        return penalty
+
+    def _shape_penalty_for_label(self, label: str) -> float:
+        penalty = 0.0
+        if "stagger" in label and "stagger=False" not in label:
+            penalty += 0.35
+        if "row" in label or "column" in label:
+            penalty += 0.05
+        if "fallback" in label:
+            penalty += 5.0
+        if "slide" in label or "radial" in label:
+            penalty += 0.25
+        return penalty
+
     def _evaluate_candidate(self, ref: str, x: float, y: float, rot: float, target: Point, label: str,
                             *, clearance_override: Optional[float], region: Optional[BBox],
-                            allow_keepout_overlap: bool) -> SearchCandidate:
-        """Score a single candidate location for legality, distance, clearance, and edge margin."""
+                            allow_keepout_overlap: bool,
+                            forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None,
+                            metadata: Optional[Dict[str, Any]] = None) -> SearchCandidate:
+        """Score a single candidate location for legality, distance, clearance, routing, and simplicity."""
 
         reason = self._collides_at(ref, x, y, rot, clearance_override=clearance_override,
-                                   region=region, allow_keepout_overlap=allow_keepout_overlap)
+                                   region=region, allow_keepout_overlap=allow_keepout_overlap,
+                                   forbidden_bboxes=forbidden_bboxes)
         legal = reason is None
         distance = math.hypot(x - target[0], y - target[1])
-        margin = self._clearance_margin(ref, x, y, rot, clearance_override, allow_keepout_overlap)
+        margin = self._clearance_margin(ref, x, y, rot, clearance_override, allow_keepout_overlap, forbidden_bboxes)
         edge = None
+        routing_penalty = 0.0
+        region_penalty = 0.0
+        high_speed_penalty = 0.0
         if ref in self.footprints:
             info = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model)
             edge = self._edge_distance(info.bbox)
-        score = distance - 0.01 * (margin if margin is not None else 0.0) - 0.01 * (edge if edge is not None else 0.0)
-        return SearchCandidate(x, y, label, legal, reason, distance, margin, edge, score)
+            # Prefer orthogonal/simple routing from the requested target over diagonal detours.
+            dx, dy = abs(x - target[0]), abs(y - target[1])
+            routing_penalty = min(dx, dy) * 0.15
+            if region is not None and region.contains_bbox(info.bbox):
+                region_penalty = 0.0
+            elif region is not None:
+                region_penalty = 100.0
+            high_speed_penalty = self._corridor_penalty(ref, info.bbox)
+        shape_penalty = self._shape_penalty_for_label(label)
+        clearance_reward = min(max(margin if margin is not None else 0.0, -5.0), 5.0) * 0.35
+        edge_reward = min(max(edge if edge is not None else 0.0, -5.0), 5.0) * 0.05
+        score = distance + routing_penalty + region_penalty + shape_penalty + high_speed_penalty - clearance_reward - edge_reward
+        if not legal:
+            score += 1000.0
+        return SearchCandidate(x, y, label, legal, reason, distance, margin, edge, score,
+                               routing_penalty, region_penalty, shape_penalty, high_speed_penalty, metadata or {})
 
     def _search_candidates(self, ref: str, target: Point, rot: float, points: Sequence[Tuple[float, float, str]],
                            *, clearance_override: Optional[float], region: Optional[BBox],
                            allow_keepout_overlap: bool, search_radius_used: float,
-                           fallback_used: bool = False) -> SearchOutcome:
+                           fallback_used: bool = False,
+                           forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None) -> SearchOutcome:
         """Evaluate candidate points and choose the lowest-cost legal one. Records diagnostics on self.search_log."""
 
         attempted: List[SearchCandidate] = []
@@ -2196,7 +2312,8 @@ class PlacementEngine:
             seen.add(key)
             attempted.append(self._evaluate_candidate(ref, x, y, rot, target, label,
                                                        clearance_override=clearance_override, region=region,
-                                                       allow_keepout_overlap=allow_keepout_overlap))
+                                                       allow_keepout_overlap=allow_keepout_overlap,
+                                                       forbidden_bboxes=forbidden_bboxes))
         legal = [c for c in attempted if c.legal]
         chosen = min(legal, key=lambda c: c.score) if legal else None
         outcome = SearchOutcome(ref, target, attempted, chosen, search_radius_used, fallback_used)
@@ -2205,12 +2322,14 @@ class PlacementEngine:
 
     def _mark_fallback(self, outcome: SearchOutcome, ref: str, x: float, y: float, rot: float,
                        *, clearance_override: Optional[float], region: Optional[BBox],
-                       allow_keepout_overlap: bool) -> SearchOutcome:
+                       allow_keepout_overlap: bool,
+                       forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None) -> SearchOutcome:
         """Append a generic grid-search fallback candidate and mark the outcome as having used it."""
 
         candidate = self._evaluate_candidate(ref, x, y, rot, outcome.target, "fallback_grid_search",
                                              clearance_override=clearance_override, region=region,
-                                             allow_keepout_overlap=allow_keepout_overlap)
+                                             allow_keepout_overlap=allow_keepout_overlap,
+                                             forbidden_bboxes=forbidden_bboxes)
         attempted = outcome.attempted + [candidate]
         chosen = candidate if candidate.legal else outcome.chosen
         new_outcome = SearchOutcome(ref, outcome.target, attempted, chosen, outcome.search_radius_used, True)
@@ -2288,7 +2407,7 @@ class PlacementEngine:
         points: List[Tuple[float, float, str]] = []
         sides_order = [side] + [s for s in ("right", "left", "top", "bottom") if s != side]
         for s_index, s in enumerate(sides_order):
-            slots = [0, -1, 1, -2, 2] if s_index == 0 else (0,)
+            slots = [0, -1, 1, -2, 2, -3, 3] if s_index == 0 else (0, -1, 1)
             for k in slots:
                 bx, by = self._satellite_base(px, py, s, dist, idx + k, pitch)
                 label = s if k == 0 else f"{s}:idx{idx + k}"
@@ -2297,7 +2416,7 @@ class PlacementEngine:
             vx, vy = self._SIDE_VECTORS[s]
             tx, ty = -vy, vx
             bx, by = self._satellite_base(px, py, s, dist, 0, pitch)
-            for off in (0.5, -0.5, 1.0, -1.0, 2.0, -2.0):
+            for off in (0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0, 3.0, -3.0):
                 points.append((bx + tx * off + dx, by + ty * off + dy, f"{s}{off:+g}"))
         return points
 
@@ -2315,11 +2434,11 @@ class PlacementEngine:
         length = math.hypot(vx, vy) or 1.0
         nx, ny = -vy / length, vx / length
         offsets = [base_offset]
-        for d in (0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0):
+        for d in (0.25, -0.25, 0.5, -0.5, 0.75, -0.75, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0, 3.0, -3.0):
             offsets.append(base_offset + d)
         t_values = [t0]
         if auto_spread:
-            for dt in (0.08, -0.08, 0.16, -0.16, 0.24, -0.24):
+            for dt in (0.04, -0.04, 0.08, -0.08, 0.12, -0.12, 0.16, -0.16, 0.24, -0.24, 0.32, -0.32):
                 t_values.append(max(0.0, min(1.0, t0 + dt)))
         points: List[Tuple[float, float, str]] = []
         for ti in t_values:
@@ -2350,6 +2469,17 @@ class PlacementEngine:
         return (sum(p[0] for p in abs_centers) / len(abs_centers),
                 sum(p[1] for p in abs_centers) / len(abs_centers))
 
+
+    def _parent_forbidden_bboxes(self, parent_ref: Optional[str], *, clearance: float = 0.0) -> List[Tuple[str, BBox]]:
+        if parent_ref is None:
+            return []
+        actual_parent = self.resolve_ref(parent_ref) or parent_ref
+        if actual_parent not in self.footprints or actual_parent not in self.positions:
+            return []
+        px, py, prot = self.positions[actual_parent]
+        bbox = footprint_bbox_at(self.footprints[actual_parent], px, py, prot, self.model).bbox.expanded(clearance)
+        return [(f"parent bbox {actual_parent}", bbox)]
+
     def _place_near_point(self, rule: Mapping[str, Any], origin: Point, why: str) -> None:
         actual_ref = self.resolve_ref(rule["ref"])
         if actual_ref is None:
@@ -2378,12 +2508,14 @@ class PlacementEngine:
         region = None if self.allow_outside_region else self._region_bbox(self._rule_value(rule, "region"))
         clearance_override = self._clearance_override(dict(rule))
         allow_keepout_overlap = self.allow_keepout_overlap or self._rule_flag(rule, "allow_keepout_overlap", False)
+        forbidden_bboxes = self._parent_forbidden_bboxes(str(rule.get("parent")) if rule.get("parent") else None)
         search_radius = distance + max(abs(o) for o in self._NEARPAD_OFFSETS)
 
         outcome = self._search_candidates(actual_ref, (primary_x, primary_y), eval_rot, points,
                                           clearance_override=clearance_override, region=region,
                                           allow_keepout_overlap=allow_keepout_overlap,
-                                          search_radius_used=search_radius)
+                                          search_radius_used=search_radius,
+                                          forbidden_bboxes=forbidden_bboxes)
         chosen = outcome.chosen
         if chosen is None:
             fallback = self._find_non_overlapping_position(actual_ref, primary_x, primary_y, eval_rot,
@@ -2393,7 +2525,8 @@ class PlacementEngine:
             if fallback is not None:
                 outcome = self._mark_fallback(outcome, actual_ref, fallback[0], fallback[1], eval_rot,
                                               clearance_override=clearance_override, region=region,
-                                              allow_keepout_overlap=allow_keepout_overlap)
+                                              allow_keepout_overlap=allow_keepout_overlap,
+                                              forbidden_bboxes=forbidden_bboxes)
                 chosen = outcome.chosen
         if chosen is None:
             raise PlacementError(self._format_search_failure(actual_ref, why, outcome, requested=(primary_x, primary_y)))
@@ -2428,12 +2561,14 @@ class PlacementEngine:
         region = None if self.allow_outside_region else self._region_bbox(self._rule_value(rule, "region"))
         clearance_override = self._clearance_override(dict(rule))
         allow_keepout_overlap = self.allow_keepout_overlap or self._rule_flag(rule, "allow_keepout_overlap", False)
+        forbidden_bboxes = self._parent_forbidden_bboxes(str(rule.get("parent")) if rule.get("parent") else None)
         search_radius = dist + abs(idx) * pitch + 2.0
 
         outcome = self._search_candidates(actual_ref, (primary_x, primary_y), eval_rot, points,
                                           clearance_override=clearance_override, region=region,
                                           allow_keepout_overlap=allow_keepout_overlap,
-                                          search_radius_used=search_radius)
+                                          search_radius_used=search_radius,
+                                          forbidden_bboxes=forbidden_bboxes)
         chosen = outcome.chosen
         if chosen is None:
             fallback = self._find_non_overlapping_position(actual_ref, primary_x, primary_y, eval_rot,
@@ -2443,7 +2578,8 @@ class PlacementEngine:
             if fallback is not None:
                 outcome = self._mark_fallback(outcome, actual_ref, fallback[0], fallback[1], eval_rot,
                                               clearance_override=clearance_override, region=region,
-                                              allow_keepout_overlap=allow_keepout_overlap)
+                                              allow_keepout_overlap=allow_keepout_overlap,
+                                              forbidden_bboxes=forbidden_bboxes)
                 chosen = outcome.chosen
         if chosen is None:
             raise PlacementError(self._format_search_failure(actual_ref, "satellite", outcome, requested=(primary_x, primary_y)))
@@ -2641,6 +2777,46 @@ class PlacementEngine:
             for actual, pos in saved.items():
                 self.positions[actual] = pos
 
+
+    def _score_grouped_array_attempt(self, refs: Sequence[str], actual_refs: Sequence[Optional[str]],
+                                     candidates: Sequence[Tuple[float, float]], rot: Optional[float],
+                                     target: Point, label: str, result: Mapping[str, Any],
+                                     metadata: Dict[str, Any]) -> SearchCandidate:
+        anchor = candidates[len(candidates) // 2] if candidates else target
+        legal = bool(result.get("ok"))
+        distances = [math.hypot(x - target[0], y - target[1]) for x, y in candidates] or [0.0]
+        distance = sum(distances) / len(distances)
+        margins: List[float] = []
+        edge_values: List[float] = []
+        hs_penalty = 0.0
+        for actual, (x, y) in zip(actual_refs, candidates):
+            if actual is None or actual not in self.footprints:
+                continue
+            eval_rot = rot if rot is not None else self.positions[actual][2]
+            margin = self._clearance_margin(actual, x, y, eval_rot, None, False)
+            if margin is not None:
+                margins.append(margin)
+            info = footprint_bbox_at(self.footprints[actual], x, y, eval_rot, self.model)
+            edge = self._edge_distance(info.bbox)
+            if edge is not None:
+                edge_values.append(edge)
+            hs_penalty += self._corridor_penalty(actual, info.bbox)
+        margin = min(margins) if margins else None
+        edge = min(edge_values) if edge_values else None
+        shape_penalty = self._shape_penalty_for_label(label)
+        if metadata.get("shape") == "stagger":
+            shape_penalty += 0.35
+        if metadata.get("shape") in {"row", "column"}:
+            shape_penalty += 0.05
+        shape_penalty += float(metadata.get("side_rank", 0)) * 2.0
+        clearance_reward = min(max(margin if margin is not None else 0.0, -5.0), 5.0) * 0.35
+        edge_reward = min(max(edge if edge is not None else 0.0, -5.0), 5.0) * 0.05
+        score = distance + shape_penalty + hs_penalty - clearance_reward - edge_reward
+        if not legal:
+            score += 1000.0
+        return SearchCandidate(anchor[0], anchor[1], label, legal, None if legal else str(result.get("reason")),
+                               distance, margin, edge, score, 0.0, 0.0, shape_penalty, hs_penalty, metadata)
+
     def place_array_near_target(self, rule: Mapping[str, Any], refs: Sequence[str], origin: Point,
                                 why: str, *, parent_ref: Optional[str] = None,
                                 pad_origin: Optional[Point] = None) -> None:
@@ -2690,9 +2866,10 @@ class PlacementEngine:
             actual_refs.append(actual)
 
         attempts: List[Dict[str, Any]] = []
-        succeeded: Optional[List[Tuple[float, float]]] = None
-        distances = [distance + delta for delta in (0.0, 1.0, 2.0, 3.0)]
-        shifts = [0.0, spacing / 2.0, -spacing / 2.0, spacing, -spacing, 2.0 * spacing, -2.0 * spacing]
+        scored_attempts: List[SearchCandidate] = []
+        chosen_attempt: Optional[Dict[str, Any]] = None
+        distances = [distance + delta for delta in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0)]
+        shifts = [0.0, spacing / 2.0, -spacing / 2.0, spacing, -spacing, 1.5 * spacing, -1.5 * spacing, 2.0 * spacing, -2.0 * spacing]
         stagger_options = [False, True] if stagger_requested else [False]
         for dist in distances:
             for side_name in sides:
@@ -2706,19 +2883,32 @@ class PlacementEngine:
                             refs, actual_refs, candidates, rot, clearance_override=clearance_override,
                             region=region, allow_keepout_overlap=allow_keepout_overlap,
                             parent_expanded=parent_expanded)
-                        attempts.append({"side": side_name, "distance": dist, "shift": shift,
-                                         "staggered": staggered,
-                                         "anchor": candidates[len(candidates) // 2] if candidates else side_origin,
-                                         "candidates": candidates, **result})
-                        if result["ok"]:
-                            succeeded = candidates
-                            break
-                    if succeeded is not None:
-                        break
-                if succeeded is not None:
-                    break
-            if succeeded is not None:
-                break
+                        rows = max(1, math.ceil(n / (max_per_row or min(3, max(1, math.ceil(n / 2))) if staggered else n)))
+                        shape = "stagger" if staggered else ("column" if side_name in {"left", "right"} else "row")
+                        metadata = {"side": side_name, "distance": round(dist, 6), "shift": round(shift, 6),
+                                    "staggered": staggered, "shape": shape, "side_rank": sides.index(side_name), "rows": rows,
+                                    "columns": max_per_row or (min(3, max(1, math.ceil(n / 2))) if staggered else n),
+                                    "candidate_count": len(candidates)}
+                        label = (f"side={side_name},distance={dist:g},shape={shape},"
+                                 f"stagger={staggered},shift={shift:g}")
+                        scored = self._score_grouped_array_attempt(refs, actual_refs, candidates, rot,
+                                                                   side_origin, label, result, metadata)
+                        attempt = {"side": side_name, "distance": dist, "shift": shift,
+                                   "staggered": staggered, "shape": shape,
+                                   "anchor": candidates[len(candidates) // 2] if candidates else side_origin,
+                                   "candidates": candidates, "score": scored.score, **result}
+                        attempts.append(attempt)
+                        scored_attempts.append(scored)
+                        if scored.legal and (chosen_attempt is None or scored.score < float(chosen_attempt["score"])):
+                            chosen_attempt = attempt
+
+        chosen_score = min((c for c in scored_attempts if c.legal), key=lambda c: c.score, default=None)
+        if scored_attempts:
+            outcome = SearchOutcome(refs[0], side_origin, scored_attempts, chosen_score, max(distances), False)
+            for ref in refs:
+                actual = self.resolve_ref(ref) or ref
+                self.search_log[actual] = outcome
+        succeeded: Optional[List[Tuple[float, float]]] = None if chosen_attempt is None else list(chosen_attempt["candidates"])
 
         rejected_by_side: Set[str] = set()
         for attempt in attempts:
@@ -2769,7 +2959,8 @@ class PlacementEngine:
         self.place_array_near_target(rule, refs, origin, why, parent_ref=str(rule.get("parent")), pad_origin=pad_origin)
 
     def _collides_at(self, ref: str, x: float, y: float, rot: float, *, clearance_override: Optional[float] = None,
-                    region: Optional[BBox] = None, allow_keepout_overlap: bool = False) -> Optional[str]:
+                    region: Optional[BBox] = None, allow_keepout_overlap: bool = False,
+                    forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None) -> Optional[str]:
         if ref not in self.footprints:
             return None
         test_info = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model)
@@ -2777,6 +2968,10 @@ class PlacementEngine:
             return "would leave board bounds"
         if region is not None and not region.contains_bbox(test_info.bbox):
             return "would leave region"
+        if forbidden_bboxes:
+            for name, bbox in forbidden_bboxes:
+                if test_info.bbox.overlaps(bbox):
+                    return f"would overlap {name}"
         if not allow_keepout_overlap:
             for keepout in keepout_rules(self.model):
                 if bool(keepout.get("extra", {}).get("allow_keepout_overlap", False)):
@@ -3415,6 +3610,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-aliases", action="store_true", help="List semantic aliases parsed from --netlist and exit")
     parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --list-refs or --list-aliases")
     parser.add_argument("--report-json", type=Path, help="Write machine-readable placement report JSON")
+    parser.add_argument("--explain-placement", metavar="REF", help="Print scored placement-candidate explanation for REF")
     parser.add_argument("--version", action="version", version=f"pcb-place {__version__}")
     return parser
 
@@ -3488,6 +3684,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.report_json:
         args.report_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"report: {args.report_json}")
+    if args.explain_placement:
+        ref = report.get("effective_aliases", {}).get(args.explain_placement, args.explain_placement)
+        explanation = report.get("placement_search", {}).get(ref)
+        if explanation is None:
+            print(json.dumps({"ref": ref, "error": "no scored placement search recorded"}, indent=2, sort_keys=True))
+        else:
+            print(json.dumps({"ref": ref, **explanation}, indent=2, sort_keys=True))
 
     changed = new_text != source_text
     if args.validate:
