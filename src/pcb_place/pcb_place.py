@@ -697,6 +697,22 @@ def _walk_sexp(node: Any) -> Iterable[List[Any]]:
             yield from _walk_sexp(item)
 
 
+def _sexp_child_atom(form: List[Any], key: str) -> Optional[str]:
+    """Return the first scalar child value with the requested S-expression key."""
+
+    key = key.lower()
+    for item in form[1:]:
+        if (
+            isinstance(item, list)
+            and len(item) >= 2
+            and isinstance(item[0], str)
+            and item[0].lower() == key
+            and not isinstance(item[1], list)
+        ):
+            return str(item[1])
+    return None
+
+
 def _parse_sexp_netlist(text: str) -> Tuple[Dict[str, str], List[str]]:
     tree = _parse_sexp(_sexp_tokens(text))
     aliases: Dict[str, str] = {}
@@ -704,12 +720,20 @@ def _parse_sexp_netlist(text: str) -> Tuple[Dict[str, str], List[str]]:
     path_names = {k.lower() for k in _PATH_KEYS}
     ref_names = {k.lower() for k in _REF_KEYS}
     for form in _walk_sexp(tree):
+        head = str(form[0]).lower() if form and isinstance(form[0], str) else ""
         values: Dict[str, str] = {}
         for item in form[1:]:
             if isinstance(item, list) and len(item) >= 2 and isinstance(item[0], str):
                 key = item[0].lower()
                 if key in path_names | ref_names and not isinstance(item[1], list):
                     values[key] = str(item[1])
+                # KiCad netlist exports store hierarchical component names as
+                # (comp (ref "C1") ... (sheetpath (names "FLASH.C") ...)).
+                # Treat that sheet path as the semantic alias for the comp ref.
+                elif head in {"component", "comp"} and key == "sheetpath":
+                    names = _sexp_child_atom(item, "names")
+                    if names:
+                        values.setdefault("path", names)
         ref = next((values[k] for k in ref_names if k in values and _looks_like_ref(values[k])), None)
         semantic = next((values[k] for k in path_names if k in values), None)
         if ref is not None and semantic is not None:
