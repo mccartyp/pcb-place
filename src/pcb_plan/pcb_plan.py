@@ -40,7 +40,7 @@ from pcb_place import (
     parse_netlist_aliases,
 )
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 Point = Tuple[float, float]
 _POWER_RE = re.compile(r"^(?:\+?(?:1V[0-9]|1V[0-9]|[0-9]+V[0-9]*|VCC|VDD|VBAT|VIN|VBUS|AVDD|DVDD|PVDD|3V3|5V|12V))", re.I)
@@ -50,6 +50,112 @@ _HIGHSPEED_RE = re.compile(r"(?:TMDS|HDMI|USB|DP|DN|D\+|D-|SSTX|SSRX|PCIE|PCIe|L
 _ALLOWED_VIA_POLICIES = {"avoid", "allow", "constrained", "forbid"}
 _ALLOWED_ROUTING_MODES = {"low_speed_only", "all_nets_constrained", "experimental_high_speed"}
 _HIGH_SPEED_CLASS_HINTS = ("high_speed", "diff", "rf", "clock", "hdmi", "usb", "pcie", "lvds")
+
+# Conservative default part-to-part spacing profile (mm). Overridable via the
+# board.pln `spacing:` section; never defaults to essentially-touching parts.
+DEFAULT_SPACING_PROFILE: Dict[str, float] = {
+    "default": 0.25,
+    "passive_to_passive": 0.25,
+    "passive_to_ic": 0.40,
+    "ic_to_ic": 0.75,
+    "connector_to_component": 1.00,
+    "mechanical_to_component": 1.00,
+}
+
+_STACKUP_IMPEDANCE_WARNING = (
+    "Stackup template applied: layer roles/reference planes are placement/routing intent only. "
+    "Controlled impedance requires the actual fabricator stackup; do not trust template "
+    "thickness/er values for impedance."
+)
+
+# Reusable conservative stackup templates. These set layer roles and likely
+# reference planes for placement/routing intent; impedance always requires
+# fab-specific validation.
+STACKUP_PROFILES: Dict[str, Dict[str, Any]] = {
+    "2_layer_basic": {
+        "layers": [
+            {"name": "F.Cu", "type": "signal"},
+            {"name": "B.Cu", "type": "mixed"},
+        ],
+        "reference_planes": [],
+        "high_speed_preferred_layers": ["F.Cu"],
+        "power_planes": [],
+        "notes": "2-layer basic: no dedicated planes; route ground pours generously; "
+                 "high-speed interfaces are discouraged without careful return-path planning.",
+    },
+    "4_layer_signal_gnd_pwr_signal": {
+        "layers": [
+            {"name": "F.Cu", "type": "signal"},
+            {"name": "In1.GND", "type": "plane", "net": "GND"},
+            {"name": "In2.PWR", "type": "plane"},
+            {"name": "B.Cu", "type": "signal"},
+        ],
+        "reference_planes": ["In1.GND"],
+        "high_speed_preferred_layers": ["F.Cu"],
+        "power_planes": ["In2.PWR"],
+        "notes": "4-layer SIG/GND/PWR/SIG: route high-speed on F.Cu over In1.GND; "
+                 "B.Cu references the power plane and is second choice for high-speed.",
+    },
+    "6_layer_high_speed": {
+        "layers": [
+            {"name": "F.Cu", "type": "signal"},
+            {"name": "In1.GND", "type": "plane", "net": "GND"},
+            {"name": "In2.PWR", "type": "plane"},
+            {"name": "In3.SIG", "type": "signal"},
+            {"name": "In4.GND", "type": "plane", "net": "GND"},
+            {"name": "B.Cu", "type": "signal"},
+        ],
+        "reference_planes": ["In1.GND", "In4.GND"],
+        "high_speed_preferred_layers": ["F.Cu", "In3.SIG"],
+        "power_planes": ["In2.PWR"],
+        "notes": "6-layer high-speed: F.Cu over In1.GND and In3.SIG between planes are the "
+                 "preferred high-speed layers.",
+    },
+    "8_layer_high_speed": {
+        "layers": [
+            {"name": "F.Cu", "type": "signal"},
+            {"name": "In1.GND", "type": "plane", "net": "GND"},
+            {"name": "In2.SIG", "type": "signal"},
+            {"name": "In3.PWR", "type": "plane"},
+            {"name": "In4.GND", "type": "plane", "net": "GND"},
+            {"name": "In5.SIG", "type": "signal"},
+            {"name": "In6.GND", "type": "plane", "net": "GND"},
+            {"name": "B.Cu", "type": "signal"},
+        ],
+        "reference_planes": ["In1.GND", "In4.GND", "In6.GND"],
+        "high_speed_preferred_layers": ["In2.SIG", "In5.SIG"],
+        "power_planes": ["In3.PWR"],
+        "notes": "8-layer high-speed: stripline layers In2.SIG/In5.SIG between ground planes "
+                 "are preferred for the most critical pairs.",
+    },
+    "10_layer_high_speed": {
+        "layers": [
+            {"name": "F.Cu", "type": "signal"},
+            {"name": "In1.GND", "type": "plane", "net": "GND"},
+            {"name": "In2.SIG", "type": "signal"},
+            {"name": "In3.GND", "type": "plane", "net": "GND"},
+            {"name": "In4.PWR", "type": "plane"},
+            {"name": "In5.PWR", "type": "plane"},
+            {"name": "In6.GND", "type": "plane", "net": "GND"},
+            {"name": "In7.SIG", "type": "signal"},
+            {"name": "In8.GND", "type": "plane", "net": "GND"},
+            {"name": "B.Cu", "type": "signal"},
+        ],
+        "reference_planes": ["In1.GND", "In3.GND", "In6.GND", "In8.GND"],
+        "high_speed_preferred_layers": ["In2.SIG", "In7.SIG"],
+        "power_planes": ["In4.PWR", "In5.PWR"],
+        "notes": "10-layer high-speed: dual stripline signal layers with adjacent ground planes; "
+                 "power planes paired in the core.",
+    },
+}
+
+_LAYER_COUNT_PROFILES: Dict[int, str] = {
+    2: "2_layer_basic",
+    4: "4_layer_signal_gnd_pwr_signal",
+    6: "6_layer_high_speed",
+    8: "8_layer_high_speed",
+    10: "10_layer_high_speed",
+}
 
 
 
@@ -139,6 +245,11 @@ class Plan:
     decoupling_groups: List[Dict[str, Any]]
     pullup_groups: List[Dict[str, Any]]
     duplicate_rules: List[str]
+    spacing: Dict[str, float] = dataclasses.field(default_factory=lambda: dict(DEFAULT_SPACING_PROFILE))
+    functional_paths: Dict[str, Dict[str, Any]] = dataclasses.field(default_factory=dict)
+    power_islands: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+    mounting_hole_plan: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+    edge_rotation_plan: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
 
 
 def _q(value: Any) -> str:
@@ -716,19 +827,106 @@ def _validate_layer_refs(spec: Mapping[str, Any], label: str, layer_names: set[s
         warnings.append(f"{label} reference plane {ref_plane!r} is not present in stackup.")
 
 
+def _guess_layer_type(name: str) -> str:
+    upper = name.upper()
+    if "GND" in upper or "PWR" in upper or "POWER" in upper or "PLANE" in upper:
+        return "plane"
+    return "signal"
+
+
+def _normalize_stackup_layer(layer: Any) -> Dict[str, Any]:
+    if isinstance(layer, Mapping):
+        return dict(layer)
+    name = str(layer)
+    entry: Dict[str, Any] = {"name": name, "type": _guess_layer_type(name)}
+    if "GND" in name.upper():
+        entry["net"] = "GND"
+    return entry
+
+
+def expand_stackup_intent(stackup: Mapping[str, Any], stackup_warnings: List[str]) -> Dict[str, Any]:
+    """Expand `stackup.profile`/`stackup.layers: N` into a full template stackup.
+
+    Expanded templates are marked source=stackup_template / requires_review=true:
+    they improve placement/routing intent only and never claim impedance accuracy.
+    """
+
+    if not stackup:
+        return {}
+    expanded = dict(stackup)
+    layers = expanded.get("layers")
+    profile_name = expanded.get("profile")
+    if profile_name is None and isinstance(layers, int):
+        profile_name = _LAYER_COUNT_PROFILES.get(int(layers))
+        if profile_name is None:
+            stackup_warnings.append(
+                f"stackup.layers: {layers} has no built-in template (supported: "
+                f"{sorted(_LAYER_COUNT_PROFILES)}); supply explicit layers.")
+            expanded.pop("layers", None)
+            return expanded
+    if profile_name is None:
+        if isinstance(layers, list):
+            expanded["layers"] = [_normalize_stackup_layer(layer) for layer in layers]
+        return expanded
+    template = STACKUP_PROFILES.get(str(profile_name))
+    if template is None:
+        stackup_warnings.append(
+            f"Unknown stackup profile {profile_name!r}; supported profiles: "
+            f"{sorted(STACKUP_PROFILES)}.")
+        return expanded
+    template_layers = [dict(layer) for layer in template["layers"]]
+    if isinstance(layers, list) and layers:
+        user_layers = [_normalize_stackup_layer(layer) for layer in layers]
+        if len(user_layers) != len(template_layers):
+            stackup_warnings.append(
+                f"stackup profile {profile_name!r} expects {len(template_layers)} layers but "
+                f"{len(user_layers)} were listed; using the listed layers.")
+        expanded["layers"] = user_layers
+    else:
+        expanded["layers"] = template_layers
+    expanded["profile"] = str(profile_name)
+    expanded.setdefault("reference_planes", list(template["reference_planes"]))
+    expanded.setdefault("high_speed_preferred_layers", list(template["high_speed_preferred_layers"]))
+    expanded.setdefault("power_planes", list(template["power_planes"]))
+    expanded.setdefault("notes", template["notes"])
+    expanded["source"] = "stackup_template"
+    expanded["confidence"] = "medium"
+    expanded["requires_review"] = True
+    stackup_warnings.append(_STACKUP_IMPEDANCE_WARNING)
+    return expanded
+
+
+def spacing_profile(intent: Mapping[str, Any], warnings: Optional[List[str]] = None) -> Dict[str, float]:
+    """Effective spacing profile: conservative defaults merged with board.pln overrides."""
+
+    profile = dict(DEFAULT_SPACING_PROFILE)
+    overrides = _as_mapping(intent.get("spacing"))
+    for key, value in overrides.items():
+        if key not in profile:
+            if warnings is not None:
+                warnings.append(f"Unknown spacing key {key!r}; expected one of {sorted(profile)}.")
+            continue
+        if not _is_number(value) or float(value) < 0:
+            if warnings is not None:
+                warnings.append(f"spacing.{key} must be a non-negative number.")
+            continue
+        profile[key] = float(value)
+    return profile
+
+
 def validate_routing_intent(intent: Mapping[str, Any], nets: Mapping[str, PlanNet]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Any], List[str], List[str], List[str], bool]:
     """Validate optional .pln routing/SI intent without turning it into placement primitives."""
 
-    stackup = _as_mapping(intent.get("stackup"))
+    stackup_warnings: List[str] = []
+    routing_warnings: List[str] = []
+    simulation_warnings: List[str] = []
+
+    stackup = expand_stackup_intent(_as_mapping(intent.get("stackup")), stackup_warnings)
     routing = _as_mapping(intent.get("routing"))
     declared_pairs = {str(k): _as_mapping(v) for k, v in _as_mapping(intent.get("differential_pairs")).items()}
     net_classes = _as_mapping(intent.get("net_classes"))
     routing_overrides = {str(k): _as_mapping(v) for k, v in _as_mapping(intent.get("routing_overrides")).items()}
     simulation = _as_mapping(intent.get("simulation"))
-
-    stackup_warnings: List[str] = []
-    routing_warnings: List[str] = []
-    simulation_warnings: List[str] = []
 
     layer_names = _stackup_layer_names(stackup)
     reference_planes = set(_stackup_reference_planes(stackup))
@@ -831,24 +1029,66 @@ def validate_routing_intent(intent: Mapping[str, Any], nets: Mapping[str, PlanNe
     return stackup, routing, declared_pairs, net_classes, routing_overrides, simulation, routing_warnings, stackup_warnings, simulation_warnings, high_speed_constraints_complete
 
 
+# board.pln may use the spec-level role vocabulary; normalize to internal roles.
+_ROLE_ALIASES = {
+    "regulator": "power_regulator",
+    "oscillator": "clock",
+    "retimer_redriver": "hdmi_retimer",
+    "protected_ic": "ic",
+    "edge_connector": "connector",
+    "hdmi_connector": "high_speed_connector",
+    "usb_connector": "high_speed_connector",
+    "ethernet_connector": "high_speed_connector",
+    "load_decoupling": "decoupling",
+    "input_cap": "decoupling",
+    "output_cap": "decoupling",
+    "series_resistor": "series",
+    "feedback_resistor": "pullup_pulldown",
+    "pullup": "pullup_pulldown",
+    "strap": "pullup_pulldown",
+}
+
+_DEBUG_HEADER_TOKENS = ("SWD", "JTAG", "DEBUG", "PROG", "ISP", "UART_DEBUG", "TAG-CONNECT", "TAGCONNECT")
+
+
+def _component_intent(intent: Mapping[str, Any], ref: str) -> Dict[str, Any]:
+    """Per-component overrides from the board.pln `components:` section."""
+
+    return _as_mapping(_as_mapping(intent.get("components")).get(ref))
+
+
 def infer_roles(components: Dict[str, PlanComponent], intent: Mapping[str, Any]) -> None:
     intent_roles = {str(k): str(v) for k, v in (intent.get("roles") or {}).items()} if isinstance(intent.get("roles"), dict) else {}
+    for ref, spec in _as_mapping(intent.get("components")).items():
+        role = _as_mapping(spec).get("role") if isinstance(spec, Mapping) else None
+        if role is not None and str(ref) not in intent_roles:
+            intent_roles[str(ref)] = str(role)
     for comp in components.values():
         if comp.ref in intent_roles:
-            comp.role = intent_roles[comp.ref]
+            supplied = intent_roles[comp.ref]
+            comp.role = _ROLE_ALIASES.get(supplied, supplied)
             comp.role_reasons.append("role supplied by board intent")
             continue
         pref = _ref_prefix(comp.ref)
         value = (comp.value or "").upper()
         fp = comp.footprint.upper()
         nets = comp.nets
+        haystack = f"{fp} {value} {' '.join(n.upper() for n in nets)}"
         if pref in {"H", "MH"}:
             comp.role = "mechanical"; comp.role_reasons.append("reference prefix indicates mechanical")
+        elif pref in {"J", "P"} and any(token in haystack for token in _DEBUG_HEADER_TOKENS):
+            comp.role = "debug_header"; comp.role_reasons.append("connector value/footprint/nets suggest debug/programming header")
         elif pref in {"J", "P"}:
             comp.role = "high_speed_connector" if ("HDMI" in fp or "USB" in fp or any(is_high_speed(n) for n in nets)) else "connector"
             comp.role_reasons.append("reference prefix indicates connector")
         elif pref == "TP":
             comp.role = "testpoint"; comp.role_reasons.append("reference prefix indicates test point")
+        elif pref == "SW":
+            comp.role = "switch"; comp.role_reasons.append("reference prefix indicates switch/button")
+        elif pref == "LED" or (pref == "D" and ("LED" in fp or "LED" in value)):
+            comp.role = "led"; comp.role_reasons.append("reference/value/footprint indicates LED")
+        elif pref == "F" and ("FUSE" in fp or "FUSE" in value or "PTC" in value or not value):
+            comp.role = "fuse"; comp.role_reasons.append("reference prefix indicates fuse/protection element")
         elif pref in {"C"}:
             if any(is_power(n) for n in nets) and any(is_ground(n) for n in nets):
                 comp.role = "decoupling"; comp.role_reasons.append("capacitor connects a power net to ground")
@@ -857,7 +1097,10 @@ def infer_roles(components: Dict[str, PlanComponent], intent: Mapping[str, Any])
         elif pref in {"D", "U"} and ("ESD" in value or "TVS" in value or "ESD" in fp or "TVS" in fp):
             comp.role = "esd_protection"; comp.role_reasons.append("value/footprint suggests TVS or ESD protection")
         elif pref in {"L", "FB"}:
-            comp.role = "inductor" if pref == "L" else "ferrite"; comp.role_reasons.append("reference prefix indicates magnetic/passive")
+            if "COMMON" in haystack or "CMC" in haystack or "CHOKE" in haystack:
+                comp.role = "common_mode_choke"; comp.role_reasons.append("value/footprint indicates common-mode choke")
+            else:
+                comp.role = "inductor" if pref == "L" else "ferrite"; comp.role_reasons.append("reference prefix indicates magnetic/passive")
         elif pref in {"Y", "X"} or "CRYSTAL" in fp or "RESONATOR" in fp or "OSC" in value:
             comp.role = "clock"; comp.role_reasons.append("reference/value/footprint suggests clock source")
         elif pref == "R":
@@ -1303,6 +1546,320 @@ def _validate_rules(rules: Sequence[PlanRule], components: Mapping[str, PlanComp
     return duplicates, problems
 
 
+_EDGE_CONNECTOR_TOKENS = (
+    "HDMI", "USB", "RJ45", "ETHERNET", "8P8C", "JACK", "BARREL", "TYPEC", "TYPE-C",
+    "TYPE_C", "MICROSD", "SD_CARD", "DSUB", "D-SUB", "DC_IN", "POWERJACK",
+)
+
+_VIN_NET_RE = re.compile(r"(VIN|VBUS|VBAT|VDC|DCIN|DC_IN|12V|24V|V_IN)", re.I)
+_SW_NET_RE = re.compile(r"^(SW|LX|PH|SWITCH)", re.I)
+_FB_NET_RE = re.compile(r"(FB|FEEDBACK|ADJ|VSNS|SENSE)", re.I)
+
+_PROTECTED_IC_PRIORITY = {"hdmi_retimer": 0, "ic": 1, "mcu": 2, "rf_module": 3}
+
+
+def detect_functional_paths(components: Mapping[str, PlanComponent], nets: Mapping[str, PlanNet],
+                            intent: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Build functional signal paths (connector -> protection -> IC) from connectivity.
+
+    Explicit board.pln `functional_paths:` entries win; high-speed connector
+    paths are inferred from shared high-speed nets otherwise. Placement is
+    derived from these paths, never from component type alone.
+    """
+
+    paths: Dict[str, Dict[str, Any]] = {}
+    for name, spec in _as_mapping(intent.get("functional_paths")).items():
+        spec = _as_mapping(spec)
+        sequence = [str(r) for r in _as_list(spec.get("sequence"))]
+        if len(sequence) < 2:
+            continue
+        paths[str(name)] = {
+            "type": str(spec.get("type", "custom")),
+            "sequence": sequence,
+            "corridor_width_mm": float(spec.get("corridor_width_mm", 3.0)) if _is_number(spec.get("corridor_width_mm")) else 3.0,
+            "protect_first": bool(spec.get("protect_first", True)),
+            "source": "board.pln",
+        }
+    explicit_starts = {p["sequence"][0] for p in paths.values()}
+    for comp in sorted(components.values(), key=lambda c: c.ref):
+        if "connector" not in comp.role or comp.ref in explicit_starts:
+            continue
+        hs_nets = {n for n in comp.nets if is_high_speed(n)}
+        if not hs_nets:
+            continue
+        protection = sorted(c.ref for c in components.values()
+                            if c.role in {"esd_protection", "common_mode_choke"} and set(c.nets) & hs_nets)
+        ics = sorted((c for c in components.values()
+                      if c.role in _PROTECTED_IC_PRIORITY and set(c.nets) & hs_nets),
+                     key=lambda c: (_PROTECTED_IC_PRIORITY[c.role], c.ref))
+        if not ics:
+            continue
+        paths[f"HS_{comp.ref}"] = {
+            "type": "high_speed_diff",
+            "sequence": [comp.ref] + protection + [ics[0].ref],
+            "corridor_width_mm": 3.0,
+            "protect_first": True,
+            "source": "inferred_from_connectivity",
+        }
+    return paths
+
+
+def detect_power_islands(components: Mapping[str, PlanComponent], nets: Mapping[str, PlanNet],
+                         intent: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Build topology-aware power islands (regulator + hot-loop parts), not power piles.
+
+    A capacitor only joins an island when its nearest power-net parent IC is
+    the regulator itself; downstream load decouplers stay owned by their loads.
+    """
+
+    explicit: Dict[str, Dict[str, Any]] = {}
+    for name, spec in _as_mapping(intent.get("power_islands")).items():
+        spec = _as_mapping(spec)
+        regulator = spec.get("regulator")
+        if regulator is None:
+            continue
+        explicit[str(regulator)] = {
+            "name": str(name),
+            "regulator": str(regulator),
+            "input_caps": [str(r) for r in _as_list(spec.get("input_caps"))],
+            "inductor": str(spec["inductor"]) if spec.get("inductor") else None,
+            "output_caps": [str(r) for r in _as_list(spec.get("output_caps"))],
+            "feedback": [str(r) for r in _as_list(spec.get("feedback"))],
+            "switch_net": spec.get("switch_node") or spec.get("switch_net"),
+            "source": "board.pln",
+        }
+
+    ic_candidates = [c for c in components.values()
+                     if c.role in {"ic", "mcu", "hdmi_retimer", "rf_module", "power_regulator"}]
+    islands: List[Dict[str, Any]] = []
+    for reg in sorted((c for c in components.values() if c.role == "power_regulator"), key=lambda c: c.ref):
+        if reg.ref in explicit:
+            islands.append(explicit.pop(reg.ref))
+            continue
+        power_nets = {n for n in reg.nets if is_power(n)}
+        input_nets = {n for n in power_nets if _VIN_NET_RE.search(n)}
+        sw_nets = {n for n in reg.nets if not is_power(n) and not is_ground(n) and _SW_NET_RE.match(n)}
+        inductor = None
+        output_nets: set[str] = set()
+        for ind in sorted((c for c in components.values() if c.role == "inductor"), key=lambda c: c.ref):
+            shared = set(ind.nets) & set(reg.nets)
+            if not shared:
+                continue
+            inductor = ind
+            sw_nets |= {n for n in shared if not is_power(n) and not is_ground(n)}
+            output_nets |= {n for n in ind.nets if is_power(n)}
+            break
+        if not output_nets:
+            output_nets = power_nets - input_nets
+        if not input_nets:
+            input_nets = power_nets - output_nets
+
+        def island_caps(target_nets: set[str]) -> List[str]:
+            # A cap joins the island only when the regulator/inductor is its
+            # closest plausible owner; caps nearer a downstream IC stay load
+            # decouplers owned by that load.
+            anchors = [reg] + ([inductor] if inductor is not None else [])
+            out: List[str] = []
+            for cap in components.values():
+                if cap.role not in {"decoupling", "capacitor"}:
+                    continue
+                cap_power = set(cap.nets) & target_nets
+                if not cap_power or not any(is_ground(n) for n in cap.nets):
+                    continue
+                parent = _nearest_parent(cap, ic_candidates, cap_power)
+                if parent is not None and parent.ref == reg.ref:
+                    out.append(cap.ref)
+                    continue
+                anchor_dist = min(math.hypot(cap.x - a.x, cap.y - a.y) for a in anchors)
+                parent_dist = math.hypot(cap.x - parent.x, cap.y - parent.y) if parent is not None else float("inf")
+                if anchor_dist < parent_dist:
+                    out.append(cap.ref)
+            return sorted(out)
+
+        input_caps = island_caps(input_nets)
+        output_caps = [r for r in island_caps(output_nets) if r not in input_caps]
+        fb_nets = {n for n in reg.nets if not is_power(n) and not is_ground(n) and _FB_NET_RE.search(n)}
+        feedback = sorted(c.ref for c in components.values()
+                          if c.role in {"pullup_pulldown", "resistor", "series"} and set(c.nets) & fb_nets)
+        if inductor is None and not input_caps and not output_caps and not feedback:
+            continue
+        islands.append({
+            "name": f"PWR_{reg.ref}",
+            "regulator": reg.ref,
+            "input_caps": input_caps,
+            "inductor": None if inductor is None else inductor.ref,
+            "output_caps": output_caps,
+            "feedback": feedback,
+            "switch_net": sorted(sw_nets)[0] if sw_nets else None,
+            "input_nets": sorted(input_nets),
+            "output_nets": sorted(output_nets),
+            "source": "inferred_from_connectivity",
+        })
+    # Explicit islands whose regulator was not detected as a regulator still apply.
+    islands.extend(explicit[k] for k in sorted(explicit))
+    return islands
+
+
+_CORNER_ORDER = ("top_left", "top_right", "bottom_left", "bottom_right")
+
+
+def _corner_distances(board: BoardGeometry, comp: PlanComponent) -> Dict[str, float]:
+    lx = comp.x - board.origin_x
+    ly = comp.y - board.origin_y
+    return {
+        "top_left": math.hypot(lx, ly),
+        "top_right": math.hypot(board.width - lx, ly),
+        "bottom_left": math.hypot(lx, board.height - ly),
+        "bottom_right": math.hypot(board.width - lx, board.height - ly),
+    }
+
+
+def plan_mounting_holes(board: BoardGeometry, components: Mapping[str, PlanComponent],
+                        intent: Mapping[str, Any], warnings: List[str]) -> List[Dict[str, Any]]:
+    """Assign mounting holes to distinct corners or explicit board.pln locations.
+
+    Mounting holes are fixed mechanical objects, never clusters. board.pln
+    `mechanical.mounting_holes` wins; otherwise holes already sitting at
+    distinct corners keep their positions, and clustered/colocated holes are
+    redistributed so no two holes share a corner.
+    """
+
+    mech_cfg = _as_mapping(intent.get("mechanical"))
+    holes_cfg = {str(k): _as_mapping(v) for k, v in _as_mapping(mech_cfg.get("mounting_holes")).items()}
+    fixed = intent.get("fixed") if isinstance(intent.get("fixed"), dict) else {}
+    holes = sorted((c for c in components.values() if c.role == "mechanical" and c.ref not in fixed),
+                   key=lambda c: c.ref)
+    if not holes:
+        return []
+
+    assignments: List[Dict[str, Any]] = []
+    used_corners: set[str] = set()
+    remaining: List[PlanComponent] = []
+    for comp in holes:
+        spec = holes_cfg.get(comp.ref)
+        if spec and spec.get("corner"):
+            corner = str(spec["corner"])
+            assignments.append({"ref": comp.ref, "kind": "corner", "corner": corner,
+                                "inset": float(spec.get("inset", 3)) if _is_number(spec.get("inset", 3)) else 3.0,
+                                "source": "board.pln"})
+            used_corners.add(corner)
+        elif spec and _is_number(spec.get("x")) and _is_number(spec.get("y")):
+            assignments.append({"ref": comp.ref, "kind": "anchor", "x": float(spec["x"]), "y": float(spec["y"]),
+                                "source": "board.pln"})
+        else:
+            remaining.append(comp)
+
+    # Keep existing positions when the holes are already distributed to
+    # distinct corners; otherwise redistribute (the classic failure is all
+    # holes colocated or piled in one area by a type-grouping pass).
+    nearest: Dict[str, str] = {}
+    for comp in remaining:
+        distances = _corner_distances(board, comp)
+        nearest[comp.ref] = min(distances, key=distances.get)
+    distinct = len(set(nearest.values())) == len(remaining) and not (set(nearest.values()) & used_corners)
+    span = max(1e-9, min(board.width, board.height))
+    near_their_corners = all(_corner_distances(board, comp)[nearest[comp.ref]] <= 0.45 * span for comp in remaining)
+    if remaining and distinct and near_their_corners:
+        for comp in remaining:
+            assignments.append({"ref": comp.ref, "kind": "anchor",
+                                "x": comp.x - board.origin_x, "y": comp.y - board.origin_y,
+                                "rot": comp.rot, "corner": nearest[comp.ref],
+                                "source": "existing_distinct_corners"})
+        return assignments
+
+    for comp in remaining:
+        ordered = sorted(_corner_distances(board, comp).items(), key=lambda kv: kv[1])
+        corner = next((c for c, _d in ordered if c not in used_corners), None)
+        if corner is None:
+            assignments.append({"ref": comp.ref, "kind": "anchor",
+                                "x": comp.x - board.origin_x, "y": comp.y - board.origin_y,
+                                "rot": comp.rot, "source": "no_free_corner"})
+            warnings.append(f"{comp.ref}: more mounting holes than corners; kept at existing location. "
+                            "Define mechanical.mounting_holes in board.pln for explicit placement.")
+            continue
+        used_corners.add(corner)
+        assignments.append({"ref": comp.ref, "kind": "corner", "corner": corner, "inset": 3.0,
+                            "source": "distributed_to_distinct_corner"})
+        warnings.append(f"{comp.ref}: mounting hole distributed to {corner} corner (inset 3 mm); "
+                        "review against the mechanical design.")
+    return assignments
+
+
+# Final placement ownership priority. Lower rank wins. Groups/clusters are
+# metadata: a component may belong to several semantic groups, but exactly one
+# rule owns its final placement.
+_OWNERSHIP_RANK: Dict[str, int] = {
+    "corner": 0, "fixed": 0,                      # explicit/locked mechanical
+    "edge": 1,                                     # edge-required connector
+    "anchor": 2,                                   # explicit board.pln anchor
+    "esd": 3, "between": 3, "series": 3,           # functional path placement
+    "decoupling": 4, "decoupling_array": 4, "nearpad": 4,
+    "pullup": 5, "pullup_array": 5,
+    "satellite": 6,
+    "cluster": 9,                                  # coarse fallback only
+}
+
+
+def compute_ownership(rules: Sequence[PlanRule], components: Mapping[str, PlanComponent]) -> Dict[str, Dict[str, Any]]:
+    ownership: Dict[str, Dict[str, Any]] = {}
+    for rule in rules:
+        rank = _OWNERSHIP_RANK.get(rule.kind)
+        if rank is None or not rule.refs:
+            continue
+        if rule.kind == "cluster":
+            targets = list(rule.refs)
+            anchor_rank = 1 if "edge_required=True" in rule.text else rank
+        elif rule.kind in {"decoupling_array", "pullup_array"}:
+            targets = list(rule.refs)
+            anchor_rank = rank
+        else:
+            targets = rule.refs[:1]
+            anchor_rank = rank
+        for i, ref in enumerate(targets):
+            if ref not in components:
+                continue
+            effective = anchor_rank if (rule.kind != "cluster" or i == 0) else rank
+            current = ownership.get(ref)
+            if current is None or effective < current["rank"]:
+                kind = rule.kind
+                if rule.kind == "cluster" and i == 0 and effective == 1:
+                    kind = "edge_required_connector"
+                ownership[ref] = {"owner": kind, "rank": effective, "rule": rule.text}
+    return ownership
+
+
+def compute_semantic_groups(clusters: Sequence[Mapping[str, Any]],
+                            functional_paths: Mapping[str, Mapping[str, Any]],
+                            power_islands: Sequence[Mapping[str, Any]],
+                            decoupling_groups: Sequence[Mapping[str, Any]]) -> Dict[str, List[str]]:
+    """Semantic group membership per ref. Groups are metadata, not placement units."""
+
+    groups: Dict[str, List[str]] = {}
+
+    def add(ref: str, group: str) -> None:
+        groups.setdefault(ref, [])
+        if group not in groups[ref]:
+            groups[ref].append(group)
+
+    for cluster in clusters:
+        for ref in cluster.get("members", []):
+            add(str(ref), str(cluster.get("name")))
+    for name, path in functional_paths.items():
+        for ref in path.get("sequence", []):
+            add(str(ref), f"path:{name}")
+    for island in power_islands:
+        members = [island.get("regulator"), island.get("inductor")] + \
+            list(island.get("input_caps", [])) + list(island.get("output_caps", [])) + \
+            list(island.get("feedback", []))
+        for ref in members:
+            if ref:
+                add(str(ref), f"power:{island.get('name')}")
+    for group in decoupling_groups:
+        for ref in group.get("members", []):
+            add(str(ref), f"decoupling:{group.get('parent')}")
+    return groups
+
+
 def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], nets: Dict[str, PlanNet], aliases: Dict[str, str], alias_diagnostics: AliasDiagnostics, intent: Mapping[str, Any], warnings: List[str]) -> Plan:
     infer_roles(components, intent)
     pairs = detect_differential_pairs(nets)
@@ -1321,6 +1878,9 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     warnings.extend(routing_warnings)
     warnings.extend(stackup_warnings)
     warnings.extend(simulation_warnings)
+    spacing = spacing_profile(intent, warnings)
+    functional_paths = detect_functional_paths(components, nets, intent)
+    power_islands = detect_power_islands(components, nets, intent)
     rules: List[PlanRule] = []
     explanations: Dict[str, Dict[str, Any]] = {}
     uncertain: List[str] = []
@@ -1351,41 +1911,97 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
         if isinstance(spec, dict) and spec.get("type") == "corner":
             rules.append(PlanRule("corner", f'Corner({_q(ref)}, corner={_q(spec.get("corner", "top_left"))}, inset={spec.get("inset", 3)}, role="fixed_mechanical")', [str(ref)], f"{ref} fixed by board intent."))
             explanations.setdefault(str(ref), {})["generated_rule"] = rules[-1].text
-    for comp in components.values():
-        if comp.role == "mechanical" and comp.ref not in fixed:
-            rules.append(PlanRule("fixed", f'Anchor({_q(comp.ref)}, x={comp.x - board.origin_x:.3f}, y={comp.y - board.origin_y:.3f}, rot={comp.rot:g}, role="mechanical")', [comp.ref], f"{comp.ref} kept at existing mechanical location."))
+    # Mounting holes are fixed mechanical objects placed first: distinct
+    # corners or explicit board.pln locations, never clusters.
+    mounting_hole_plan = plan_mounting_holes(board, components, intent, warnings)
+    for assignment in mounting_hole_plan:
+        ref = assignment["ref"]
+        if assignment["kind"] == "corner":
+            text = (f'Corner({_q(ref)}, corner={_q(assignment["corner"])}, '
+                    f'inset={assignment.get("inset", 3.0):g}, role="mechanical")')
+            rules.append(PlanRule("corner", text, [ref],
+                                  f"{ref} mounting hole at {assignment['corner']} corner ({assignment['source']}); mechanical constraints first."))
+        else:
+            rot = assignment.get("rot", components[ref].rot if ref in components else 0.0)
+            text = (f'Anchor({_q(ref)}, x={assignment["x"]:.3f}, y={assignment["y"]:.3f}, '
+                    f'rot={rot:g}, lock=True, role="mechanical")')
+            rules.append(PlanRule("fixed", text, [ref],
+                                  f"{ref} mounting hole kept at explicit/existing mechanical location ({assignment['source']})."))
+        explanations.setdefault(ref, {}).update({"role": "mechanical", "generated_rule": rules[-1].text,
+                                                  "mounting_hole_assignment": assignment})
 
     clusters: List[Dict[str, Any]] = []
-    # Connector/high-speed clusters.
+    edge_rotation_plan: List[Dict[str, Any]] = []
+    # Connector/high-speed clusters. Edge-required connectors are mechanically
+    # edge-locked, rotated by access side, and may extend their body outside
+    # the board outline; their support parts are optimized around them later.
     for comp in components.values():
-        if "connector" in comp.role:
-            members = _cluster_members(comp, components, nets, aliases, radius=18.0, proximity_any_role=False)
-            local_x = max(0.0, min(board.width, comp.x - board.origin_x))
-            local_y = max(0.0, min(board.height, comp.y - board.origin_y))
-            distances = {
-                "left": local_x,
-                "right": board.width - local_x,
-                "top": local_y,
-                "bottom": board.height - local_y,
-            }
-            edge = min(distances, key=distances.get)
-            edge_span = board.width if edge in ("left", "right") else board.height
-            inset = 2.0
-            name = re.sub(r"[^A-Za-z0-9_]+", "_", (("IC" if comp.role == "mcu" else comp.role.upper()) + "_" + comp.ref))
-            if edge_span > 0 and distances[edge] / edge_span <= 0.25 and distances[edge] > inset:
-                along = local_y if edge in ("left", "right") else local_x
-                placement_kw = "y" if edge in ("left", "right") else "x"
-                edge_required = comp.role in {"connector", "high_speed_connector"}
-                text = (f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, '
-                        f'placement=Edge(edge={_q(edge)}, {placement_kw}={along:.3f}, inset={inset}, '
-                        f'locked=True, edge_required={str(edge_required)}, mechanical=True, access_side={_q(edge)}), '
-                        f'role={_q(comp.role)})')
-                rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector cluster preserves local geometry and reserves edge access; edge_required={edge_required}, access_side={edge}."))
+        if "connector" not in comp.role and comp.role != "debug_header":
+            continue
+        cfg = _component_intent(intent, comp.ref)
+        members = _cluster_members(comp, components, nets, aliases, radius=18.0, proximity_any_role=False)
+        local_x = max(0.0, min(board.width, comp.x - board.origin_x))
+        local_y = max(0.0, min(board.height, comp.y - board.origin_y))
+        distances = {
+            "left": local_x,
+            "right": board.width - local_x,
+            "top": local_y,
+            "bottom": board.height - local_y,
+        }
+        nearest_edge = min(distances, key=distances.get)
+        edge_span = board.width if nearest_edge in ("left", "right") else board.height
+        inset = 2.0
+        near_edge = edge_span > 0 and distances[nearest_edge] / edge_span <= 0.25 and distances[nearest_edge] > inset
+        name = re.sub(r"[^A-Za-z0-9_]+", "_", (("IC" if comp.role == "mcu" else comp.role.upper()) + "_" + comp.ref))
+        haystack = f"{comp.footprint.upper()} {(comp.value or '').upper()}"
+        inferred_edge_required = (comp.role == "high_speed_connector" or
+                                  any(token in haystack for token in _EDGE_CONNECTOR_TOKENS))
+        if "edge_required" in cfg:
+            edge_required = bool(cfg.get("edge_required"))
+        elif cfg.get("access_side") is not None:
+            edge_required = True
+        elif "connector" in comp.role:
+            edge_required = near_edge or inferred_edge_required
+        else:
+            edge_required = False
+        access_side = str(cfg.get("access_side") or nearest_edge)
+        if edge_required or near_edge:
+            along = local_y if access_side in ("left", "right") else local_x
+            placement_kw = "y" if access_side in ("left", "right") else "x"
+            allow_outside = bool(cfg.get("allow_body_outside_board", edge_required))
+            rotation_cfg = cfg.get("rotation", "auto")
+            if _is_number(rotation_cfg):
+                rot_kw = f"rot={float(rotation_cfg):g}, "
+                rotation_label = f"{float(rotation_cfg):g}"
+            elif isinstance(rotation_cfg, str) and rotation_cfg.lower() == "auto":
+                rot_kw = 'rot="auto", '
+                rotation_label = "auto from access side"
             else:
-                text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement=Anchor(x={local_x:.3f}, y={local_y:.3f}, rot={comp.rot:g}), role={_q(comp.role)})'
-                rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector cluster kept at existing location; not adjacent to a board edge."))
-            clusters.append({"name": name, "anchor": comp.ref, "members": members, "role": comp.role, "category": _cluster_category(comp), "confidence": "high" if len(members) > 1 else "low"})
-            explanations.setdefault(comp.ref, {}).update({"role": comp.role, "generated_rule": text})
+                rot_kw = ""
+                rotation_label = "keep existing"
+            locked = bool(cfg.get("locked", True))
+            text = (f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, '
+                    f'placement=Edge(edge={_q(access_side)}, {placement_kw}={along:.3f}, inset={inset}, '
+                    f'{rot_kw}locked={str(locked)}, edge_required={str(edge_required)}, mechanical=True, '
+                    f'access_side={_q(access_side)}, allow_body_outside_board={str(allow_outside)}), '
+                    f'role={_q(comp.role)})')
+            rules.append(PlanRule("cluster", text, members,
+                                  f"{comp.ref} connector cluster preserves local geometry and reserves edge access; "
+                                  f"edge_required={edge_required}, access_side={access_side}, "
+                                  f"rotation={rotation_label}, "
+                                  f"allow_body_outside_board={allow_outside}."))
+            edge_rotation_plan.append({"ref": comp.ref, "access_side": access_side,
+                                       "rotation": rotation_cfg if not isinstance(rotation_cfg, str) else "auto",
+                                       "allow_body_outside_board": allow_outside,
+                                       "edge_required": edge_required, "locked": locked})
+        else:
+            text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement=Anchor(x={local_x:.3f}, y={local_y:.3f}, rot={comp.rot:g}), role={_q(comp.role)})'
+            rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector cluster kept at existing location; not adjacent to a board edge and not edge-required."))
+        clusters.append({"name": name, "anchor": comp.ref, "members": members, "role": comp.role,
+                         "category": _cluster_category(comp), "confidence": "high" if len(members) > 1 else "low",
+                         "metadata_only": True,
+                         "note": "clusters are metadata: members keep this neighborhood only until a higher-priority ownership rule refines them"})
+        explanations.setdefault(comp.ref, {}).update({"role": comp.role, "generated_rule": text})
 
     # High speed pairs/corridors and ESD chains.
     hs_connectors = [c for c in components.values() if "connector" in c.role and any(is_high_speed(n) for n in c.nets)]
@@ -1413,6 +2029,16 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
         else:
             uncertain.append(f"{esd.ref} looks like ESD/protection but connector/protected IC was not clear.")
 
+    # Functional signal paths: reserve direct high-speed corridors before
+    # low-speed support parts are placed. Metadata for scoring + soft keepout.
+    for path_name, path in sorted(functional_paths.items()):
+        text = (f'HighSpeedPath({_q(path_name)}, sequence={_q(path["sequence"])}, '
+                f'corridor_width={path["corridor_width_mm"]:g}, protect_first={str(path["protect_first"])}, '
+                f'role={_q(path["type"])})')
+        rules.append(PlanRule("high_speed_path", text, list(path["sequence"]),
+                              f"Functional path {path_name} ({path['source']}): keep "
+                              f"{' -> '.join(path['sequence'])} short, direct, and free of unrelated parts."))
+
     # IC and power clusters.
     for comp in components.values():
         if comp.role in {"ic", "mcu", "power_regulator", "rf_module", "hdmi_retimer"}:
@@ -1432,12 +2058,97 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     graph = ConnectivityGraph(components, nets)
     ic_candidates = [c for c in components.values() if c.role in {"ic", "mcu", "hdmi_retimer", "rf_module"}]
 
+    # Power islands: compact regulator topology (input cap -> regulator ->
+    # inductor -> output cap, feedback at FB), not a generic power pile.
+    # Members claimed here are skipped by the generic decoupling/pullup passes
+    # so each ref keeps exactly one placement owner.
+    power_claimed: set[str] = set()
+    for island in power_islands:
+        reg_ref = island["regulator"]
+        reg = components.get(reg_ref)
+        if reg is None:
+            uncertain.append(f"power island {island['name']} regulator {reg_ref} is not on the board.")
+            continue
+        island_member_refs = [reg_ref]
+
+        def _emit_island_caps(refs: List[str], target_nets: List[str], role: str, distance: float) -> None:
+            refs = [r for r in refs if r in components]
+            if not refs:
+                return
+            pad = _nearest_pad(reg, set(target_nets))
+            net = target_nets[0] if target_nets else None
+            if len(refs) == 1:
+                pad_kw = f"pad={_q(pad)}, " if pad else ""
+                text = (f'Decoupling({_q(refs[0])}, parent={_q(reg_ref)}, {pad_kw}distance={distance:g}, '
+                        f'power_net={_qn(net)}, ground_net="GND", role={_q(role)})')
+                rules.append(PlanRule("decoupling", text, [refs[0], reg_ref],
+                                      f"{refs[0]} {role.replace('_', ' ')} for {reg_ref}: minimize the high di/dt hot loop."))
+            else:
+                pad_kw = f"pad={_q(pad)}, " if pad else ""
+                text = (f'DecouplingArray(refs={_q(refs)}, parent={_q(reg_ref)}, {pad_kw}side="auto", '
+                        f'distance={distance:g}, spacing=1.5, stagger=True, rows="auto", '
+                        f'role={_q(role)}, power_net={_qn(net)}, ground_net="GND")')
+                rules.append(PlanRule("decoupling_array", text, list(refs),
+                                      f"{', '.join(refs)} {role.replace('_', ' ')} array for {reg_ref}: keep the converter loop compact."))
+            for cref in refs:
+                power_claimed.add(cref)
+                island_member_refs.append(cref)
+                explanations[cref] = {"role": role, "nets": components[cref].nets, "parent_candidate": reg_ref,
+                                      "generated_rule": text, "primitive_selected": "Decoupling" if len(refs) == 1 else "DecouplingArray",
+                                      "power_island": island["name"]}
+
+        _emit_island_caps(list(island.get("input_caps", [])), list(island.get("input_nets", [])), "input_cap", 1.2)
+        _emit_island_caps(list(island.get("output_caps", [])), list(island.get("output_nets", [])), "output_cap", 1.5)
+
+        inductor_ref = island.get("inductor")
+        if inductor_ref and inductor_ref in components:
+            sw_or_out = ([island["switch_net"]] if island.get("switch_net") else []) + list(island.get("output_nets", []))
+            pad = _nearest_pad(reg, set(sw_or_out))
+            if pad:
+                text = f'NearPad({_q(inductor_ref)}, parent={_q(reg_ref)}, pad={_q(pad)}, distance=1.5, role="inductor")'
+            else:
+                text = f'Satellite({_q(inductor_ref)}, parent={_q(reg_ref)}, side="auto", distance=1.5, role="inductor")'
+            rules.append(PlanRule("nearpad" if pad else "satellite", text, [inductor_ref, reg_ref],
+                                  f"{inductor_ref} power inductor kept tight against {reg_ref}; keep switch-node copper compact."))
+            power_claimed.add(inductor_ref)
+            island_member_refs.append(inductor_ref)
+            explanations[inductor_ref] = {"role": "inductor", "nets": components[inductor_ref].nets,
+                                          "parent_candidate": reg_ref, "generated_rule": text,
+                                          "power_island": island["name"]}
+
+        feedback_refs = [r for r in island.get("feedback", []) if r in components]
+        if feedback_refs:
+            fb_nets = {n for n in reg.nets if not is_power(n) and not is_ground(n) and _FB_NET_RE.search(n)}
+            fb_pad = _nearest_pad(reg, fb_nets)
+            for fref in feedback_refs:
+                if fb_pad:
+                    text = f'NearPad({_q(fref)}, parent={_q(reg_ref)}, pad={_q(fb_pad)}, distance=1.5, role="feedback")'
+                else:
+                    text = f'Satellite({_q(fref)}, parent={_q(reg_ref)}, side="auto", distance=2.0, role="feedback")'
+                rules.append(PlanRule("nearpad" if fb_pad else "satellite", text, [fref, reg_ref],
+                                      f"{fref} feedback network kept at {reg_ref} FB pin, away from the switch node."))
+                power_claimed.add(fref)
+                island_member_refs.append(fref)
+                explanations[fref] = {"role": "feedback", "nets": components[fref].nets,
+                                      "parent_candidate": reg_ref, "generated_rule": text,
+                                      "power_island": island["name"]}
+
+        island_text = (f'PowerIsland({_q(island["name"])}, regulator={_q(reg_ref)}, '
+                       f'input_caps={_q(list(island.get("input_caps", [])))}, '
+                       f'inductor={_qn(island.get("inductor"))}, '
+                       f'output_caps={_q(list(island.get("output_caps", [])))}, '
+                       f'feedback={_q(list(island.get("feedback", [])))}, '
+                       f'switch_net={_qn(island.get("switch_net"))})')
+        rules.append(PlanRule("power_island", island_text, island_member_refs,
+                              f"Power island {island['name']} ({island['source']}): topology-aware converter "
+                              "placement scored in power-placement-review."))
+
     # Decoupling capacitors: group caps that share the same owning power pin
     # (same parent IC + same power net/pad) and emit one primitive per group
     # instead of one Decoupling()+NearPad() pair per capacitor.
     decoupling_groups: List[Dict[str, Any]] = []
     decoupling_keys: Dict[Tuple[str, str], List[Tuple[PlanComponent, Optional[str]]]] = {}
-    for cap in [c for c in components.values() if c.role == "decoupling"]:
+    for cap in [c for c in components.values() if c.role == "decoupling" and c.ref not in power_claimed]:
         power_nets = {n for n in cap.nets if is_power(n)}
         parent = _nearest_parent(cap, ic_candidates, power_nets) or _nearest_parent(cap, ic_candidates)
         if not parent:
@@ -1493,7 +2204,7 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     # resistors that share an owner into a single placement primitive.
     pullup_groups: List[Dict[str, Any]] = []
     pullup_owners: Dict[str, List[Tuple[PlanComponent, Optional[str]]]] = {}
-    for r in [c for c in components.values() if c.role == "pullup_pulldown"]:
+    for r in [c for c in components.values() if c.role == "pullup_pulldown" and c.ref not in power_claimed]:
         signal_nets = [n for n in r.nets if not is_power(n) and not is_ground(n)]
         signal_net = signal_nets[0] if signal_nets else None
         owner = graph.pullup_owner(r.ref, signal_net)
@@ -1534,7 +2245,7 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     # resistor to exactly one other non-passive component). Shared-net
     # relationships with other passives (e.g. decoupling caps) are
     # insufficient and are rejected with a warning instead.
-    for r in [c for c in components.values() if c.role == "series"]:
+    for r in [c for c in components.values() if c.role == "series" and c.ref not in power_claimed]:
         endpoints = graph.series_endpoints(r.ref)
         if endpoints:
             a_ref, b_ref = endpoints
@@ -1560,17 +2271,20 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
         if comp.role in {"testpoint", "clock"} and pad:
             text = f'NearPad({_q(comp.ref)}, parent={_q(parent.ref)}, pad={_q(pad)}, distance=2.0, role={_q(comp.role)})'
             rules.append(PlanRule("nearpad", text, [comp.ref, parent.ref], f"{comp.ref} support component placed near {parent.ref} pad {pad} from shared connectivity."))
-        elif comp.role in {"inductor", "ferrite"}:
-            peers = [components[ref] for n in signal_nets for ref, _ in nets.get(n, PlanNet(n)).pads if ref in components and ref != comp.ref and components[ref].role not in {"inductor", "ferrite", "capacitor", "resistor"}]
+        elif comp.role in {"inductor", "ferrite", "common_mode_choke", "fuse"}:
+            peers = [components[ref] for n in signal_nets for ref, _ in nets.get(n, PlanNet(n)).pads if ref in components and ref != comp.ref and components[ref].role not in {"inductor", "ferrite", "common_mode_choke", "fuse", "capacitor", "resistor"}]
             if len(peers) >= 2:
                 text = f'Between({_q(comp.ref)}, a={_q(peers[0].ref)}, b={_q(peers[1].ref)}, t=0.5, offset=0, role={_q(comp.role)})'
-                rules.append(PlanRule("between", text, [comp.ref, peers[0].ref, peers[1].ref], f"{comp.ref} inferred as inline magnetic/filter element."))
+                rules.append(PlanRule("between", text, [comp.ref, peers[0].ref, peers[1].ref], f"{comp.ref} inferred as inline filter/protection element between {peers[0].ref} and {peers[1].ref}."))
             else:
                 text = f'Satellite({_q(comp.ref)}, parent={_q(parent.ref)}, side="auto", distance=2.0, role={_q(comp.role)})'
                 rules.append(PlanRule("satellite", text, [comp.ref, parent.ref], f"{comp.ref} support magnetic/filter element kept near {parent.ref}."))
         elif comp.role in {"capacitor", "resistor"}:
             text = f'Satellite({_q(comp.ref)}, parent={_q(parent.ref)}, side="auto", distance=2.5, role={_q(comp.role)})'
             rules.append(PlanRule("satellite", text, [comp.ref, parent.ref], f"{comp.ref} generic support passive kept near connected anchor {parent.ref}."))
+        elif comp.role in {"led", "switch"}:
+            text = f'Satellite({_q(comp.ref)}, parent={_q(parent.ref)}, side="auto", distance=3.0, role={_q(comp.role)})'
+            rules.append(PlanRule("satellite", text, [comp.ref, parent.ref], f"{comp.ref} {comp.role} placed near {parent.ref} by access/service rules; move to an edge or annotate components.{comp.ref} in board.pln if it is user-facing."))
         if comp.ref in {ref for rule in rules for ref in rule.refs}:
             explanations.setdefault(comp.ref, {"role": comp.role, "nets": comp.nets, "parent_candidate": parent.ref, "generated_rule": rules[-1].text})
 
@@ -1614,6 +2328,11 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
         decoupling_groups,
         pullup_groups,
         duplicate_rules,
+        spacing,
+        functional_paths,
+        power_islands,
+        mounting_hole_plan,
+        edge_rotation_plan,
     )
 
 
@@ -1787,6 +2506,13 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
     lines = [
         "# Generated by pcb-plan",
         "# Generated placement plan.",
+        "# This file is intended to be edited by humans and AI assistants as part of an",
+        "# iterative layout-optimization workflow: review the comments, adjust rules,",
+        "# re-run pcb-place, and feed the reports back into board.pln.",
+        "# Ordering model: mechanical constraints first, functional signal-path topology",
+        "# second, power topology third, support passives fourth; spacing always enforced.",
+        "# Each ref has exactly one placement owner: later higher-priority rules refine",
+        "# earlier coarse cluster moves (clusters are metadata, not atomic units).",
         "# Requires engineering review before fabrication.",
         "# High-speed routing, impedance, return path, and EMI compliance must be verified.",
         "# Generated: not timestamped to keep planner output deterministic.",
@@ -1805,18 +2531,25 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
     emit_outline = plan.board.source != "inferred_from_footprints"
     if not emit_outline:
         lines.append("# Edge.Cuts outline not emitted: board geometry was inferred from footprint extents (low confidence).")
+    sp = plan.spacing
     lines.extend([
         f"Board(width={plan.board.width:.6g}, height={plan.board.height:.6g}, origin_x={plan.board.origin_x:.6g}, origin_y={plan.board.origin_y:.6g}, emit_outline={emit_outline})",
-        "Spacing(default=0.25, passive_to_ic=0.50, connector=1.00)",
+        "# Spacing profile (mm) from board.pln spacing: section or conservative defaults;",
+        "# parts never default to touching.",
+        (f"Spacing(default={sp['default']:g}, passive_to_passive={sp['passive_to_passive']:g}, "
+         f"passive_to_ic={sp['passive_to_ic']:g}, ic_to_ic={sp['ic_to_ic']:g}, "
+         f"connector={sp['connector_to_component']:g}, mechanical={sp['mechanical_to_component']:g})"),
         "PlacementPolicy(avoid_overlap=True, allow_anchor_move=False, max_search_radius=5, search_step=0.5)",
         "",
     ])
     sections = [
+        ("Mechanical constraints first: mounting holes and fixed mechanical objects", {"corner", "fixed"}),
         ("Regions and keepouts", {"region", "keepout"}),
-        ("Fixed mechanical placement", {"corner", "fixed"}),
-        ("Clusters and routing corridors", {"cluster", "corridor"}),
-        ("Critical pin-aware refinements", {"decoupling", "decoupling_array", "esd", "nearpad", "between"}),
-        ("Low-priority refinements", {"pullup", "pullup_array", "series", "satellite"}),
+        ("Edge connectors and coarse clusters (clusters are metadata; members may be refined below)", {"cluster"}),
+        ("Functional signal paths and high-speed corridors (reserved before support parts)", {"high_speed_path", "corridor"}),
+        ("Power islands: topology-aware regulator placement", {"power_island"}),
+        ("Critical pin-aware refinements (these own their refs over cluster moves)", {"decoupling", "decoupling_array", "esd", "nearpad", "between"}),
+        ("Low-priority refinements and support parts", {"pullup", "pullup_array", "series", "satellite"}),
     ]
     emitted: set[int] = set()
     for title, kinds in sections:
@@ -1914,11 +2647,30 @@ def report(plan: Plan) -> Dict[str, Any]:
         primitive_counts[primitive] = primitive_counts.get(primitive, 0) + 1
     total_clusters = single_clusters + multi_clusters
     cluster_quality_score = (multi_clusters / total_clusters) if total_clusters else 1.0
+    ownership = compute_ownership(plan.rules, plan.components)
+    semantic_groups = compute_semantic_groups(plan.clusters, plan.functional_paths,
+                                              plan.power_islands, plan.decoupling_groups)
     return {
         "components_parsed": len(plan.components),
         "nets_parsed": len(plan.nets),
         "components_placed": len(placed_refs),
         "components_unplaced": len(unplaced),
+        "spacing_profile": dict(plan.spacing),
+        "functional_paths": plan.functional_paths,
+        "high_speed_paths": {name: path for name, path in plan.functional_paths.items()
+                             if "high_speed" in str(path.get("type", ""))},
+        "power_islands": plan.power_islands,
+        "mechanical_constraints": {
+            "mounting_holes": plan.mounting_hole_plan,
+            "keepouts": plan.keepouts,
+        },
+        "edge_required_components": [item["ref"] for item in plan.edge_rotation_plan if item.get("edge_required")],
+        "edge_rotation_plan": plan.edge_rotation_plan,
+        "ownership_model": ownership,
+        "semantic_groups": semantic_groups,
+        "multi_group_components": sorted(ref for ref, groups in semantic_groups.items() if len(groups) > 1),
+        "clusters_are_metadata": "Clusters preserve neighborhoods only; they are not atomic placement units. "
+                                 "Each ref has exactly one placement owner (see ownership_model).",
         "clusters_single_member": single_clusters,
         "clusters_multi_member": multi_clusters,
         "diff_pairs_inferred": len(plan.differential_pairs),
@@ -1974,7 +2726,21 @@ def build_check_report(plan: Plan) -> Dict[str, Any]:
 
     payload = report(plan)
     invalid_series = [f for f in plan.topology_failures if "rejected Series()" in f]
+    confidence = payload["plan_confidence"]
+    cluster_quality = payload["cluster_quality_score"]
+    placement_quality_score = round(confidence["score"] * 0.7 + cluster_quality * 100 * 0.3, 1)
     return {
+        "mechanical_constraints": payload["mechanical_constraints"],
+        "edge_required_components": payload["edge_required_components"],
+        "edge_rotation_plan": payload["edge_rotation_plan"],
+        "functional_paths": payload["functional_paths"],
+        "high_speed_paths": payload["high_speed_paths"],
+        "power_islands": payload["power_islands"],
+        "ownership_model": payload["ownership_model"],
+        "spacing_profile": payload["spacing_profile"],
+        "clusters_are_metadata": payload["clusters_are_metadata"],
+        "multi_group_components": payload["multi_group_components"],
+        "placement_quality_score": placement_quality_score,
         "nets_parsed": payload["nets_parsed"],
         "components_parsed": payload["components_parsed"],
         "components_planned": payload["components_placed"],
@@ -2045,7 +2811,8 @@ def validate_pln(payload: Mapping[str, Any]) -> List[str]:
     allowed = {
         "board", "regions", "keepouts", "roles", "clusters", "high_speed", "routing",
         "stackup", "differential_pairs", "net_classes", "simulation", "provenance",
-        "fixed", "routing_overrides",
+        "fixed", "routing_overrides", "spacing", "components", "mechanical",
+        "functional_paths", "power_islands",
     }
     for key in payload:
         if key not in allowed:
@@ -2173,10 +2940,54 @@ def plan_to_pln(plan: Plan) -> Dict[str, Any]:
         "differential_pairs": pairs,
         "net_classes": plan.net_classes,
         "simulation": infer_simulation_config(plan),
+        "spacing": {key: provenance_value(value, "conservative_default_spacing_profile", "medium", True)
+                    for key, value in plan.spacing.items()},
+        "components": {
+            item["ref"]: {
+                "edge_required": provenance_value(item["edge_required"], "inferred_from_connector_role_and_position", "medium", True),
+                "access_side": provenance_value(item["access_side"], "inferred_from_board_position", "medium", True),
+                "allow_body_outside_board": provenance_value(item["allow_body_outside_board"], "edge_connector_default", "medium", True),
+                "locked": provenance_value(item["locked"], "edge_connector_default", "medium", True),
+                "rotation": provenance_value(item["rotation"], "auto_from_access_side", "medium", True),
+            }
+            for item in plan.edge_rotation_plan
+        },
+        "mechanical": {
+            "mounting_holes": {
+                item["ref"]: ({"corner": provenance_value(item["corner"], item["source"], "medium", True),
+                               "inset": provenance_value(item.get("inset", 3.0), item["source"], "medium", True)}
+                              if item["kind"] == "corner" else
+                              {"x": provenance_value(item.get("x"), item["source"], "medium", True),
+                               "y": provenance_value(item.get("y"), item["source"], "medium", True)})
+                for item in plan.mounting_hole_plan
+            },
+        },
+        "functional_paths": {
+            name: {
+                "type": provenance_value(path["type"], path["source"], "medium", True),
+                "sequence": [provenance_value(ref, path["source"], "medium", True) for ref in path["sequence"]],
+                "corridor_width_mm": provenance_value(path["corridor_width_mm"], path["source"], "medium", True),
+                "protect_first": provenance_value(path["protect_first"], path["source"], "medium", True),
+            }
+            for name, path in plan.functional_paths.items()
+        },
+        "power_islands": {
+            island["name"]: {
+                "regulator": provenance_value(island["regulator"], island["source"], "medium", True),
+                "input_caps": [provenance_value(r, island["source"], "medium", True) for r in island.get("input_caps", [])],
+                "inductor": provenance_value(island.get("inductor"), island["source"], "medium", True),
+                "output_caps": [provenance_value(r, island["source"], "medium", True) for r in island.get("output_caps", [])],
+                "feedback": [provenance_value(r, island["source"], "medium", True) for r in island.get("feedback", [])],
+                "switch_node": provenance_value(island.get("switch_net"), island["source"], "medium", True),
+            }
+            for island in plan.power_islands
+        },
         "provenance": {
             "generator": "pcb-plan init",
-            "schema_version": "0.1",
+            "schema_version": "0.2",
             "visibility": "inferred values include value/source/confidence/requires_review wrappers where practical",
+            "ai_editing": "board.pln is intended to be reviewed and edited by humans and AI assistants; "
+                          "sections are stably ordered for diffs and carry rationale via source fields",
         },
     }
     return payload
@@ -2398,6 +3209,7 @@ def build_parser() -> argparse.ArgumentParser:
     emit.add_argument("--emit-routing-policy", type=Path, help="Write routing-policy.yaml handoff from .pln routing constraints")
     emit.add_argument("--emit-openems-plan", type=Path, help="Write OpenEMS handoff plan when simulation.openems is enabled")
     emit.add_argument("--summary-md", type=Path, help="Write human-readable summary markdown")
+    emit.add_argument("--ai-edit-hints", type=Path, help="Write ai-edit-hints.md listing uncertain inferences, ownership, and suggested .pln/.ppl edits")
     emit.add_argument("--strict-confidence", action="store_true",
                       help="Fail if the plan is low-confidence (requires --allow-low-confidence to proceed anyway)")
     emit.add_argument("--allow-low-confidence", action="store_true",
@@ -2465,6 +3277,92 @@ def _summary_markdown(title: str, payload: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def ai_edit_hints_text(plan: Plan) -> str:
+    """ai-edit-hints.md: what an AI/human editor should revisit in board.pln/placement.ppl."""
+
+    payload = report(plan)
+    lines = ["# AI edit hints (pcb-plan)", "",
+             "board.pln and placement.ppl are intended to be edited by humans and AI",
+             "assistants as part of an iterative layout optimization workflow. The items",
+             "below are the lowest-confidence decisions and the highest-value edits.", ""]
+
+    lines.append("## Uncertain placement choices")
+    lines.append("")
+    uncertain = list(plan.uncertain_inferences)
+    if uncertain:
+        lines.extend(f"- {item}" for item in uncertain)
+    else:
+        lines.append("- none")
+    lines.append("")
+
+    lines.append("## Low-confidence inferred constraints")
+    lines.append("")
+    confidence = payload["plan_confidence"]
+    lines.append(f"- plan confidence: {confidence['level']} (score {confidence['score']})")
+    lines.extend(f"- {reason}" for reason in confidence["reasons"])
+    if plan.stackup.get("source") == "stackup_template":
+        lines.append(f"- stackup expanded from template {plan.stackup.get('profile')!r}: layer roles are intent only; "
+                     "controlled impedance requires the actual fab stackup")
+    lines.append("")
+
+    lines.append("## Components with multiple semantic groups")
+    lines.append("")
+    multi = payload["multi_group_components"]
+    groups = payload["semantic_groups"]
+    if multi:
+        for ref in multi:
+            owner = payload["ownership_model"].get(ref, {})
+            lines.append(f"- {ref}: groups [{', '.join(groups[ref])}]; placement owner: "
+                         f"{owner.get('owner', 'unowned')} (groups are metadata; ownership is unique)")
+    else:
+        lines.append("- none")
+    lines.append("")
+
+    lines.append("## Placement owners")
+    lines.append("")
+    for ref in sorted(payload["ownership_model"]):
+        owner = payload["ownership_model"][ref]
+        lines.append(f"- {ref}: {owner['owner']} (priority rank {owner['rank']})")
+    lines.append("")
+
+    lines.append("## Suggested board.pln edits")
+    lines.append("")
+    suggestions: List[str] = []
+    for item in plan.edge_rotation_plan:
+        suggestions.append(f"- confirm components.{item['ref']}: access_side={item['access_side']}, "
+                           f"allow_body_outside_board={item['allow_body_outside_board']} match the enclosure")
+    for hole in plan.mounting_hole_plan:
+        if hole["source"] in {"distributed_to_distinct_corner", "no_free_corner"}:
+            suggestions.append(f"- confirm mechanical.mounting_holes.{hole['ref']} "
+                               f"({hole.get('corner', 'explicit location')}) against the mechanical design")
+    for island in plan.power_islands:
+        if island["source"] != "board.pln":
+            suggestions.append(f"- review inferred power island {island['name']} membership "
+                               "(input_caps/inductor/output_caps/feedback) and add a power_islands: entry to pin it")
+    for name, path in plan.functional_paths.items():
+        if path["source"] != "board.pln":
+            suggestions.append(f"- review inferred functional path {name}: {' -> '.join(path['sequence'])}; "
+                               "add a functional_paths: entry to pin the sequence and corridor width")
+    lines.extend(suggestions if suggestions else ["- none"])
+    lines.append("")
+
+    lines.append("## Suggested placement.ppl edits")
+    lines.append("")
+    ppl_suggestions = [f"- {item}" for item in plan.topology_failures]
+    unplaced = payload["unplaced_components"]
+    if unplaced:
+        ppl_suggestions.append(f"- add explicit rules for unplaced refs: {', '.join(sorted(unplaced))}")
+    lines.extend(ppl_suggestions if ppl_suggestions else ["- none"])
+    lines.append("")
+
+    lines.append("## Risks requiring engineering review")
+    lines.append("")
+    lines.append("- Placement heuristics cannot verify impedance, return paths, plane splits, thermal, or EMI compliance.")
+    lines.append("- Stackup templates never claim impedance accuracy; validate with the fabricator.")
+    lines.append("- Run pcb-place with --high-speed-review/--power-review/--mechanical-review and inspect the output.")
+    return "\n".join(lines) + "\n"
+
+
 def run_emit(args: argparse.Namespace, *, legacy: bool = False) -> int:
     pln_path = getattr(args, "pln", None) or getattr(args, "intent", None)
     _ensure_exists(args.board, "Board")
@@ -2490,6 +3388,8 @@ def run_emit(args: argparse.Namespace, *, legacy: bool = False) -> int:
         return 0
     if getattr(args, "summary_md", None):
         _write_text(args.summary_md, _summary_markdown("pcb-plan summary", {"report": report(plan)}))
+    if getattr(args, "ai_edit_hints", None):
+        _write_text(args.ai_edit_hints, ai_edit_hints_text(plan))
     ppl = emit_ppl(plan, args.board, args.netlist)
     _write_text(args.output, ppl)
     return 0

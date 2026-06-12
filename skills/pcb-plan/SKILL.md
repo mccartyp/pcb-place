@@ -291,13 +291,37 @@ pcb-plan update \
 5. Claude adjusts POWER and HIGH_SPEED regions/keepouts to reduce overlap and
    improve routing corridors, then reruns check/emit/place.
 
+## Topology-Aware Placement Model
+
+Planning follows a fixed priority: mechanical constraints first (board outline,
+mounting holes, edge connectors, keepouts), functional signal-path topology
+second (`functional_paths` / inferred connector -> ESD -> IC paths emitted as
+`HighSpeedPath(...)`), power topology third (`power_islands` with compact
+regulator/input-cap/inductor/output-cap/feedback placement; load decouplers stay
+at their loads), support passives fourth; spacing is always enforced from the
+`spacing:` profile (conservative non-touching defaults).
+
+Groups are metadata, clusters are not atomic: a ref can belong to several
+semantic groups, but exactly one rule owns its final placement (see
+`ownership_model`, `semantic_groups`, `multi_group_components`, and
+`clusters_are_metadata` in the reports). Edge-required connectors are
+edge-locked, rotated by `access_side` (`rotation: auto`), and may extend their
+body outside the board with `allow_body_outside_board: true`. Mounting holes go
+to distinct corners or explicit `mechanical.mounting_holes` entries — never into
+clusters. Stackup templates (`2_layer_basic` ... `10_layer_high_speed`, or
+`stackup: { layers: 6 }`) improve intent only and never claim impedance
+accuracy. Use `pcb-plan emit --ai-edit-hints ai-edit-hints.md` to get the
+uncertain inferences, owners, and suggested `.pln`/`.ppl` edits for AI-assisted
+iteration.
+
 ## Important Concepts
 
 - **`board.pln`** — the single source of planning intent (JSON or a
   dependency-free YAML-like subset). Top-level sections: `board`, `fixed`,
   `regions`, `keepouts`, `roles`, `clusters`, `high_speed`, `routing`,
   `stackup`, `differential_pairs`, `net_classes`, `routing_overrides`,
-  `simulation`, `provenance`. Avoid YAML anchors/aliases/block scalars/custom
+  `simulation`, `provenance`, `spacing`, `components`, `mechanical`,
+  `functional_paths`, `power_islands`. Avoid YAML anchors/aliases/block scalars/custom
   tags — use JSON if those features are needed.
 - **`placement.ppl`** — the deterministic placement DSL consumed by
   `pcb-place`. `pcb-plan emit` unwraps provenance-wrapped values into plain

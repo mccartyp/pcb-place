@@ -133,6 +133,24 @@ When asked to apply or debug a `placement.ppl`:
     `board.pln` changes first. Use manual `Anchor` edits only as a last resort
     when the planning primitive cannot express the needed intent.
 
+## Placement Ownership, Edge Connectors, and Review Reports
+
+The report's `ownership` section records the unique winning rule per ref;
+cluster moves later refined by higher-priority rules (ESD, arrays, near-pad)
+are expected, not errors. `Edge(...)` supports `rot="auto"` (rotation from
+`access_side`: top 0°, right 90°, bottom 180°, left 270°, assuming the mating
+face points toward the top edge at rot=0) and `allow_body_outside_board=True`
+(connector body may extend past the outline while its anchor stays on-board;
+reported in `allowed_outside_board_refs`, not as a violation). Spacing defaults
+are conservative (`passive_to_passive=0.25`, `passive_to_ic=0.40`,
+`ic_to_ic=0.75`, `connector=1.0`, `mechanical=1.0`); arrays escalate spacing
+rather than emit touching parts. Emit markdown reviews with
+`--high-speed-review`, `--power-review`, `--mechanical-review`, and
+`--ai-edit-hints` to score `HighSpeedPath(...)` directness/ESD position/corridor
+intruders, `PowerIsland(...)` hot-loop compactness and high-speed separation,
+mounting-hole distribution, and to collect suggested `.ppl` edits for
+AI-assisted iteration.
+
 ## AI-Assisted Placement Report Review
 
 After every `pcb-place ... --dry-run --report-json pcb-place-report.json`,

@@ -349,12 +349,15 @@ If you want mechanically simple rotations, `--cardinal-rotations` rounds explici
 
 `pcb-place` checks placed footprint bounding boxes instead of treating footprint center points as sufficient physical geometry.  It parses common KiCad footprint primitives such as pads and footprint graphics to estimate each footprint's occupied area, reports fallback bounding boxes when exact geometry is unavailable, and validates both direct overlaps and minimum spacing.
 
-Spacing is configurable globally:
+Spacing is configurable globally. Defaults are conservative and never let parts
+touch: `default=0.25`, `passive_to_passive=0.25`, `passive_to_ic=0.40`,
+`ic_to_ic=0.75`, `connector=1.00`, `mechanical=1.00` (the aliases
+`connector_to_component`/`mechanical_to_component` are also accepted):
 
 ```python
 Spacing(
     default=0.25,
-    passive_to_ic=0.50,
+    passive_to_ic=0.40,
     connector=1.00,
 )
 
@@ -544,7 +547,54 @@ Explicit rotations are normalized into `[0, 360)`. With `--cardinal-rotations`, 
 | `CopyPlacement` | Copies repeated-channel placement from one hierarchical prefix to another. |
 | `Keepout` | Parsed, reported, and used by basic validation; KiCad geometry not emitted yet. |
 | `Corridor` | Parsed and reported; KiCad geometry not emitted yet. |
+| `HighSpeedPath` | Metadata: declares a connector -> protection -> IC path, reserves a scored corridor against unrelated parts, and feeds `--high-speed-review`. |
+| `PowerIsland` | Metadata: declares regulator topology membership (input caps, inductor, output caps, feedback, switch net) and feeds `--power-review`. |
 | `Component` | Fluent wrapper around the rule functions. |
+
+### Edge connectors: access side, rotation, and body extension
+
+`Edge(...)` supports `access_side=...`, `edge_required=True`, `rot="auto"`, and
+`allow_body_outside_board=True`:
+
+```python
+Edge("J1", edge="left", y=20, inset=2, rot="auto", access_side="left",
+     edge_required=True, allow_body_outside_board=True)
+```
+
+- `rot="auto"` rotates the connector from its access side using the convention
+  that at rot=0 the footprint's mating face points toward the top board edge
+  (-y): top→0°, right→90°, bottom→180°, left→270°. Supply an explicit `rot=`
+  for footprints with a different convention.
+- A `Cluster(...)` with an Edge placement rotates rigidly: the anchor takes the
+  access-side rotation and members rotate around it, preserving relative
+  geometry.
+- `allow_body_outside_board=True` lets the footprint body/courtyard extend past
+  the board outline — an expected mechanical condition for edge connectors, not
+  an ordinary outside-board violation — while the footprint anchor must remain
+  on the board. The report lists these refs in `allowed_outside_board_refs`,
+  and `edge_required_validation` confirms each edge-required ref actually sits
+  at a board edge.
+
+### Review reports and AI edit hints
+
+`--report-json` now includes `ownership` (the unique winning rule per ref, and
+whether a cluster move was refined), `spacing_profile`, `high_speed_paths`,
+`power_islands`, and `mechanical_review`. Markdown reviews can be written
+directly:
+
+```bash
+pcb-place board.kicad_pcb placement.ppl -o out.kicad_pcb \
+  --high-speed-review high-speed-placement-review.md \
+  --power-review power-placement-review.md \
+  --mechanical-review mechanical-placement-review.md \
+  --ai-edit-hints ai-edit-hints.md
+```
+
+`ai-edit-hints.md` lists uncertain/adjusted placements, fallback searches,
+placement ownership, and suggested `.ppl` edits: the `.pln`/`.ppl` files are
+intended to be edited by humans and AI assistants as part of an iterative
+layout optimization workflow. These reviews score placement only; impedance,
+return paths, and EMI compliance still require engineering review.
 
 ## Reference matching
 
