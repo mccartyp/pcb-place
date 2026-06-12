@@ -128,6 +128,55 @@ When asked to apply or debug a `placement.ppl`:
     remove rules to bisect which rule causes a failure; use
     `--print-clusters`/`--print-regions` to confirm declarations parsed as
     expected; re-run `--dry-run` after each change.
+11. **Prefer planner intent fixes over executor hacks.** When `placement.ppl`
+    was emitted by `pcb-plan`, fix recurring dry-run failures by proposing
+    `board.pln` changes first. Use manual `Anchor` edits only as a last resort
+    when the planning primitive cannot express the needed intent.
+
+## AI-Assisted Placement Report Review
+
+After every `pcb-place ... --dry-run --report-json pcb-place-report.json`,
+Claude should inspect the report before recommending a write. Treat the report
+as feedback to improve `board.pln` and regenerate `placement.ppl`, not as a
+reason to hide failures with ad-hoc placement edits.
+
+Inspect:
+
+- collisions and near-collisions;
+- spacing violations;
+- keepout violations;
+- region violations;
+- outside-board placements and board-geometry source;
+- array slide/clamp diagnostics, including candidate `PlacementRegion`,
+  capacity, original/slid array bboxes, slide deltas, and rejected candidates;
+- placement ownership conflicts, duplicate owners, priority conflicts, and
+  overridden rules;
+- attempts to move locked, fixed, mechanical, or edge-required components;
+- unplaced references;
+- candidate search failures for `DecouplingArray`, `PullupArray`, `NearPad`,
+  `Satellite`, `Between`, `Inline`, rows/columns, and other automatic rules.
+
+Propose `board.pln` changes such as:
+
+- region size/position changes to give clusters and arrays legal room;
+- keepout additions, shrinkage, expansion, or relocation when the report shows
+  missing or over-broad exclusions;
+- `effective_side` overrides when automatic side selection chooses a bad
+  side, especially near edges or high-speed corridors;
+- `DecouplingArray` spacing, stagger, rows, distance, side, and
+  `effective_side` updates;
+- `PullupArray` or strap-array owner, side, row/spacing, and
+  `effective_side` updates;
+- explicit `edge_required` and `access_side` corrections for connectors,
+  buttons, antenna modules, mounting holes, and other access/mechanical parts;
+- cluster/keepout/high-speed/power-region changes when ownership conflicts or
+  region violations show the floorplan is wrong.
+
+Do **not** recommend disabling `DecouplingArray` or `PullupArray` just because
+placement failed. Keep those primitives and adjust their owner, side, region,
+spacing, stagger, rows, or `effective_side` unless the primitive itself is
+broken. Manual `Anchor` placement is the last resort after planner intent,
+regions, keepouts, side selection, and array strategy have been reviewed.
 
 ## Troubleshooting
 
