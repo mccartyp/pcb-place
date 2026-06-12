@@ -40,7 +40,7 @@ from pcb_place import (
     parse_netlist_aliases,
 )
 
-__version__ = "0.10.0-experimental"
+__version__ = "0.12.0"
 
 Point = Tuple[float, float]
 _POWER_RE = re.compile(r"^(?:\+?(?:1V[0-9]|1V[0-9]|[0-9]+V[0-9]*|VCC|VDD|VBAT|VIN|VBUS|AVDD|DVDD|PVDD|3V3|5V|12V))", re.I)
@@ -1096,7 +1096,7 @@ def _nearest_pad(parent: PlanComponent, nets: set[str]) -> Optional[str]:
 def _connected_refs(anchor: PlanComponent, nets: Mapping[str, PlanNet]) -> set[str]:
     refs: set[str] = set()
     for net_name in anchor.nets:
-        if is_ground(net_name):
+        if is_ground(net_name) or is_power(net_name):
             continue
         for ref, _pin in nets.get(net_name, PlanNet(net_name)).pads:
             if ref != anchor.ref:
@@ -1113,7 +1113,7 @@ def _alias_groups(aliases: Mapping[str, str]) -> Dict[str, set[str]]:
     return groups
 
 
-def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanComponent], nets: Optional[Mapping[str, PlanNet]] = None, aliases: Optional[Mapping[str, str]] = None, radius: float = 12.0) -> List[str]:
+def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanComponent], nets: Optional[Mapping[str, PlanNet]] = None, aliases: Optional[Mapping[str, str]] = None, radius: float = 12.0, proximity_any_role: bool = True) -> List[str]:
     shared = set(anchor.nets)
     connected = _connected_refs(anchor, nets or {}) if nets else set()
     alias_refs = set()
@@ -1126,9 +1126,12 @@ def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanCompone
         if comp.ref == anchor.ref or comp.role == "mechanical":
             continue
         dist = math.hypot(anchor.x - comp.x, anchor.y - comp.y)
-        has_shared_signal = bool((shared & set(comp.nets)) - {n for n in shared if is_ground(n)})
+        if dist > radius and comp.ref not in alias_refs:
+            continue
+        has_shared_signal = bool((shared & set(comp.nets)) - {n for n in shared if is_ground(n) or is_power(n)})
         is_support = comp.role in support_roles and dist <= radius
-        if comp.ref in connected or comp.ref in alias_refs or has_shared_signal or is_support or (dist <= radius / 2.0 and comp.role != "unknown"):
+        is_nearby_any_role = proximity_any_role and dist <= radius / 2.0 and comp.role != "unknown"
+        if comp.ref in connected or comp.ref in alias_refs or has_shared_signal or is_support or is_nearby_any_role:
             members.append(comp.ref)
     return sorted(set(members), key=lambda r: (r != anchor.ref, r))
 
@@ -1354,7 +1357,7 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     # Connector/high-speed clusters.
     for comp in components.values():
         if "connector" in comp.role:
-            members = _cluster_members(comp, components, nets, aliases, radius=18.0)
+            members = _cluster_members(comp, components, nets, aliases, radius=18.0, proximity_any_role=False)
             local_x = max(0.0, min(board.width, comp.x - board.origin_x))
             local_y = max(0.0, min(board.height, comp.y - board.origin_y))
             distances = {
@@ -1798,7 +1801,7 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
         lines.append("")
     lines.extend(routing_summary_comments(plan))
     lines.extend([
-        f"Board(width={plan.board.width:.6g}, height={plan.board.height:.6g}, origin_x={plan.board.origin_x:.6g}, origin_y={plan.board.origin_y:.6g})",
+        f"Board(width={plan.board.width:.6g}, height={plan.board.height:.6g}, origin_x={plan.board.origin_x:.6g}, origin_y={plan.board.origin_y:.6g}, emit_outline=True)",
         "Spacing(default=0.25, passive_to_ic=0.50, connector=1.00)",
         "PlacementPolicy(avoid_overlap=True, allow_anchor_move=False, max_search_radius=5, search_step=0.5)",
         "",
