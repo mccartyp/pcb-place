@@ -52,7 +52,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 Number = float | int
 Point = Tuple[float, float]
@@ -189,11 +189,15 @@ class PlacementRegion:
 
 @dataclasses.dataclass
 class ClearanceRules:
-    """Configurable minimum clearance rules in millimeters."""
+    """Configurable minimum clearance rules in millimeters.
+
+    Defaults are deliberately conservative so generated placements never
+    default to essentially-touching parts; override via Spacing() in .ppl.
+    """
 
     default: float = 0.25
-    passive_to_passive: float = 0.20
-    passive_to_ic: float = 0.50
+    passive_to_passive: float = 0.25
+    passive_to_ic: float = 0.40
     ic_to_ic: float = 0.75
     connector: float = 1.00
     mechanical: float = 1.00
@@ -866,11 +870,17 @@ def load_ppl(path: Path) -> PlacementModel:
             raise PlacementError(f"Region() unknown parameter(s): {', '.join(sorted(kwargs))}")
         model.region(str(name), x=x, y=y, w=w, h=h, role=role, note=note, priority=priority)
 
-    def Spacing(*, default: Number = 0.25, passive_to_passive: Number = 0.20,
-                passive_to_ic: Number = 0.50, ic_to_ic: Number = 0.75,
-                connector: Number = 1.00, mechanical: Number = 1.00, **kwargs: Any) -> None:
+    def Spacing(*, default: Number = 0.25, passive_to_passive: Number = 0.25,
+                passive_to_ic: Number = 0.40, ic_to_ic: Number = 0.75,
+                connector: Number = 1.00, mechanical: Number = 1.00,
+                connector_to_component: Optional[Number] = None,
+                mechanical_to_component: Optional[Number] = None, **kwargs: Any) -> None:
         if kwargs:
             raise PlacementError(f"Spacing() unknown parameter(s): {', '.join(sorted(kwargs))}")
+        if connector_to_component is not None:
+            connector = connector_to_component
+        if mechanical_to_component is not None:
+            mechanical = mechanical_to_component
         model.clearance = ClearanceRules(float(default), float(passive_to_passive), float(passive_to_ic),
                                          float(ic_to_ic), float(connector), float(mechanical))
 
@@ -997,6 +1007,7 @@ def load_ppl(path: Path) -> PlacementModel:
              rot: Optional[Number | str] = None, role: Optional[str] = None,
              lock: bool = False, locked: bool = False, edge_required: bool = False,
              mechanical: bool = False, access_side: Optional[str] = None,
+             allow_body_outside_board: bool = False,
              note: Optional[str] = None, **kwargs: Any) -> None:
         w, h, _ox, _oy = _require_board_size(model, "Edge")
         e = edge.lower().replace("-", "_")
@@ -1021,6 +1032,7 @@ def load_ppl(path: Path) -> PlacementModel:
                     rot=_rot_or_none(rot), role=role,
                     lock=must_lock, locked=must_lock, edge_required=bool(edge_required),
                     mechanical=bool(mechanical), access_side=access,
+                    allow_body_outside_board=bool(allow_body_outside_board),
                     edge=e, note=note, extra=dict(kwargs))
         if ref is None:
             return rule
@@ -1247,6 +1259,38 @@ def load_ppl(path: Path) -> PlacementModel:
         model.add("corridor", name=str(name), a=_normalize_ref(a), b=_normalize_ref(b),
                   width=float(width), clearance=float(clearance), role=role, note=note, extra=dict(kwargs))
 
+    def HighSpeedPath(name: str, *, sequence: Sequence[str], corridor_width: Number = 3.0,
+                      protect_first: bool = True, role: str = "high_speed",
+                      note: Optional[str] = None, **kwargs: Any) -> None:
+        """Declare a high-speed signal path (connector -> protection -> IC).
+
+        Metadata only: it moves nothing by itself, but the path is scored in the
+        high-speed placement review (directness, ESD position, corridor
+        obstruction) and its corridor contributes soft scoring penalties.
+        """
+        seq = [_normalize_ref(r) for r in sequence]
+        if len(seq) < 2:
+            raise PlacementError(f"HighSpeedPath({name!r}) requires at least two sequence members")
+        model.add("high_speed_path", name=str(name), sequence=seq, corridor_width=float(corridor_width),
+                  protect_first=bool(protect_first), role=role, note=note, extra=dict(kwargs))
+
+    def PowerIsland(name: str, *, regulator: str, input_caps: Sequence[str] = (),
+                    inductor: Optional[str] = None, output_caps: Sequence[str] = (),
+                    feedback: Sequence[str] = (), switch_net: Optional[str] = None,
+                    role: str = "power_island", note: Optional[str] = None, **kwargs: Any) -> None:
+        """Declare a regulator power-island topology.
+
+        Metadata only: members are placed by their own rules; the island is
+        scored in the power placement review (hot-loop area, cap/inductor
+        compactness, feedback proximity, separation from high-speed paths).
+        """
+        model.add("power_island", name=str(name), regulator=_normalize_ref(regulator),
+                  input_caps=[_normalize_ref(r) for r in input_caps],
+                  inductor=None if inductor is None else _normalize_ref(inductor),
+                  output_caps=[_normalize_ref(r) for r in output_caps],
+                  feedback=[_normalize_ref(r) for r in feedback],
+                  switch_net=switch_net, role=role, note=note, extra=dict(kwargs))
+
     class ComponentBuilder:
         """Fluent API for users who prefer Component("U1").anchor(...).
 
@@ -1329,6 +1373,8 @@ def load_ppl(path: Path) -> PlacementModel:
         "CopyPlacement": CopyPlacement,
         "Keepout": Keepout,
         "Corridor": Corridor,
+        "HighSpeedPath": HighSpeedPath,
+        "PowerIsland": PowerIsland,
         "mm": lambda v: float(v),
         "True": True,
         "False": False,
@@ -1645,6 +1691,18 @@ def _same_physical_side(a: Footprint, b: Footprint) -> bool:
     side_a = _physical_side(a)
     side_b = _physical_side(b)
     return side_a == "both" or side_b == "both" or side_a == side_b
+
+
+# Rotation applied for rot="auto" on Edge() rules, by access side. Convention:
+# at rot=0 the footprint's mating face points toward -y (the top board edge).
+# Override with an explicit rot=... when a footprint uses a different convention.
+ACCESS_SIDE_ROTATIONS: Dict[str, float] = {"top": 0.0, "right": 90.0, "bottom": 180.0, "left": 270.0}
+
+
+def access_side_rotation(access_side: Optional[str]) -> Optional[float]:
+    if access_side is None:
+        return None
+    return ACCESS_SIDE_ROTATIONS.get(str(access_side).lower().replace("-", "_"))
 
 
 def _rot_point(x: float, y: float, deg: float) -> Point:
@@ -1983,12 +2041,42 @@ class PlacementEngine:
         self.clusters: List[Dict[str, Any]] = []
         self.last_cluster_by_ref: Dict[str, str] = {}
         self.search_log: Dict[str, SearchOutcome] = {}
+        self.allow_body_outside_refs: Set[str] = self._collect_allow_body_outside_refs()
         for error in model.alias_diagnostics.errors:
             self.messages.append(Message("error", error))
         for warning in model.alias_diagnostics.warnings:
             self.messages.append(Message("warn", warning))
         if self.strict and model.alias_diagnostics.errors:
             raise PlacementError("netlist alias validation failed: " + "; ".join(model.alias_diagnostics.errors))
+
+    def _collect_allow_body_outside_refs(self) -> Set[str]:
+        """Refs whose footprint body/courtyard may extend past the board outline.
+
+        Granted by Edge(allow_body_outside_board=True) directly or via a
+        Cluster() whose Edge placement carries the flag (the grant applies to
+        the cluster anchor, typically the connector itself, not its support
+        parts). The footprint origin must still land inside the board.
+        """
+
+        allowed: Set[str] = set()
+
+        def flagged(spec: Mapping[str, Any]) -> bool:
+            return bool(spec.get("allow_body_outside_board") or
+                        (spec.get("extra") or {}).get("allow_body_outside_board"))
+
+        for rule in self.model.rules:
+            if rule.get("type") == "cluster":
+                placement = rule.get("placement") or {}
+                if isinstance(placement, Mapping) and flagged(placement):
+                    anchor = self.resolve_ref(str(rule.get("anchor")))
+                    if anchor is not None:
+                        allowed.add(anchor)
+                continue
+            if rule.get("ref") is not None and flagged(rule):
+                actual = self.resolve_ref(str(rule["ref"]))
+                if actual is not None:
+                    allowed.add(actual)
+        return allowed
 
     def alias_map(self) -> Dict[str, str]:
         """Return the effective alias map used by the resolver."""
@@ -2192,15 +2280,24 @@ class PlacementEngine:
         new_anchor = self._placement_target(rule["placement"])
         dx = new_anchor[0] - old_anchor[0]
         dy = new_anchor[1] - old_anchor[1]
-        targets = [(self.positions[actual][0] + dx, self.positions[actual][1] + dy) for actual in members]
+        rot_delta = self._cluster_rotation_delta(rule["placement"], anchor_ref)
+        if abs(rot_delta) > 1e-9:
+            self.messages.append(Message("note",
+                f"cluster {name} rotated rigidly by {_fmt_num(rot_delta)} deg to honor access_side/rotation"))
+        targets = []
+        for actual in members:
+            mx, my, _ = self.positions[actual]
+            ox, oy = _rot_point(mx - old_anchor[0], my - old_anchor[1], rot_delta)
+            targets.append((new_anchor[0] + ox, new_anchor[1] + oy))
         margin = self.model.policy.max_search_radius + 5.0
         cluster_region = BBox(
             min(t[0] for t in targets) - margin, min(t[1] for t in targets) - margin,
             max(t[0] for t in targets) + margin, max(t[1] for t in targets) + margin,
         )
-        for actual in members:
-            x, y, rot = self.positions[actual]
-            self.place(actual, x + dx, y + dy, None, f"cluster {name}", rule.get("note"),
+        for actual, (tx, ty) in zip(members, targets):
+            _x, _y, rot = self.positions[actual]
+            new_rot = None if abs(rot_delta) <= 1e-9 else _normalize_rotation(rot + rot_delta)
+            self.place(actual, tx, ty, new_rot, f"cluster {name}", rule.get("note"),
                        region_override=cluster_region)
             self.last_cluster_by_ref[actual] = name
         if self._rule_flag(rule.get("placement", {}), "edge_required", False):
@@ -2213,6 +2310,27 @@ class PlacementEngine:
             "old_anchor": [old_anchor[0], old_anchor[1]],
             "new_anchor": [new_anchor[0], new_anchor[1]],
         })
+
+    def _cluster_rotation_delta(self, placement: Mapping[str, Any], anchor_ref: str) -> float:
+        """Rigid rotation to apply to a cluster so its anchor honors the Edge rotation.
+
+        Only Edge placements rotate clusters: rot="auto" uses the access-side
+        convention, an explicit numeric rot is honored directly. The whole
+        cluster rotates around the anchor so relative geometry is preserved.
+        """
+
+        if placement.get("type") != "edge":
+            return 0.0
+        rot_spec = placement.get("rot")
+        target_rot: Optional[float] = None
+        if isinstance(rot_spec, str) and rot_spec.lower() == "auto":
+            target_rot = access_side_rotation(placement.get("access_side") or placement.get("edge"))
+        elif rot_spec is not None:
+            target_rot = _normalize_rotation(float(rot_spec))
+        if target_rot is None:
+            return 0.0
+        current = self.positions[anchor_ref][2]
+        return _normalize_rotation(target_rot - current)
 
     def lock(self, ref: str, why: str = "Lock") -> None:
         actual_ref = self.resolve_ref(ref)
@@ -2357,6 +2475,21 @@ class PlacementEngine:
             return 0.0
         penalty = 0.0
         for rule in self.model.rules:
+            if rule.get("type") == "high_speed_path":
+                members = {self.resolve_ref(r) or r for r in rule.get("sequence", [])}
+                if ref in members:
+                    continue
+                width = float(rule.get("corridor_width", 3.0))
+                for a_name, b_name in zip(rule.get("sequence", []), rule.get("sequence", [])[1:]):
+                    a_ref = self.resolve_ref(a_name)
+                    b_ref = self.resolve_ref(b_name)
+                    if a_ref not in self.positions or b_ref not in self.positions:
+                        continue
+                    ax, ay, _ = self.positions[a_ref]
+                    bx, by, _ = self.positions[b_ref]
+                    if _bbox_intrudes_corridor(bbox, (ax, ay), (bx, by), width):
+                        penalty += 25.0
+                continue
             if rule.get("type") != "corridor":
                 continue
             marker = " ".join(str(rule.get(k, "")) for k in ("name", "role", "note")).lower()
@@ -3054,9 +3187,16 @@ class PlacementEngine:
         scored_attempts: List[SearchCandidate] = []
         chosen_attempt: Optional[Dict[str, Any]] = None
         distances = [distance + delta for delta in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0)]
-        shifts = [0.0, spacing / 2.0, -spacing / 2.0, spacing, -spacing, 1.5 * spacing, -1.5 * spacing, 2.0 * spacing, -2.0 * spacing]
         stagger_options = [False, True] if stagger_requested else [False]
-        for dist in distances:
+        # If the requested spacing cannot satisfy clearance between array members,
+        # escalate spacing rather than failing or placing touching parts.
+        requested_spacing = spacing
+        spacing_ladder = [requested_spacing] + [requested_spacing * mult for mult in (1.25, 1.5, 2.0)]
+        for spacing in spacing_ladder:
+          if chosen_attempt is not None:
+            break
+          shifts = [0.0, spacing / 2.0, -spacing / 2.0, spacing, -spacing, 1.5 * spacing, -1.5 * spacing, 2.0 * spacing, -2.0 * spacing]
+          for dist in distances:
             for side_name in sides:
                 for staggered in stagger_options:
                     for shift in shifts:
@@ -3078,6 +3218,7 @@ class PlacementEngine:
                         rows = max(1, math.ceil(n / (max_per_row or min(3, max(1, math.ceil(n / 2))) if staggered else n)))
                         shape = "stagger" if staggered else ("column" if side_name in {"left", "right"} else "row")
                         metadata = {"side": side_name, "effective_side": side_name, "distance": round(dist, 6), "shift": round(shift, 6),
+                                    "spacing": round(spacing, 6), "requested_spacing": round(requested_spacing, 6),
                                     "staggered": staggered, "shape": shape, "side_rank": sides.index(side_name), "rows": rows,
                                     "columns": max_per_row or (min(3, max(1, math.ceil(n / 2))) if staggered else n),
                                     "candidate_count": len(candidates),
@@ -3094,7 +3235,7 @@ class PlacementEngine:
                         scored = self._score_grouped_array_attempt(refs, actual_refs, candidates, rot,
                                                                    side_origin, label, result, metadata)
                         attempt = {"side": side_name, "distance": dist, "shift": shift,
-                                   "staggered": staggered, "shape": shape,
+                                   "spacing": spacing, "staggered": staggered, "shape": shape,
                                    "anchor": candidates[len(candidates) // 2] if candidates else side_origin,
                                    "original_candidates": original_candidates, "candidates": candidates,
                                    "placement_region": None if placement_region is None else placement_region.as_report(),
@@ -3125,6 +3266,11 @@ class PlacementEngine:
                 f"stagger={attempt['staggered']}) rejected: {attempt.get('failed_ref')!r} {attempt.get('reason')}"))
 
         if succeeded is not None:
+            chosen_spacing = float(chosen_attempt.get("spacing", requested_spacing))
+            if abs(chosen_spacing - requested_spacing) > 1e-9:
+                self.messages.append(Message("note",
+                    f"{why}: array spacing increased from {_fmt_num(requested_spacing)} to "
+                    f"{_fmt_num(chosen_spacing)} mm to satisfy clearance rules"))
             for ref, (x, y) in zip(refs, succeeded):
                 self.place(ref, x, y, rot, why, rule.get("note"),
                            allow_arbitrary_rotation=allow_arbitrary_rotation,
@@ -3187,7 +3333,10 @@ class PlacementEngine:
             return None
         test_info = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model)
         if not _board_contains_bbox(self.board_geometry, test_info.bbox):
-            return "would leave board bounds"
+            if ref not in self.allow_body_outside_refs:
+                return "would leave board bounds"
+            if self.board_geometry is not None and not self.board_geometry.contains(x, y):
+                return "anchor would leave board bounds (body extension allowed, anchor is not)"
         if region is not None and not region.contains_bbox(test_info.bbox):
             return "would leave region"
         if forbidden_bboxes:
@@ -3274,7 +3423,15 @@ class PlacementEngine:
             typ = rule["type"]
             if typ in {"anchor", "fixed", "corner", "edge"}:
                 x, y = self._placement_target(rule)
-                self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot")), typ, rule.get("note"),
+                rot_spec = rule.get("rot")
+                if typ == "edge" and isinstance(rot_spec, str) and rot_spec.lower() == "auto":
+                    rot = access_side_rotation(rule.get("access_side") or rule.get("edge"))
+                    if rot is not None:
+                        self.messages.append(Message("note",
+                            f"{rule['ref']} edge rotation auto: access_side={rule.get('access_side') or rule.get('edge')!r} -> rot={_fmt_num(rot)}"))
+                else:
+                    rot = self.resolve_rot(rot_spec)
+                self.place(rule["ref"], x, y, rot, typ, rule.get("note"),
                            allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule), rule=rule)
 
             elif typ == "cluster":
@@ -3418,6 +3575,15 @@ class PlacementEngine:
                                                    f"width={_fmt_num(rule['width'])} "
                                                    f"clearance={_fmt_num(rule['clearance'])} parsed but not emitted yet"))
 
+            elif typ == "high_speed_path":
+                self.messages.append(Message("note", f"high-speed path {rule['name']!r}: "
+                                                   f"{' -> '.join(rule['sequence'])} "
+                                                   f"corridor_width={_fmt_num(rule['corridor_width'])} (scored in review)"))
+
+            elif typ == "power_island":
+                self.messages.append(Message("note", f"power island {rule['name']!r}: regulator {rule['regulator']} "
+                                                   f"(scored in review)"))
+
 
 def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
                         allow_overlap: bool = False, warn_overlap: bool = False,
@@ -3514,6 +3680,429 @@ def validate_safe_placements(engine: PlacementEngine, *, allow_large_move: bool 
     return messages
 
 
+def ownership_report(engine: PlacementEngine) -> Dict[str, Dict[str, Any]]:
+    """Final placement ownership per ref: exactly one winning rule per footprint.
+
+    Groups/clusters are metadata; this records which rule actually owns the
+    final coordinates, and whether a coarse cluster move was later refined by
+    a higher-priority rule.
+    """
+
+    ownership: Dict[str, Dict[str, Any]] = {}
+    for ref, update in engine.updates.items():
+        cluster = engine.last_cluster_by_ref.get(ref)
+        refined = cluster is not None and not update.why.startswith("cluster ")
+        ownership[ref] = {
+            "owner_rule": update.why,
+            "priority": engine.applied_priority.get(ref, 0.0),
+            "rule_index": engine.applied_rule_index.get(ref, -1),
+            "cluster": cluster,
+            "refined_from_cluster": refined,
+            "locked": ref in engine.locked,
+            "allow_body_outside_board": ref in engine.allow_body_outside_refs,
+        }
+    return ownership
+
+
+def _resolved_position(engine: PlacementEngine, ref: str) -> Optional[Point]:
+    actual = engine.resolve_ref(ref)
+    if actual is None or actual not in engine.positions:
+        return None
+    x, y, _ = engine.positions[actual]
+    return x, y
+
+
+def _bbox_at_current(engine: PlacementEngine, ref: str) -> Optional[BBox]:
+    actual = engine.resolve_ref(ref)
+    if actual is None or actual not in engine.footprints:
+        return None
+    x, y, rot = engine.positions[actual]
+    return footprint_bbox_at(engine.footprints[actual], x, y, rot, engine.model).bbox
+
+
+def high_speed_path_review(engine: PlacementEngine) -> List[Dict[str, Any]]:
+    """Score each declared HighSpeedPath: directness, protection position, corridor obstruction."""
+
+    reviews: List[Dict[str, Any]] = []
+    for rule in engine.model.rules:
+        if rule.get("type") != "high_speed_path":
+            continue
+        sequence = [str(r) for r in rule.get("sequence", [])]
+        width = float(rule.get("corridor_width", 3.0))
+        positions = [(name, _resolved_position(engine, name)) for name in sequence]
+        missing = [name for name, pos in positions if pos is None]
+        located = [(name, pos) for name, pos in positions if pos is not None]
+        warnings: List[str] = []
+        if missing:
+            warnings.append(f"path members missing from board: {', '.join(missing)}")
+        segments: List[Dict[str, Any]] = []
+        total = 0.0
+        for (a_name, a), (b_name, b) in zip(located, located[1:]):
+            length = math.hypot(b[0] - a[0], b[1] - a[1])
+            total += length
+            segments.append({"from": a_name, "to": b_name, "length_mm": round(length, 3)})
+        direct = math.hypot(located[-1][1][0] - located[0][1][0],
+                            located[-1][1][1] - located[0][1][1]) if len(located) >= 2 else 0.0
+        straightness = (direct / total) if total > 1e-9 else 1.0
+        if straightness < 0.85 and len(located) >= 3:
+            warnings.append(f"path detours: straightness {straightness:.2f} (1.0 is a straight flow-through path)")
+        protection_quality = None
+        if rule.get("protect_first") and len(located) >= 3:
+            conn_to_prot = segments[0]["length_mm"]
+            ratio = conn_to_prot / total if total > 1e-9 else 0.0
+            protection_quality = {
+                "protection_ref": located[1][0],
+                "connector_to_protection_mm": conn_to_prot,
+                "protection_position_ratio": round(ratio, 3),
+            }
+            if ratio > 0.5:
+                warnings.append(f"protection {located[1][0]} sits closer to the IC than the connector; "
+                                "ESD should be placed near the connector for flow-through protection")
+        intruders: List[str] = []
+        members = {engine.resolve_ref(name) or name for name in sequence}
+        for (a_name, a), (b_name, b) in zip(located, located[1:]):
+            for other in sorted(engine.positions):
+                if other in members or other not in engine.footprints:
+                    continue
+                bbox = _bbox_at_current(engine, other)
+                if bbox is not None and _bbox_intrudes_corridor(bbox, a, b, width) and other not in intruders:
+                    intruders.append(other)
+        if intruders:
+            warnings.append("unrelated components intrude the high-speed corridor: " + ", ".join(intruders))
+        reviews.append({
+            "name": str(rule.get("name")),
+            "sequence": sequence,
+            "corridor_width_mm": width,
+            "segments": segments,
+            "total_path_length_mm": round(total, 3),
+            "direct_distance_mm": round(direct, 3),
+            "straightness": round(straightness, 3),
+            "protection": protection_quality,
+            "corridor_intruders": intruders,
+            "warnings": warnings,
+        })
+    return reviews
+
+
+def power_island_review(engine: PlacementEngine) -> List[Dict[str, Any]]:
+    """Score each declared PowerIsland: compactness, hot-loop area, feedback proximity, HS separation."""
+
+    hs_segments: List[Tuple[Point, Point]] = []
+    for rule in engine.model.rules:
+        if rule.get("type") != "high_speed_path":
+            continue
+        pts = [p for p in (_resolved_position(engine, r) for r in rule.get("sequence", [])) if p is not None]
+        hs_segments.extend(zip(pts, pts[1:]))
+
+    reviews: List[Dict[str, Any]] = []
+    for rule in engine.model.rules:
+        if rule.get("type") != "power_island":
+            continue
+        regulator = str(rule.get("regulator"))
+        reg_pos = _resolved_position(engine, regulator)
+        warnings: List[str] = []
+
+        def group_distances(refs: Sequence[str]) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for ref in refs:
+                pos = _resolved_position(engine, ref)
+                if pos is None or reg_pos is None:
+                    out.append({"ref": ref, "distance_mm": None})
+                    continue
+                out.append({"ref": ref, "distance_mm": round(math.hypot(pos[0] - reg_pos[0], pos[1] - reg_pos[1]), 3)})
+            return out
+
+        input_caps = group_distances([str(r) for r in rule.get("input_caps", [])])
+        output_caps = group_distances([str(r) for r in rule.get("output_caps", [])])
+        feedback = group_distances([str(r) for r in rule.get("feedback", [])])
+        inductor_ref = rule.get("inductor")
+        inductor = group_distances([str(inductor_ref)])[0] if inductor_ref else None
+
+        for item in input_caps:
+            if item["distance_mm"] is not None and item["distance_mm"] > 5.0:
+                warnings.append(f"input cap {item['ref']} is {item['distance_mm']} mm from {regulator}; "
+                                "keep input capacitance close to regulator power pins")
+        if inductor and inductor["distance_mm"] is not None and inductor["distance_mm"] > 6.0:
+            warnings.append(f"inductor {inductor['ref']} is {inductor['distance_mm']} mm from {regulator}")
+        for item in feedback:
+            if item["distance_mm"] is not None and item["distance_mm"] > 6.0:
+                warnings.append(f"feedback part {item['ref']} is far from {regulator} FB pin")
+
+        hot_loop_refs = [regulator] + [str(r) for r in rule.get("input_caps", [])]
+        if inductor_ref:
+            hot_loop_refs.append(str(inductor_ref))
+        hot_loop_refs.extend(str(r) for r in rule.get("output_caps", []))
+        boxes = [b for b in (_bbox_at_current(engine, r) for r in hot_loop_refs) if b is not None]
+        island_bbox = _union_bbox(boxes)
+        hot_loop_area = None if island_bbox is None else round(island_bbox.width * island_bbox.height, 3)
+
+        hs_separation = None
+        if island_bbox is not None and hs_segments:
+            cx = (island_bbox.min_x + island_bbox.max_x) / 2.0
+            cy = (island_bbox.min_y + island_bbox.max_y) / 2.0
+            hs_separation = round(min(_point_segment_distance((cx, cy), a, b) for a, b in hs_segments), 3)
+            if hs_separation < 5.0:
+                warnings.append(f"power island {rule.get('name')!r} is {hs_separation} mm from a high-speed path; "
+                                "keep switching power away from high-speed corridors")
+
+        reviews.append({
+            "name": str(rule.get("name")),
+            "regulator": regulator,
+            "input_caps": input_caps,
+            "inductor": inductor,
+            "output_caps": output_caps,
+            "feedback": feedback,
+            "switch_net": rule.get("switch_net"),
+            "island_bbox": None if island_bbox is None else island_bbox.as_report(),
+            "estimated_hot_loop_area_mm2": hot_loop_area,
+            "high_speed_separation_mm": hs_separation,
+            "warnings": warnings,
+        })
+    return reviews
+
+
+_CORNER_NAMES = ("top_left", "top_right", "bottom_left", "bottom_right")
+
+
+def _nearest_board_corner(geometry: BoardGeometry, point: Point) -> str:
+    corners = {
+        "top_left": (geometry.min_x, geometry.min_y),
+        "top_right": (geometry.max_x, geometry.min_y),
+        "bottom_left": (geometry.min_x, geometry.max_y),
+        "bottom_right": (geometry.max_x, geometry.max_y),
+    }
+    return min(corners, key=lambda name: math.hypot(point[0] - corners[name][0], point[1] - corners[name][1]))
+
+
+def mechanical_review(engine: PlacementEngine) -> Dict[str, Any]:
+    """Review mechanical placement: mounting-hole distribution and edge-connector handling."""
+
+    geometry = engine.board_geometry
+    holes: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    for ref in sorted(engine.footprints):
+        if _part_class_for(engine.model, ref) != "mechanical":
+            continue
+        x, y, _ = engine.positions[ref]
+        corner = None if geometry is None else _nearest_board_corner(geometry, (x, y))
+        holes.append({"ref": ref, "x": round(x, 3), "y": round(y, 3), "nearest_corner": corner})
+    by_corner: Dict[str, List[str]] = {}
+    for hole in holes:
+        if hole["nearest_corner"]:
+            by_corner.setdefault(hole["nearest_corner"], []).append(hole["ref"])
+    for corner, refs in sorted(by_corner.items()):
+        if len(refs) > 1:
+            warnings.append(f"mounting holes {', '.join(refs)} share nearest corner {corner}; "
+                            "holes should be distributed to distinct corners or explicit locations")
+    for i, a in enumerate(holes):
+        for b in holes[i + 1:]:
+            d = math.hypot(a["x"] - b["x"], a["y"] - b["y"])
+            if d < 5.0:
+                warnings.append(f"mounting holes {a['ref']} and {b['ref']} are clustered ({d:.2f} mm apart)")
+
+    edge_components: List[Dict[str, Any]] = []
+    for rule in engine.model.rules:
+        placement = rule.get("placement") if rule.get("type") == "cluster" else None
+        edge_rule = placement if isinstance(placement, Mapping) and placement.get("type") == "edge" else (
+            rule if rule.get("type") == "edge" else None)
+        if edge_rule is None:
+            continue
+        ref_name = str(rule.get("anchor") if rule.get("type") == "cluster" else rule.get("ref"))
+        actual = engine.resolve_ref(ref_name)
+        if actual is None:
+            continue
+        bbox = _bbox_at_current(engine, actual)
+        body_outside = (geometry is not None and bbox is not None and
+                        not _board_contains_bbox(geometry, bbox))
+        allowed = actual in engine.allow_body_outside_refs
+        if body_outside and not allowed:
+            warnings.append(f"edge component {actual} body extends outside the board without "
+                            "allow_body_outside_board=True")
+        edge_components.append({
+            "ref": actual,
+            "edge": edge_rule.get("edge"),
+            "access_side": edge_rule.get("access_side"),
+            "edge_required": bool(edge_rule.get("edge_required")),
+            "rotation": engine.positions[actual][2],
+            "rotation_spec": edge_rule.get("rot"),
+            "allow_body_outside_board": allowed,
+            "body_outside_board": body_outside,
+            "locked": actual in engine.locked,
+        })
+    return {"mounting_holes": holes, "holes_by_corner": by_corner,
+            "edge_components": edge_components, "warnings": warnings}
+
+
+def _md_warnings(lines: List[str], warnings: Sequence[str]) -> None:
+    lines.append("")
+    lines.append("## Warnings requiring human review")
+    lines.append("")
+    if warnings:
+        lines.extend(f"- {w}" for w in warnings)
+    else:
+        lines.append("- none")
+    lines.append("")
+
+
+def high_speed_review_md(reviews: Sequence[Mapping[str, Any]]) -> str:
+    lines = ["# High-speed placement review", "",
+             "Scores declared high-speed paths (connector -> protection -> IC) for directness,",
+             "flow-through ESD placement, and corridor obstruction. Placement-level review only:",
+             "impedance, return paths, and reference-plane continuity must be verified during routing.", ""]
+    all_warnings: List[str] = []
+    for review in reviews:
+        lines.append(f"## {review['name']}")
+        lines.append("")
+        lines.append(f"- path: {' -> '.join(review['sequence'])}")
+        lines.append(f"- corridor width: {review['corridor_width_mm']} mm")
+        lines.append(f"- total path length: {review['total_path_length_mm']} mm "
+                     f"(direct {review['direct_distance_mm']} mm, straightness {review['straightness']})")
+        for segment in review["segments"]:
+            lines.append(f"- segment {segment['from']} -> {segment['to']}: {segment['length_mm']} mm")
+        if review.get("protection"):
+            p = review["protection"]
+            lines.append(f"- protection {p['protection_ref']}: {p['connector_to_protection_mm']} mm from connector "
+                         f"(position ratio {p['protection_position_ratio']}; lower is closer to connector)")
+        if review["corridor_intruders"]:
+            lines.append(f"- corridor intruders: {', '.join(review['corridor_intruders'])}")
+        else:
+            lines.append("- corridor intruders: none")
+        lines.append("")
+        all_warnings.extend(review["warnings"])
+    if not reviews:
+        lines.append("No high-speed paths declared (HighSpeedPath() in placement.ppl).")
+    _md_warnings(lines, all_warnings)
+    return "\n".join(lines)
+
+
+def power_review_md(reviews: Sequence[Mapping[str, Any]]) -> str:
+    lines = ["# Power placement review", "",
+             "Scores declared power islands (regulator topology) for compactness, estimated",
+             "hot-loop area, feedback proximity, and separation from high-speed paths.", ""]
+    all_warnings: List[str] = []
+    for review in reviews:
+        lines.append(f"## {review['name']} (regulator {review['regulator']})")
+        lines.append("")
+        for label, items in (("input caps", review["input_caps"]), ("output caps", review["output_caps"]),
+                             ("feedback", review["feedback"])):
+            if items:
+                rendered = ", ".join(f"{i['ref']} ({i['distance_mm']} mm)" for i in items)
+                lines.append(f"- {label}: {rendered}")
+        if review.get("inductor"):
+            lines.append(f"- inductor: {review['inductor']['ref']} ({review['inductor']['distance_mm']} mm)")
+        if review.get("switch_net"):
+            lines.append(f"- switch node: {review['switch_net']} (keep copper compact; keep away from "
+                         "high-speed, RF, and crystals)")
+        if review.get("estimated_hot_loop_area_mm2") is not None:
+            lines.append(f"- estimated hot-loop bounding area: {review['estimated_hot_loop_area_mm2']} mm^2")
+        if review.get("high_speed_separation_mm") is not None:
+            lines.append(f"- separation from nearest high-speed path: {review['high_speed_separation_mm']} mm")
+        lines.append("")
+        all_warnings.extend(review["warnings"])
+    if not reviews:
+        lines.append("No power islands declared (PowerIsland() in placement.ppl).")
+    _md_warnings(lines, all_warnings)
+    return "\n".join(lines)
+
+
+def mechanical_review_md(review: Mapping[str, Any]) -> str:
+    lines = ["# Mechanical placement review", "",
+             "Mechanical constraints have highest priority: mounting holes, board outline,",
+             "edge connectors, and keepouts are placed before everything else.", "",
+             "## Mounting holes", ""]
+    holes = review.get("mounting_holes", [])
+    if holes:
+        for hole in holes:
+            lines.append(f"- {hole['ref']}: x={hole['x']} y={hole['y']} nearest corner: {hole['nearest_corner']}")
+    else:
+        lines.append("- none detected")
+    lines.append("")
+    lines.append("## Edge components")
+    lines.append("")
+    edge_components = review.get("edge_components", [])
+    if edge_components:
+        for item in edge_components:
+            outside = " (body extends outside board: allowed)" if item["body_outside_board"] and item["allow_body_outside_board"] else (
+                " (body extends outside board: NOT allowed)" if item["body_outside_board"] else "")
+            lines.append(f"- {item['ref']}: edge={item['edge']} access_side={item['access_side']} "
+                         f"rotation={item['rotation']:g} edge_required={item['edge_required']} "
+                         f"locked={item['locked']}{outside}")
+    else:
+        lines.append("- none declared")
+    _md_warnings(lines, review.get("warnings", []))
+    return "\n".join(lines)
+
+
+def ai_edit_hints_md(report: Mapping[str, Any]) -> str:
+    """AI adjustment hints: uncertain placements and suggested .ppl edits.
+
+    placement.ppl is intended to be edited by humans and AI assistants as part
+    of an iterative layout-optimization loop; this report points editors at the
+    placements most worth revisiting.
+    """
+
+    lines = ["# AI edit hints (pcb-place)", "",
+             "placement.ppl and board.pln are designed to be edited by humans and AI",
+             "assistants iteratively. The items below are the placements most worth",
+             "revisiting, with suggested edits.", ""]
+
+    lines.append("## Placement ownership")
+    lines.append("")
+    ownership = report.get("ownership", {})
+    refined = {ref: o for ref, o in ownership.items() if o.get("refined_from_cluster")}
+    for ref, owner in sorted(ownership.items()):
+        cluster = f" (cluster {owner['cluster']} refined)" if owner.get("refined_from_cluster") else ""
+        lines.append(f"- {ref}: owned by `{owner['owner_rule']}` priority {owner['priority']:g}{cluster}")
+    if not ownership:
+        lines.append("- no placements applied")
+    lines.append("")
+
+    lines.append("## Uncertain or adjusted placements")
+    lines.append("")
+    flagged = False
+    for adj in report.get("auto_adjustments", []):
+        flagged = True
+        lines.append(f"- {adj['ref']} moved from requested ({adj['requested_x']:g}, {adj['requested_y']:g}) to "
+                     f"({adj['placed_x']:g}, {adj['placed_y']:g}): {adj['reason']}. "
+                     "If this is wrong, add an explicit Anchor()/NearPad() with the intended location.")
+    for ref, search in (report.get("placement_search") or {}).items():
+        if search.get("fallback_used"):
+            flagged = True
+            lines.append(f"- {ref} used grid-search fallback; consider widening its region, increasing distance, "
+                         "or relaxing spacing for this ref.")
+    if not flagged:
+        lines.append("- none")
+    lines.append("")
+
+    lines.append("## Suggested placement.ppl edits")
+    lines.append("")
+    suggestions = False
+    for item in report.get("spacing_violations", []):
+        suggestions = True
+        lines.append(f"- {item['ref_a']}/{item['ref_b']} spacing {item['actual_clearance']:g} mm is below "
+                     f"{item['required_clearance']:g} mm: move one ref or override Spacing() deliberately.")
+    for review in report.get("high_speed_paths", []):
+        for warning in review.get("warnings", []):
+            suggestions = True
+            lines.append(f"- {review['name']}: {warning}")
+    for review in report.get("power_islands", []):
+        for warning in review.get("warnings", []):
+            suggestions = True
+            lines.append(f"- {review['name']}: {warning}")
+    if refined:
+        suggestions = True
+        lines.append(f"- {len(refined)} ref(s) had cluster moves refined by higher-priority rules "
+                     "(expected: clusters are metadata, not atomic placement units).")
+    if not suggestions:
+        lines.append("- none")
+    lines.append("")
+    lines.append("## Risks requiring engineering review")
+    lines.append("")
+    lines.append("- Placement-level scoring cannot verify impedance, return paths, plane splits, or EMI compliance.")
+    lines.append("- Review high-speed-placement-review.md and power-placement-review.md before routing.")
+    return "\n".join(lines) + "\n"
+
+
 def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
                      allow_suffix_match: bool = True, validate: bool = False, safe: bool = False,
                      allow_large_move: bool = False, allow_outside_board: bool = False,
@@ -3574,6 +4163,26 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         for r in model.rules
         if r.get("type") == "cluster" and engine._rule_flag(r.get("placement", {}), "edge_required", False)
     )
+    edge_required_validation: List[Dict[str, Any]] = []
+    for ref in sorted(edge_required_refs):
+        if ref not in engine.footprints:
+            continue
+        bbox = _bbox_at_current(engine, ref)
+        edge_distance = None if bbox is None else engine._edge_distance(bbox)
+        on_edge = edge_distance is not None and edge_distance <= 5.0
+        edge_required_validation.append({
+            "ref": ref,
+            "edge_distance_mm": None if edge_distance is None else round(edge_distance, 3),
+            "on_board_edge": on_edge,
+            "locked": ref in engine.locked,
+        })
+        if edge_distance is not None and not on_edge:
+            engine.messages.append(Message("warn", f"edge-required {ref!r} sits {_fmt_num(edge_distance)} mm "
+                                           "from the nearest board edge; optimization must not pull edge "
+                                           "connectors inward"))
+    hs_reviews = high_speed_path_review(engine)
+    power_reviews = power_island_review(engine)
+    mech_review = mechanical_review(engine)
     report = {
         "version": __version__,
         "footprints_total": len(footprints),
@@ -3589,6 +4198,13 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "part_classes": {ref: _part_class_for(model, ref) for ref in sorted(footprints)},
         "locked_refs": sorted(engine.locked),
         "edge_required_refs": sorted(edge_required_refs),
+        "edge_required_validation": edge_required_validation,
+        "allowed_outside_board_refs": sorted(engine.allow_body_outside_refs),
+        "ownership": ownership_report(engine),
+        "high_speed_paths": hs_reviews,
+        "power_islands": power_reviews,
+        "mechanical_review": mech_review,
+        "spacing_profile": dataclasses.asdict(model.clearance),
         "validation_errors": sum(1 for m in engine.messages if m.level == "error"),
         "board": dataclasses.asdict(model.board) | {"origin_x": model.board.origin_x, "origin_y": model.board.origin_y},
         "bounds": footprint_bounds(footprints),
@@ -3844,6 +4460,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-aliases", action="store_true", help="List semantic aliases parsed from --netlist and exit")
     parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --list-refs or --list-aliases")
     parser.add_argument("--report-json", type=Path, help="Write machine-readable placement report JSON")
+    parser.add_argument("--high-speed-review", type=Path, metavar="MD",
+                        help="Write high-speed-placement-review.md scoring HighSpeedPath() declarations")
+    parser.add_argument("--power-review", type=Path, metavar="MD",
+                        help="Write power-placement-review.md scoring PowerIsland() declarations")
+    parser.add_argument("--mechanical-review", type=Path, metavar="MD",
+                        help="Write mechanical-placement-review.md for holes and edge connectors")
+    parser.add_argument("--ai-edit-hints", type=Path, metavar="MD",
+                        help="Write ai-edit-hints.md with uncertain placements and suggested .ppl edits")
     parser.add_argument("--explain-placement", metavar="REF", help="Print scored placement-candidate explanation for REF")
     parser.add_argument("--version", action="version", version=f"pcb-place {__version__}")
     return parser
@@ -3918,6 +4542,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.report_json:
         args.report_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"report: {args.report_json}")
+    for path, text_out in ((args.high_speed_review, lambda: high_speed_review_md(report["high_speed_paths"])),
+                           (args.power_review, lambda: power_review_md(report["power_islands"])),
+                           (args.mechanical_review, lambda: mechanical_review_md(report["mechanical_review"])),
+                           (args.ai_edit_hints, lambda: ai_edit_hints_md(report))):
+        if path is not None:
+            content = text_out()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content if content.endswith("\n") else content + "\n", encoding="utf-8")
+            print(f"review: {path}")
     if args.explain_placement:
         ref = report.get("effective_aliases", {}).get(args.explain_placement, args.explain_placement)
         explanation = report.get("placement_search", {}).get(ref)

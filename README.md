@@ -188,6 +188,150 @@ heuristics. It does **not** infer placement strategy from netlists and does
 See [`src/pcb_place/README.md`](src/pcb_place/README.md) for the placement DSL,
 safety checks, CLI reference, and executor-specific examples.
 
+## Topology-aware placement model
+
+Placement planning and execution follow a fixed priority model:
+
+```text
+mechanical constraints first
+functional signal path topology second
+power topology third
+support passives fourth
+spacing/clearance always enforced
+high-speed/EMI best practices baked into scoring
+```
+
+### Groups vs clusters vs ownership
+
+Groups are metadata. A component may belong to several semantic groups at once
+(a retimer cluster, an HDMI path, a 1V2 power domain, a decoupling group), but
+**final placement ownership is explicit and unique**: exactly one rule owns each
+ref's final coordinates. Clusters only preserve coarse neighborhoods; they are
+never atomic placement units, and a later higher-priority rule (ESD, power
+island member, decoupling array, near-pad) refines members out of the cluster
+move. `pcb-plan` reports this as `ownership_model` / `semantic_groups` /
+`multi_group_components`; `pcb-place` reports the final winner per ref in
+`ownership` and notes every cluster move that a refinement overrode.
+
+Ownership priority (highest first): explicit fixed/locked mechanical,
+edge-required connector, explicit anchor, functional-path placement
+(ESD/Between/Series), DecouplingArray/NearPad, PullupArray, Satellite, cluster
+fallback.
+
+### Mechanical constraints first
+
+Mounting holes are fixed/corner mechanical objects, never cluster members. If
+`board.pln` defines `mechanical.mounting_holes`, those corners/locations win;
+otherwise `pcb-plan` keeps holes that already sit at distinct corners and
+redistributes clustered/colocated holes to distinct corners (`inset` 3 mm) with
+a review warning. Board outline, keepouts (RF antenna, cable access), and edge
+connectors are planned before any other component.
+
+### Edge-required components
+
+Connectors that leave the board (HDMI, USB, RJ45/Ethernet, DC jacks, card
+slots) are inferred — or declared in `board.pln` — as `edge_required`. They are
+edge-locked, never pulled inward by optimization, and rotated by access side:
+
+```yaml
+components:
+  J1:
+    role: hdmi_connector
+    edge_required: true
+    access_side: left
+    allow_body_outside_board: true
+    locked: true
+    rotation: auto
+```
+
+`rotation: auto` uses the convention that at rot=0 the footprint's mating face
+points toward the top board edge (-y), so auto maps top→0°, right→90°,
+bottom→180°, left→270°; supply an explicit rotation when a footprint uses a
+different convention. With `allow_body_outside_board: true` the connector body
+or courtyard may extend past the board outline (an expected mechanical
+condition, not an ordinary outside-board violation) while the footprint anchor
+must stay on the board. Support parts stay inside the board unless explicitly
+allowed.
+
+### Functional paths and high-speed/EMI scoring
+
+`pcb-plan` builds functional paths from the connectivity graph
+(connector → ESD/protection → receiver/retimer) and emits them as
+`HighSpeedPath(...)` declarations; `board.pln` `functional_paths:` entries pin
+them explicitly. Paths reserve direct corridors before low-speed support parts
+are placed: unrelated components are penalized out of corridors during
+candidate scoring, and `pcb-place --high-speed-review` writes
+`high-speed-placement-review.md` scoring each path for directness/straightness,
+flow-through ESD position (protection belongs near the connector), corridor
+intruders, and warnings requiring human review.
+
+### Power islands and power/EMI scoring
+
+Regulator sections are planned as topology-aware power islands, not generic
+"power component piles": input capacitor tight to the regulator power pins,
+inductor and output capacitor compact against the regulator, feedback network
+at the FB pin away from the switch node — while downstream load decouplers stay
+owned by their loads. `board.pln` `power_islands:` entries pin membership
+explicitly. `pcb-place --power-review` writes `power-placement-review.md`
+scoring cap/inductor distances, estimated hot-loop area, feedback proximity,
+and separation from high-speed paths.
+
+### Spacing profiles
+
+Both tools default to a conservative, non-touching spacing profile and accept a
+`board.pln` `spacing:` override:
+
+```yaml
+spacing:
+  passive_to_passive: 0.25
+  passive_to_ic: 0.40
+  ic_to_ic: 0.75
+  connector_to_component: 1.00
+  mechanical_to_component: 1.00
+```
+
+Spacing is enforced during candidate scoring and validation. Arrays whose
+requested pitch cannot satisfy clearance escalate their spacing instead of
+emitting touching parts.
+
+### Stackup profiles
+
+`board.pln` supports reusable stackup templates for 2/4/6/8/10 layers:
+`2_layer_basic`, `4_layer_signal_gnd_pwr_signal`, `6_layer_high_speed`,
+`8_layer_high_speed`, `10_layer_high_speed`. A bare `stackup: { layers: 6 }`
+expands to the conservative 6-layer profile and is marked
+`source: stackup_template`, `confidence: medium`, `requires_review: true`.
+Templates set layer roles, likely reference planes, and preferred high-speed
+layers to improve placement/routing intent only — **controlled impedance always
+requires the actual fabricator stackup**, and the tools emit a warning saying
+so.
+
+### AI-adjustable .pln and .ppl files
+
+The `.pln` and `.ppl` files are intended to be edited by humans and AI
+assistants as part of an iterative layout optimization workflow:
+
+```text
+generate board.pln  ->  AI reviews/edits board.pln  ->  pcb-plan emits placement.ppl
+->  AI reviews/edits placement.ppl if needed  ->  pcb-place applies placement
+->  reports feed back into board.pln
+```
+
+Generated files carry stable ordering for diffs, section comments explaining
+inferred constraints (effective sides, edge requirements, paths, islands,
+arrays), and provenance/`requires_review` markers. Both CLIs emit
+`ai-edit-hints.md` (`pcb-plan emit --ai-edit-hints`, `pcb-place
+--ai-edit-hints`) listing uncertain placement choices, low-confidence
+constraints, multi-group components, placement owners, suggested `.pln`/`.ppl`
+edits, and risks requiring engineering review.
+
+### Why human review remains required
+
+Placement-level heuristics and scoring cannot verify impedance, return paths,
+reference-plane continuity, plane splits, thermal behavior, RF detuning, or
+EMI compliance. The review reports exist to focus engineering attention, not to
+replace it.
+
 ## Installation
 
 From the repository root:

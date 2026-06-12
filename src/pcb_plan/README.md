@@ -154,6 +154,11 @@ write JSON content while keeping the `.pln` extension.
 | `routing_overrides` | map of net names to maps | routing/SI reports, routing-policy emit | Per-net routing exceptions. |
 | `simulation` | map | reports, OpenEMS plan emit, update | OpenEMS and ngspice enablement, triggers, export locations, and feedback notes. |
 | `provenance` | map | `review`, `explain`, reports, update | Generator metadata, confidence/review data, and update proposals. |
+| `spacing` | map | `emit`, reports | Part-to-part clearance profile emitted as `Spacing(...)`; conservative non-touching defaults. |
+| `components` | map of refs to maps | `emit`, reports | Per-component overrides: `role`, `edge_required`, `access_side`, `allow_body_outside_board`, `locked`, `rotation`. |
+| `mechanical` | map | `emit`, reports | Mechanical constraints, currently `mounting_holes` corner/location assignments. |
+| `functional_paths` | map of names to maps | `emit`, reports | Explicit functional signal paths (connector -> protection -> IC) emitted as `HighSpeedPath(...)`. |
+| `power_islands` | map of names to maps | `emit`, reports | Explicit regulator topology (input caps, inductor, output caps, feedback, switch node) emitted as island rules + `PowerIsland(...)`. |
 
 Unknown top-level keys are reported by validation and should be avoided unless a
 future `pcb-plan` version documents them.
@@ -192,6 +197,107 @@ Fields for `type: corner`:
 
 - `corner`: one of `top_left`, `top_right`, `bottom_left`, or `bottom_right`.
 - `inset`: distance from the board edges in millimeters.
+
+### `mechanical`
+
+`mechanical.mounting_holes` assigns mounting holes to explicit corners or
+coordinates. Mounting holes are fixed mechanical objects, never clusters; holes
+without explicit assignments keep their positions when already at distinct
+corners and are otherwise redistributed to distinct corners with a review
+warning.
+
+```yaml
+mechanical:
+  mounting_holes:
+    H1: { corner: top_left, inset: 3 }
+    H2: { corner: top_right, inset: 3 }
+    H3: { corner: bottom_left, inset: 3 }
+    H4: { corner: bottom_right, inset: 3 }
+```
+
+### `components`
+
+`components` carries per-component overrides consumed during role inference and
+edge-connector planning:
+
+```yaml
+components:
+  J1:
+    role: hdmi_connector
+    edge_required: true
+    access_side: left
+    allow_body_outside_board: true
+    locked: true
+    rotation: auto
+```
+
+Fields:
+
+- `role`: overrides the inferred semantic role (spec-level names such as
+  `regulator`, `oscillator`, `retimer_redriver`, `hdmi_connector` are accepted).
+- `edge_required`: forces (or suppresses) edge placement. Edge-required
+  connectors are locked at the board edge; optimization never pulls them inward.
+- `access_side`: `left`/`right`/`top`/`bottom`; determines the target edge and
+  the automatic rotation.
+- `allow_body_outside_board`: lets the connector body/courtyard extend past the
+  board outline (the anchor must stay on the board). Defaults to true for
+  edge-required connectors.
+- `locked`: lock the connector after placement (default true at edges).
+- `rotation`: `auto` (rotate from `access_side`; convention: at rot=0 the mating
+  face points toward the top edge), an explicit angle, or `keep`.
+
+### `spacing`
+
+`spacing` overrides the conservative default clearance profile used in
+`Spacing(...)` emission, candidate scoring, and validation:
+
+```yaml
+spacing:
+  passive_to_passive: 0.25
+  passive_to_ic: 0.40
+  ic_to_ic: 0.75
+  connector_to_component: 1.00
+  mechanical_to_component: 1.00
+```
+
+Overrides are allowed, but the tools never default to essentially-touching
+parts.
+
+### `functional_paths`
+
+`functional_paths` declares functional signal paths explicitly. Each path is
+emitted as a `HighSpeedPath(...)` declaration that reserves a corridor before
+support parts are placed and is scored by the high-speed placement review.
+Explicit entries suppress the inferred path for the same connector.
+
+```yaml
+functional_paths:
+  HDMI_IN:
+    type: high_speed_diff
+    sequence: [J1, U2, U10]
+    corridor_width_mm: 8
+    protect_first: true
+```
+
+### `power_islands`
+
+`power_islands` pins regulator topology membership. Members get compact
+topology placement (input caps tight to the regulator, inductor/output caps
+compact, feedback at the FB pin) and the island is scored by the power
+placement review. Inferred islands only claim capacitors whose closest
+plausible owner is the regulator/inductor — downstream load decouplers stay
+with their loads.
+
+```yaml
+power_islands:
+  BUCK_3V3:
+    regulator: U7
+    input_caps: [C11]
+    inductor: L1
+    output_caps: [C12]
+    feedback: [R13]
+    switch_node: SW_NODE
+```
 
 ### `regions`
 
@@ -321,6 +427,46 @@ stackup:
 Layer fields include `name`, `type`, `net`, and `copper_oz`. Dielectric entries
 include `between`, `material`, `thickness_mm`, and `er`. Validation checks that
 referenced layers exist and that numeric dielectric values are positive.
+
+#### Stackup profiles
+
+Reusable conservative templates are available for common layer counts:
+
+| Profile | Layers |
+| --- | --- |
+| `2_layer_basic` | 2 |
+| `4_layer_signal_gnd_pwr_signal` | 4 |
+| `6_layer_high_speed` | 6 |
+| `8_layer_high_speed` | 8 |
+| `10_layer_high_speed` | 10 |
+
+```yaml
+stackup:
+  profile: 6_layer_high_speed
+  layers:
+    - F.Cu
+    - In1.GND
+    - In2.PWR
+    - In3.SIG
+    - In4.GND
+    - B.Cu
+```
+
+The `layers` list is optional with a profile (plain layer names are accepted
+and normalized). A bare layer count also works:
+
+```yaml
+stackup:
+  layers: 6
+```
+
+and expands to the conservative profile for that count, marked
+`source: stackup_template`, `confidence: medium`, `requires_review: true`.
+Each profile records layer names/types, likely reference planes, default
+high-speed preferred layers, and power-plane assumptions. Templates improve
+placement/routing intent only: they never claim impedance accuracy, and a
+warning is emitted reminding that controlled impedance requires the actual
+fabricator stackup.
 
 ### `routing`
 
@@ -550,6 +696,14 @@ pcb-plan emit \
 
 `emit` owns placement-plan generation and placement reports only. The resulting
 `placement.ppl` is still executed by `pcb-place`.
+
+`--ai-edit-hints ai-edit-hints.md` writes an AI-adjustment report listing
+uncertain placement choices, low-confidence inferred constraints, components
+with multiple semantic groups, placement owners per ref, suggested
+`board.pln`/`placement.ppl` edits, and risks requiring engineering review. The
+generated `.pln` and `.ppl` files are intended to be edited by humans and AI
+assistants as part of an iterative layout optimization workflow; both carry
+stable ordering, section comments, and provenance markers to support that loop.
 
 Legacy one-shot invocation remains available for compatibility:
 
