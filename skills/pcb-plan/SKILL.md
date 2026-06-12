@@ -80,6 +80,13 @@ pcb-plan update \
   -o board.updated.pln \
   --patch board.pln.patch
 
+# Evaluate plan quality without writing placement.ppl
+pcb-plan check \
+  --pln board.pln \
+  --board layout.kicad_pcb \
+  --netlist default.net \
+  --report-json pcb-plan-check-report.json
+
 # Generate placement.ppl (and optional handoff artifacts)
 pcb-plan emit \
   --pln board.pln \
@@ -121,19 +128,28 @@ When asked to plan or update a PCB, follow this sequence:
    `differential_pairs`, or `net_classes` are absent or incomplete for
    high-speed interfaces, propose additions — but mark anything you add as
    inferred (see Provenance below) and explain the reasoning.
-5. **Generate `placement.ppl`.** Run `pcb-plan emit` once `board.pln` reflects
-   the desired intent.
-6. **Interpret reports.** Read `pcb-plan-*-report.json` and any
+5. **Check plan quality before emitting.** Run `pcb-plan check` and inspect
+   `plan_confidence`. If `level` is `"low"`, address the listed `reasons`
+   (e.g. add a netlist, fix board geometry, resolve duplicate rules) before
+   generating `placement.ppl`, or explain to the user why the plan is
+   low-confidence.
+6. **Generate `placement.ppl`.** Run `pcb-plan emit` once `board.pln` reflects
+   the desired intent. `emit` also reports `plan_confidence` and prints
+   `WARNING:` lines (and a `# Plan confidence: low` header in
+   `placement.ppl`) for low-confidence plans; use `--strict-confidence` in CI
+   to fail on low-confidence plans (paired with `--allow-low-confidence` to
+   intentionally proceed anyway).
+7. **Interpret reports.** Read `pcb-plan-*-report.json` and any
    `--summary-md` output; surface warnings and `review_required_items` to the
    user instead of silently proceeding.
-7. **Preserve user intent and provenance.** Never overwrite explicit
+8. **Preserve user intent and provenance.** Never overwrite explicit
    user-authored sections of `board.pln` without calling it out. Use
    `pcb-plan update` (with a `--patch`) for proposed changes so they are
    reviewable as a diff.
-8. **Avoid silently inventing undocumented constraints.** Only use the
+9. **Avoid silently inventing undocumented constraints.** Only use the
    documented top-level keys (see Important Concepts). Do not add unknown
    keys — `pcb-plan` validation reports unknown top-level keys.
-9. **Mark inferred values as `inferred` / `requires_review`.** Any constraint
+10. **Mark inferred values as `inferred` / `requires_review`.** Any constraint
    you add or change that isn't explicitly requested by the user should use
    the provenance object form (`value`/`source`/`confidence`/`requires_review`)
    under `provenance.update_proposals`, not be silently injected as a bare

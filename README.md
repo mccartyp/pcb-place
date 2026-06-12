@@ -80,6 +80,12 @@ pcb-plan init \
   --netlist default.net \
   -o board.pln
 
+pcb-plan check \
+  --pln board.pln \
+  --board layout.kicad_pcb \
+  --netlist default.net \
+  --report-json pcb-plan-check-report.json
+
 pcb-plan emit \
   --pln board.pln \
   --board layout.kicad_pcb \
@@ -90,6 +96,14 @@ pcb-place layout.kicad_pcb placement.ppl --dry-run
 pcb-place layout.kicad_pcb placement.ppl -o layout.placed.kicad_pcb
 pcbnew layout.placed.kicad_pcb
 ```
+
+Run `pcb-plan check` after `init`/`update` and before `emit` to catch
+low-confidence plans (missing nets, mostly-singleton clusters, mostly-unplaced
+components, duplicate rules, missing differential pairs, rejected `Series(...)`
+inferences, or footprint-extents board geometry) before generating
+`placement.ppl`. See [`src/pcb_plan/README.md`](src/pcb_plan/README.md) for the
+`plan_confidence` model and the `--strict-confidence`/`--allow-low-confidence`
+flags on `emit`.
 
 For early use, you can skip the planner and write `placement.ppl` by hand, or
 run the planner with only a KiCad board:
