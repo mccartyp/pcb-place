@@ -672,6 +672,21 @@ def test_pcb_plan_emit_strict_confidence_fails(tmp_path):
     assert "--allow-low-confidence" in result.stderr
 
 
+def test_pcb_plan_emit_omits_outline_for_inferred_geometry(tmp_path):
+    # When board geometry is inferred from footprint extents (no Edge.Cuts
+    # or board.pln), emit_outline must not be set, since drawing a low-
+    # confidence rectangle as the real Edge.Cuts outline could cut through
+    # components.
+    board_path = tmp_path / "layout.kicad_pcb"
+    board_path.write_text(_LOW_CONFIDENCE_BOARD, encoding="utf-8")
+    board, components, nets, warnings = pcb_plan.parse_board(board_path)
+    plan = pcb_plan.generate_plan(board, components, nets, {}, pcb_plan.AliasDiagnostics(), {}, warnings)
+    assert plan.board.source == "inferred_from_footprints"
+    ppl = pcb_plan.emit_ppl(plan, board_path, None)
+    assert "emit_outline=False" in ppl
+    assert "emit_outline=True" not in ppl
+
+
 def test_pcb_plan_emit_allow_low_confidence_override(tmp_path):
     board_path = tmp_path / "layout.kicad_pcb"
     board_path.write_text(_LOW_CONFIDENCE_BOARD, encoding="utf-8")
@@ -765,3 +780,18 @@ def test_cluster_members_connector_proximity_any_role_disabled():
 
     members_default = pcb_plan._cluster_members(components["J1"], components, nets, {}, radius=18.0)
     assert "U5" in members_default
+
+
+def test_cluster_members_connector_excludes_unrelated_nearby_support_part():
+    # With proximity_any_role disabled, a nearby decoupling cap that shares
+    # no signal/power net and isn't otherwise connected to the connector
+    # should not be dragged into the connector's rigidly-moved Edge() cluster.
+    components = {
+        "J1": _plan_component("J1", 0.0, 0.0, "connector", ["USB_DP", "USB_DM", "GND"]),
+        "C1": _plan_component("C1", 1.0, 1.0, "decoupling", ["3V3", "GND"]),
+        "C2": _plan_component("C2", 1.0, -1.0, "decoupling", ["USB_DP", "GND"]),
+    }
+    nets = _plan_nets(components)
+    members = pcb_plan._cluster_members(components["J1"], components, nets, {}, radius=18.0, proximity_any_role=False)
+    assert "C1" not in members
+    assert "C2" in members

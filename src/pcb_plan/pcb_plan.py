@@ -1130,6 +1130,8 @@ def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanCompone
             continue
         has_shared_signal = bool((shared & set(comp.nets)) - {n for n in shared if is_ground(n) or is_power(n)})
         is_support = comp.role in support_roles and dist <= radius
+        if not proximity_any_role:
+            is_support = is_support and (has_shared_signal or comp.ref in connected)
         is_nearby_any_role = proximity_any_role and dist <= radius / 2.0 and comp.role != "unknown"
         if comp.ref in connected or comp.ref in alias_refs or has_shared_signal or is_support or is_nearby_any_role:
             members.append(comp.ref)
@@ -1800,8 +1802,11 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
             lines.append(f"# - {reason}")
         lines.append("")
     lines.extend(routing_summary_comments(plan))
+    emit_outline = plan.board.source != "inferred_from_footprints"
+    if not emit_outline:
+        lines.append("# Edge.Cuts outline not emitted: board geometry was inferred from footprint extents (low confidence).")
     lines.extend([
-        f"Board(width={plan.board.width:.6g}, height={plan.board.height:.6g}, origin_x={plan.board.origin_x:.6g}, origin_y={plan.board.origin_y:.6g}, emit_outline=True)",
+        f"Board(width={plan.board.width:.6g}, height={plan.board.height:.6g}, origin_x={plan.board.origin_x:.6g}, origin_y={plan.board.origin_y:.6g}, emit_outline={emit_outline})",
         "Spacing(default=0.25, passive_to_ic=0.50, connector=1.00)",
         "PlacementPolicy(avoid_overlap=True, allow_anchor_move=False, max_search_radius=5, search_step=0.5)",
         "",
