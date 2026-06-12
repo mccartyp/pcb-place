@@ -1047,6 +1047,22 @@ def _component_pad_side(parent: PlanComponent, pad: Optional[str]) -> Optional[s
     return min(distances, key=distances.get)
 
 
+
+
+def _effective_support_side(inferred_side: Optional[str], parent: PlanComponent, board: BoardGeometry, threshold: float = 3.0) -> Optional[str]:
+    """Return an inward support side when a pad points into a nearby board edge."""
+
+    if inferred_side not in {"left", "right", "top", "bottom"} or parent.bbox is None:
+        return inferred_side
+    near = {
+        "left": parent.bbox.min_x - board.origin_x <= threshold,
+        "right": board.origin_x + board.width - parent.bbox.max_x <= threshold,
+        "top": parent.bbox.min_y - board.origin_y <= threshold,
+        "bottom": board.origin_y + board.height - parent.bbox.max_y <= threshold,
+    }
+    opposite = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
+    return opposite[inferred_side] if near.get(inferred_side, False) else inferred_side
+
 def _component_near_board_edge(parent: PlanComponent, board: BoardGeometry, threshold: float = 3.0) -> bool:
     if parent.bbox is None:
         x = parent.x - board.origin_x
@@ -1354,8 +1370,12 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             if edge_span > 0 and distances[edge] / edge_span <= 0.25 and distances[edge] > inset:
                 along = local_y if edge in ("left", "right") else local_x
                 placement_kw = "y" if edge in ("left", "right") else "x"
-                text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement=Edge(edge={_q(edge)}, {placement_kw}={along:.3f}, inset={inset}), role={_q(comp.role)})'
-                rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector cluster preserves local geometry and reserves edge access."))
+                edge_required = comp.role in {"connector", "high_speed_connector"}
+                text = (f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, '
+                        f'placement=Edge(edge={_q(edge)}, {placement_kw}={along:.3f}, inset={inset}, '
+                        f'locked=True, edge_required={str(edge_required)}, mechanical=True, access_side={_q(edge)}), '
+                        f'role={_q(comp.role)})')
+                rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector cluster preserves local geometry and reserves edge access; edge_required={edge_required}, access_side={edge}."))
             else:
                 text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement=Anchor(x={local_x:.3f}, y={local_y:.3f}, rot={comp.rot:g}), role={_q(comp.role)})'
                 rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector cluster kept at existing location; not adjacent to a board edge."))
@@ -1442,7 +1462,8 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             inferred_pad_side = _component_pad_side(parent, pad)
             parent_near_edge = _component_near_board_edge(parent, board)
             stagger_recommended = len(caps) > 3
-            side_value = "inward" if parent_near_edge else "auto"
+            effective_side = _effective_support_side(inferred_pad_side, parent, board)
+            side_value = effective_side or ("inward" if parent_near_edge else "auto")
             array_opts = 'stagger=True, rows="auto", '
             if len(caps) > 3:
                 array_opts += 'max_per_row=3, '
@@ -1452,13 +1473,14 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             rules.append(PlanRule("decoupling_array", text, list(members),
                                    f"{', '.join(members)} grouped decoupling array for {parent_ref} ({power_net or 'unknown net'}); "
                                    f"pad_side={inferred_pad_side or 'unknown'}, parent_near_board_edge={parent_near_edge}, "
-                                   f"stagger_recommended={stagger_recommended}; replaces per-capacitor Decoupling()/NearPad() rules."))
+                                   f"effective_side={side_value}, stagger_recommended={stagger_recommended}; replaces per-capacitor Decoupling()/NearPad() rules."))
             for cref in members:
                 explanations[cref] = {"role": "decoupling", "nets": components[cref].nets, "parent_candidate": parent_ref, "generated_rule": text, "primitive_selected": "DecouplingArray", "primitive_scores": {"NearPad": 0, "Decoupling": 40, "DecouplingArray": 90, "Cluster": 80, "Anchor": 10}}
             decoupling_groups.append({"parent": parent_ref, "power_net": power_net, "pad": pad, "members": members,
                                         "primitive": "DecouplingArray", "grouped": True,
                                         "inferred_pad_side": inferred_pad_side,
                                         "parent_near_board_edge": parent_near_edge,
+                                        "effective_side": side_value,
                                         "stagger_recommended": stagger_recommended})
 
     # Pullup/pulldown resistors: determine the true owning signal source
@@ -2120,12 +2142,14 @@ def plan_to_pln(plan: Plan) -> Dict[str, Any]:
         for pair in plan.differential_pairs
     }
     high_speed_nets = sorted(n for n in plan.nets if is_high_speed(n))
+    trusted_board_source = plan.board.source in {"edge_cuts", "cli"}
+    board_source_label = "supplied_by_cli" if plan.board.source == "cli" else f"inferred_from_{plan.board.source}"
     payload: Dict[str, Any] = {
         "board": {
-            "width": provenance_value(plan.board.width, f"inferred_from_{plan.board.source}", "high" if plan.board.source == "edge_cuts" else "medium", plan.board.source != "edge_cuts"),
-            "height": provenance_value(plan.board.height, f"inferred_from_{plan.board.source}", "high" if plan.board.source == "edge_cuts" else "medium", plan.board.source != "edge_cuts"),
-            "origin_x": provenance_value(plan.board.origin_x, f"inferred_from_{plan.board.source}", "high" if plan.board.source == "edge_cuts" else "medium", plan.board.source != "edge_cuts"),
-            "origin_y": provenance_value(plan.board.origin_y, f"inferred_from_{plan.board.source}", "high" if plan.board.source == "edge_cuts" else "medium", plan.board.source != "edge_cuts"),
+            "width": provenance_value(plan.board.width, board_source_label, "high" if trusted_board_source else "medium", not trusted_board_source),
+            "height": provenance_value(plan.board.height, board_source_label, "high" if trusted_board_source else "medium", not trusted_board_source),
+            "origin_x": provenance_value(plan.board.origin_x, board_source_label, "high" if trusted_board_source else "medium", not trusted_board_source),
+            "origin_y": provenance_value(plan.board.origin_y, board_source_label, "high" if trusted_board_source else "medium", not trusted_board_source),
             "units": provenance_value("mm", "kicad_default", "high", False),
         },
         "regions": {name: _prov_dict_from_mapping(spec, "inferred_from_board_geometry", "medium", True) for name, spec in plan.regions.items()},
@@ -2292,7 +2316,8 @@ def _load_optional_json(path: Optional[Path]) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _load_plan_from_inputs(board_path: Path, netlist_path: Optional[Path], pln_path: Optional[Path]) -> Tuple[Plan, Dict[str, Any]]:
+def _load_plan_from_inputs(board_path: Path, netlist_path: Optional[Path], pln_path: Optional[Path],
+                           *, board_override: Optional[Mapping[str, float]] = None) -> Tuple[Plan, Dict[str, Any]]:
     board, components, nets, warnings = parse_board(board_path)
     aliases, alias_diag, net_warnings = import_netlist(netlist_path, components, nets)
     warnings.extend(net_warnings)
@@ -2305,6 +2330,15 @@ def _load_plan_from_inputs(board_path: Path, netlist_path: Optional[Path], pln_p
         if isinstance(b.get("origin"), list) and len(b["origin"]) >= 2:
             ox, oy = b["origin"][0], b["origin"][1]
         board = BoardGeometry(origin_x=float(ox), origin_y=float(oy), width=float(b.get("width", board.width)), height=float(b.get("height", board.height)), source="board.pln")
+        warnings = [w for w in warnings if "footprint extents" not in w]
+    if board_override is not None:
+        board = BoardGeometry(
+            origin_x=float(board_override.get("origin_x", board.origin_x)),
+            origin_y=float(board_override.get("origin_y", board.origin_y)),
+            width=float(board_override.get("width", board.width)),
+            height=float(board_override.get("height", board.height)),
+            source="cli",
+        )
         warnings = [w for w in warnings if "footprint extents" not in w]
     plan = generate_plan(board, components, nets, aliases, alias_diag, intent, warnings)
     return plan, raw_intent
@@ -2323,6 +2357,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init", help="Generate an initial board.pln")
     _add_common_emit_args(init)
+    init.add_argument("--width", type=float, help="Override board geometry width in mm for the generated board.pln")
+    init.add_argument("--height", type=float, help="Override board geometry height in mm for the generated board.pln")
+    init.add_argument("--origin-x", type=float, help="Override board origin X in mm when --width/--height are supplied")
+    init.add_argument("--origin-y", type=float, help="Override board origin Y in mm when --width/--height are supplied")
     init.add_argument("--summary-md", type=Path, help="Write human-readable init summary markdown")
 
     update = sub.add_parser("update", help="Update board.pln from feedback reports")
@@ -2449,10 +2487,29 @@ def run_emit(args: argparse.Namespace, *, legacy: bool = False) -> int:
     return 0
 
 
+def _board_override_from_init_args(args: argparse.Namespace) -> Optional[Dict[str, float]]:
+    width = getattr(args, "width", None)
+    height = getattr(args, "height", None)
+    origin_x = getattr(args, "origin_x", None)
+    origin_y = getattr(args, "origin_y", None)
+    if width is None and height is None and origin_x is None and origin_y is None:
+        return None
+    if width is None or height is None:
+        raise SystemExit("pcb-plan init: --width and --height must be supplied together")
+    if width <= 0 or height <= 0:
+        raise SystemExit("pcb-plan init: --width and --height must be positive millimeter values")
+    override = {"width": float(width), "height": float(height)}
+    if origin_x is not None:
+        override["origin_x"] = float(origin_x)
+    if origin_y is not None:
+        override["origin_y"] = float(origin_y)
+    return override
+
+
 def run_init(args: argparse.Namespace) -> int:
     _ensure_exists(args.board, "Board")
     _ensure_exists(args.netlist, "Netlist")
-    plan, _ = _load_plan_from_inputs(args.board, args.netlist, None)
+    plan, _ = _load_plan_from_inputs(args.board, args.netlist, None, board_override=_board_override_from_init_args(args))
     payload = plan_to_pln(plan)
     text = serialize_pln(payload)
     _write_text(args.output, text)

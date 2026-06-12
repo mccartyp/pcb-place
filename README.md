@@ -113,6 +113,12 @@ pcb-plan emit --board layout.kicad_pcb -o placement.ppl
 pcb-place layout.kicad_pcb placement.ppl -o layout.placed.kicad_pcb
 ```
 
+When initializing `board.pln` before Edge.Cuts are reliable, pass explicit board geometry so generated regions and edge-aware placements use the intended outline:
+
+```bash
+pcb-plan init --board layout.kicad_pcb --width 75 --height 75 -o board.pln
+```
+
 Legacy one-shot planner invocation is still supported for compatibility:
 
 ```bash
@@ -227,3 +233,15 @@ use `pcb-place` to apply/debug that `placement.ppl` against a KiCad board, and
 use `pcb-automation-orchestrator` to coordinate the full
 plan/place/route/verify/simulate loop. See [`skills/README.md`](skills/README.md)
 for details on when to use each.
+
+### Placement regions, support arrays, and edge-required parts
+
+`pcb-place` models grouped support-part placement with an internal `PlacementRegion`: a legal strip on the left, right, top, or bottom of the expanded parent footprint bbox, clipped to board bounds and any strict `Region(...)` requested by the rule. `DecouplingArray(...)` and `PullupArray(...)` use these regions for capacity planning before selecting a scored candidate.
+
+For arrays near a board edge, pcb-place computes the full array bounding box and slides it along the side tangent before rejecting it. Top/bottom arrays slide in X; left/right arrays slide in Y. Placement search reports include `placement_region`, capacity fields, `original_array_bbox`, `slid_array_bbox`, `slide_applied`, `slide_dx`, and `slide_dy`. Use `--explain-placement REF` to print the recorded winning score, candidate regions, slide data, and top rejected candidates for a specific part.
+
+Board, region, keepout, and coordinate geometry accepts integral or floating-point values. For example, `Board(width=75, height=75)` and `Board(width=75.0, height=75.0)` are equivalent internally.
+
+Edge-access components can be declared with metadata such as `edge_required=True`, `mechanical=True`, `locked=True`, and `access_side="left"` on `Edge(...)` placements. Edge-required anchors are treated as locked/high-priority owners; support components must move around them instead of pulling the connector or mechanical body inward. The generated report lists `edge_required_refs` separately from other locked refs.
+
+Placement ownership precedence is enforced by priority and locking: fixed/locked/edge-required placements win over explicit anchors, pin-aware arrays, near-pad/satellite rules, and cluster fallback. When a cluster gives a coarse placement and a later DecouplingArray/PullupArray refines a support part, diagnostics report the refinement rather than silently fighting the rules.

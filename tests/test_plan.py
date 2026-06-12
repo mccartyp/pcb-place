@@ -337,6 +337,34 @@ def test_emit_routing_policy_and_openems_plan_auto_mode(tmp_path):
     assert json.loads(report.read_text())["routing"]["high_speed_constraints_complete"] is True
 
 
+
+
+def test_plan_init_cli_board_geometry_overrides_edge_cuts_for_planning(tmp_path):
+    board_path = ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb"
+    pln = tmp_path / "board.pln"
+    init_report = tmp_path / "pcb-plan-init-report.json"
+    subprocess.run(
+        [
+            sys.executable, str(PLAN_CLI), "init", "--board", str(board_path),
+            "--width", "100", "--height", "60", "--origin-x", "0", "--origin-y", "0",
+            "-o", str(pln), "--report-json", str(init_report),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = pcb_plan.load_intent(pln)
+    plain = pcb_plan.unwrap_provenance(payload)
+    assert plain["board"]["width"] == 100
+    assert plain["board"]["height"] == 60
+    assert payload["board"]["width"]["source"] == "supplied_by_cli"
+    assert payload["board"]["width"]["requires_review"] is False
+    assert plain["regions"]["HIGH_SPEED"]["w"] == 100
+    assert plain["regions"]["HIGH_SPEED"]["h"] == 20.0
+    report_payload = json.loads(init_report.read_text())
+    assert not any("footprint extents" in warning for warning in report_payload["warnings"])
+
 def test_plan_init_review_explain_emit_lifecycle(tmp_path):
     board_path = ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb"
     pln = tmp_path / "board.pln"
@@ -524,6 +552,8 @@ def test_grouped_decoupling_and_pullup_arrays_and_series_validation():
     assert "inferred_pad_side" in decoupling_group
     assert "parent_near_board_edge" in decoupling_group
     assert "stagger_recommended" in decoupling_group
+    assert "effective_side" in decoupling_group
+    assert "effective_side=" in decoupling_array_rules[0].comment
 
     # Two pullups on different signal nets owned by the same MCU are grouped
     # by ownership rather than emitted as context-less Pullup() rules.
@@ -549,6 +579,18 @@ def test_grouped_decoupling_and_pullup_arrays_and_series_validation():
 
     assert payload["duplicate_rules"] == []
 
+
+
+
+def test_connector_edge_required_emitted_for_hdmi_fixture():
+    board, components, nets, warnings = pcb_plan.parse_board(ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb")
+    plan = pcb_plan.generate_plan(board, components, nets, {}, pcb_plan.AliasDiagnostics(), {}, warnings)
+    cluster_rules = [rule for rule in plan.rules if rule.kind == "cluster" and "J1" in rule.refs]
+    assert cluster_rules
+    assert any("edge_required=True" in rule.text for rule in cluster_rules)
+    assert any("locked=True" in rule.text for rule in cluster_rules)
+    assert any("access_side=" in rule.text for rule in cluster_rules)
+    assert any("edge_required=True" in rule.comment for rule in cluster_rules)
 
 def test_pcb_plan_check_report(tmp_path):
     board_path = ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb"

@@ -142,6 +142,9 @@ class BBox:
         return (self.min_x - eps <= other.min_x and other.max_x <= self.max_x + eps and
                 self.min_y - eps <= other.min_y and other.max_y <= self.max_y + eps)
 
+    def translated(self, dx: float, dy: float) -> "BBox":
+        return BBox(self.min_x + dx, self.min_y + dy, self.max_x + dx, self.max_y + dy)
+
     def as_report(self) -> Dict[str, float]:
         return dataclasses.asdict(self)
 
@@ -152,6 +155,36 @@ class BBoxInfo:
     bbox: BBox
     fallback: bool = False
     warning: Optional[str] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class PlacementRegion:
+    """Legal strip used for grouped support-part placement around a parent."""
+
+    owner_ref: str
+    owner_bbox: BBox
+    expanded_owner_bbox: BBox
+    side: str
+    legal_bbox: BBox
+    preferred_axis: str
+    cross_axis: str
+    capacity_length: float
+    capacity_area: float
+    role: str = "support"
+
+    def as_report(self) -> Dict[str, Any]:
+        return {
+            "owner_ref": self.owner_ref,
+            "owner_bbox": self.owner_bbox.as_report(),
+            "expanded_owner_bbox": self.expanded_owner_bbox.as_report(),
+            "side": self.side,
+            "legal_bbox": self.legal_bbox.as_report(),
+            "preferred_axis": self.preferred_axis,
+            "cross_axis": self.cross_axis,
+            "capacity_length": round(self.capacity_length, 6),
+            "capacity_area": round(self.capacity_area, 6),
+            "role": self.role,
+        }
 
 
 @dataclasses.dataclass
@@ -962,7 +995,9 @@ def load_ppl(path: Path) -> PlacementModel:
     def Edge(ref: Optional[str] = None, *, edge: str, offset: Optional[Number] = None, inset: Number = 0,
              x: Optional[Number] = None, y: Optional[Number] = None,
              rot: Optional[Number | str] = None, role: Optional[str] = None,
-             lock: bool = False, note: Optional[str] = None, **kwargs: Any) -> None:
+             lock: bool = False, locked: bool = False, edge_required: bool = False,
+             mechanical: bool = False, access_side: Optional[str] = None,
+             note: Optional[str] = None, **kwargs: Any) -> None:
         w, h, _ox, _oy = _require_board_size(model, "Edge")
         e = edge.lower().replace("-", "_")
         if e in ("left", "right"):
@@ -980,9 +1015,13 @@ def load_ppl(path: Path) -> PlacementModel:
             py = float(inset) if e == "top" else h - float(inset)
         else:
             raise PlacementError(f"Unknown edge {edge!r}")
+        access = access_side.lower().replace("-", "_") if access_side is not None else e
+        must_lock = bool(lock) or bool(locked) or bool(edge_required)
         rule = dict(type="edge", ref=None if ref is None else _normalize_ref(ref), x=px, y=py,
                     rot=_rot_or_none(rot), role=role,
-                    lock=bool(lock), edge=e, note=note, extra=dict(kwargs))
+                    lock=must_lock, locked=must_lock, edge_required=bool(edge_required),
+                    mechanical=bool(mechanical), access_side=access,
+                    edge=e, note=note, extra=dict(kwargs))
         if ref is None:
             return rule
         model.rules.append(rule)
@@ -1715,6 +1754,55 @@ def _board_contains_bbox(geometry: Optional[BoardGeometry], bbox: BBox, *, eps: 
             geometry.min_y - eps <= bbox.min_y and bbox.max_y <= geometry.max_y + eps)
 
 
+def _geometry_bbox(geometry: Optional[BoardGeometry]) -> Optional[BBox]:
+    if geometry is None:
+        return None
+    return BBox(geometry.min_x, geometry.min_y, geometry.max_x, geometry.max_y)
+
+
+def _union_bbox(boxes: Sequence[BBox]) -> Optional[BBox]:
+    if not boxes:
+        return None
+    return BBox(min(b.min_x for b in boxes), min(b.min_y for b in boxes),
+                max(b.max_x for b in boxes), max(b.max_y for b in boxes))
+
+
+def slide_array_bbox_into_bounds(items: Sequence[Tuple[float, float]], side: str, board_bbox: Optional[BBox],
+                                 margin: float = 0.0, *, item_bboxes: Optional[Sequence[BBox]] = None) -> Dict[str, Any]:
+    """Slide a complete array along its side tangent so the full bbox fits board bounds."""
+
+    if board_bbox is None:
+        return {"items": list(items), "slide_applied": False, "slide_dx": 0.0, "slide_dy": 0.0,
+                "original_array_bbox": None, "slid_array_bbox": None}
+    boxes = list(item_bboxes or [BBox(x, y, x, y) for x, y in items])
+    original = _union_bbox(boxes)
+    if original is None:
+        return {"items": list(items), "slide_applied": False, "slide_dx": 0.0, "slide_dy": 0.0,
+                "original_array_bbox": None, "slid_array_bbox": None}
+    allowed = BBox(board_bbox.min_x + margin, board_bbox.min_y + margin,
+                   board_bbox.max_x - margin, board_bbox.max_y - margin)
+    dx = dy = 0.0
+    if side in {"top", "bottom"}:
+        if original.width > allowed.width + 1e-9:
+            return {"items": list(items), "slide_applied": False, "slide_dx": 0.0, "slide_dy": 0.0,
+                    "original_array_bbox": original, "slid_array_bbox": original, "slide_rejected": "array wider than board"}
+        if original.min_x < allowed.min_x:
+            dx = allowed.min_x - original.min_x
+        elif original.max_x > allowed.max_x:
+            dx = allowed.max_x - original.max_x
+    elif side in {"left", "right"}:
+        if original.height > allowed.height + 1e-9:
+            return {"items": list(items), "slide_applied": False, "slide_dx": 0.0, "slide_dy": 0.0,
+                    "original_array_bbox": original, "slid_array_bbox": original, "slide_rejected": "array taller than board"}
+        if original.min_y < allowed.min_y:
+            dy = allowed.min_y - original.min_y
+        elif original.max_y > allowed.max_y:
+            dy = allowed.max_y - original.max_y
+    slid = original.translated(dx, dy)
+    return {"items": [(x + dx, y + dy) for x, y in items], "slide_applied": abs(dx) > 1e-9 or abs(dy) > 1e-9,
+            "slide_dx": dx, "slide_dy": dy, "original_array_bbox": original, "slid_array_bbox": slid}
+
+
 def _point_segment_distance(point: Point, a: Point, b: Point) -> float:
     px, py = point
     ax, ay = a
@@ -1962,6 +2050,16 @@ class PlacementEngine:
             self._warn_or_raise(f"missing footprint {ref!r} for {why}")
             return
         rule = rule or {}
+        if actual_ref in self.locked:
+            old_x, old_y, old_rot = self.positions.get(actual_ref, (0.0, 0.0, self.footprints[actual_ref].rot))
+            pre_new_rot = old_rot if rot is None else _normalize_rotation(float(rot))
+            if self.cardinal_rotations and rot is not None and not allow_arbitrary_rotation:
+                pre_new_rot = _cardinal_rotation(pre_new_rot)
+            changed = (abs(old_x - float(x)) > 1e-9 or abs(old_y - float(y)) > 1e-9 or abs(old_rot - pre_new_rot) > 1e-9)
+            if changed:
+                self.locked_move_attempts.append({"ref": actual_ref, "by": why, "locked_by": self.locked[actual_ref]})
+                self._warn_or_raise(f"locked footprint {actual_ref!r} cannot be moved by {why}; locked by {self.locked[actual_ref]}")
+                return
         priority = self._rule_priority(rule, actual_ref)
         index = int(rule.get("_index", -1))
         if actual_ref in self.updates:
@@ -2105,6 +2203,8 @@ class PlacementEngine:
             self.place(actual, x + dx, y + dy, None, f"cluster {name}", rule.get("note"),
                        region_override=cluster_region)
             self.last_cluster_by_ref[actual] = name
+        if self._rule_flag(rule.get("placement", {}), "edge_required", False):
+            self.lock(anchor_ref, f"edge_required cluster {name}")
         self.clusters.append({
             "name": name,
             "anchor": anchor_ref,
@@ -2176,6 +2276,8 @@ class PlacementEngine:
         return bool(self._rule_value(rule, name, default))
 
     def _rule_priority(self, rule: Mapping[str, Any], actual_ref: str) -> float:
+        if self._rule_flag(rule, "edge_required", False) or self._rule_flag(rule, "locked", False) or self._rule_flag(rule, "lock", False):
+            return max(10000.0, float(self.model.priority_refs.get(actual_ref, 0.0)))
         value = self._rule_value(rule, "priority")
         if value is None:
             value = self.model.priority_refs.get(actual_ref)
@@ -2721,6 +2823,65 @@ class PlacementEngine:
         return [(anchor[0] + tx * spacing * (i - (n - 1) / 2.0),
                  anchor[1] + ty * spacing * (i - (n - 1) / 2.0)) for i in range(n)]
 
+
+    def _array_item_bboxes(self, actual_refs: Sequence[Optional[str]], candidates: Sequence[Tuple[float, float]],
+                           rot: Optional[float]) -> List[BBox]:
+        boxes: List[BBox] = []
+        for actual, (x, y) in zip(actual_refs, candidates):
+            if actual is None or actual not in self.footprints:
+                boxes.append(BBox(x, y, x, y))
+                continue
+            eval_rot = rot if rot is not None else self.positions[actual][2]
+            boxes.append(footprint_bbox_at(self.footprints[actual], x, y, eval_rot, self.model).bbox)
+        return boxes
+
+    def _placement_region_for_side(self, owner_ref: str, owner_bbox: Optional[BBox], expanded: Optional[BBox],
+                                   side: str, requested_region: Optional[BBox], role: str) -> Optional[PlacementRegion]:
+        board = _geometry_bbox(self.board_geometry)
+        if owner_bbox is None or expanded is None or board is None:
+            return None
+        if side == "left":
+            raw = BBox(board.min_x, board.min_y, expanded.min_x, board.max_y)
+            preferred_axis, cross_axis = "y", "x"
+        elif side == "right":
+            raw = BBox(expanded.max_x, board.min_y, board.max_x, board.max_y)
+            preferred_axis, cross_axis = "y", "x"
+        elif side == "top":
+            raw = BBox(board.min_x, board.min_y, board.max_x, expanded.min_y)
+            preferred_axis, cross_axis = "x", "y"
+        elif side == "bottom":
+            raw = BBox(board.min_x, expanded.max_y, board.max_x, board.max_y)
+            preferred_axis, cross_axis = "x", "y"
+        else:
+            return None
+        legal = BBox(max(raw.min_x, board.min_x), max(raw.min_y, board.min_y),
+                     min(raw.max_x, board.max_x), min(raw.max_y, board.max_y))
+        if requested_region is not None:
+            legal = BBox(max(legal.min_x, requested_region.min_x), max(legal.min_y, requested_region.min_y),
+                         min(legal.max_x, requested_region.max_x), min(legal.max_y, requested_region.max_y))
+        if legal.max_x < legal.min_x:
+            legal = BBox(legal.min_x, legal.min_y, legal.min_x, legal.max_y)
+        if legal.max_y < legal.min_y:
+            legal = BBox(legal.min_x, legal.min_y, legal.max_x, legal.min_y)
+        capacity_length = legal.width if preferred_axis == "x" else legal.height
+        return PlacementRegion(owner_ref, owner_bbox, expanded, side, legal, preferred_axis, cross_axis,
+                               capacity_length, max(0.0, legal.width) * max(0.0, legal.height), role)
+
+    def _capacity_metadata(self, n: int, side: str, spacing: float, region: Optional[PlacementRegion],
+                           staggered: bool, max_per_row: Optional[int]) -> Dict[str, Any]:
+        if n <= 0:
+            single = 0
+        elif region is None:
+            single = n
+        else:
+            single = max(1, int(math.floor((region.capacity_length + 1e-9) / max(spacing, 1e-9))) + 1)
+        per_row = max_per_row or (min(3, max(1, math.ceil(n / 2))) if staggered else n)
+        rows = max(1, math.ceil(n / max(1, per_row)))
+        return {"single_row_capacity": single, "required_refs": n, "rows": rows,
+                "capacity_sufficient": single >= n if not staggered else single * rows >= n,
+                "region_capacity_length": None if region is None else round(region.capacity_length, 6),
+                "region_capacity_area": None if region is None else round(region.capacity_area, 6)}
+
     def _array_layout_candidates(self, refs: Sequence[str], actual_refs: Sequence[Optional[str]], origin: Point,
                                  side: str, distance: float, spacing: float, *, shift: float,
                                  staggered: bool, parent_expanded: Optional[BBox], rot: Optional[float],
@@ -2873,7 +3034,7 @@ class PlacementEngine:
 
         distance = float(rule.get("distance", 2.0))
         spacing = float(rule.get("spacing", 1.5))
-        stagger_requested = bool(rule.get("stagger", False))
+        stagger_requested = self._rule_flag(rule, "stagger", False)
         max_per_row_value = rule.get("max_per_row")
         max_per_row = None if max_per_row_value is None else int(max_per_row_value)
         rot = self.resolve_rot(rule.get("rot"))
@@ -2899,20 +3060,35 @@ class PlacementEngine:
             for side_name in sides:
                 for staggered in stagger_options:
                     for shift in shifts:
-                        candidates = self._array_layout_candidates(
+                        original_candidates = self._array_layout_candidates(
                             refs, actual_refs, side_origin, side_name, dist, spacing, shift=shift,
                             staggered=staggered, parent_expanded=parent_expanded, rot=rot,
                             max_per_row=max_per_row)
+                        placement_region = self._placement_region_for_side(
+                            parent_ref or "", parent_bbox, parent_expanded, side_name, region, str(rule.get("role", why)))
+                        original_boxes = self._array_item_bboxes(actual_refs, original_candidates, rot)
+                        slide_bounds = placement_region.legal_bbox if placement_region is not None else _geometry_bbox(self.board_geometry)
+                        slide = slide_array_bbox_into_bounds(
+                            original_candidates, side_name, slide_bounds, 0.0, item_bboxes=original_boxes)
+                        candidates = list(slide["items"])
                         result = self._try_grouped_spread(
                             refs, actual_refs, candidates, rot, clearance_override=clearance_override,
                             region=region, allow_keepout_overlap=allow_keepout_overlap,
                             parent_expanded=parent_expanded)
                         rows = max(1, math.ceil(n / (max_per_row or min(3, max(1, math.ceil(n / 2))) if staggered else n)))
                         shape = "stagger" if staggered else ("column" if side_name in {"left", "right"} else "row")
-                        metadata = {"side": side_name, "distance": round(dist, 6), "shift": round(shift, 6),
+                        metadata = {"side": side_name, "effective_side": side_name, "distance": round(dist, 6), "shift": round(shift, 6),
                                     "staggered": staggered, "shape": shape, "side_rank": sides.index(side_name), "rows": rows,
                                     "columns": max_per_row or (min(3, max(1, math.ceil(n / 2))) if staggered else n),
-                                    "candidate_count": len(candidates)}
+                                    "candidate_count": len(candidates),
+                                    "slide_applied": bool(slide["slide_applied"]),
+                                    "slide_dx": round(float(slide["slide_dx"]), 6),
+                                    "slide_dy": round(float(slide["slide_dy"]), 6),
+                                    "original_array_bbox": None if slide["original_array_bbox"] is None else slide["original_array_bbox"].as_report(),
+                                    "slid_array_bbox": None if slide["slid_array_bbox"] is None else slide["slid_array_bbox"].as_report(),
+                                    "slide_bounds_bbox": None if slide_bounds is None else slide_bounds.as_report(),
+                                    "placement_region": None if placement_region is None else placement_region.as_report(),
+                                    **self._capacity_metadata(n, side_name, spacing, placement_region, staggered, max_per_row)}
                         label = (f"side={side_name},distance={dist:g},shape={shape},"
                                  f"stagger={staggered},shift={shift:g}")
                         scored = self._score_grouped_array_attempt(refs, actual_refs, candidates, rot,
@@ -2920,7 +3096,10 @@ class PlacementEngine:
                         attempt = {"side": side_name, "distance": dist, "shift": shift,
                                    "staggered": staggered, "shape": shape,
                                    "anchor": candidates[len(candidates) // 2] if candidates else side_origin,
-                                   "candidates": candidates, "score": scored.score, **result}
+                                   "original_candidates": original_candidates, "candidates": candidates,
+                                   "placement_region": None if placement_region is None else placement_region.as_report(),
+                                   "slide": {k: (v.as_report() if isinstance(v, BBox) else v) for k, v in slide.items() if k != "items"},
+                                   "score": scored.score, **result}
                         attempts.append(attempt)
                         scored_attempts.append(scored)
                         if scored.legal and (chosen_attempt is None or scored.score < float(chosen_attempt["score"])):
@@ -2962,11 +3141,30 @@ class PlacementEngine:
             detail.append(f"pad at x={_fmt_num(pad_origin[0])} y={_fmt_num(pad_origin[1])}")
         if inferred_side is not None:
             detail.append(f"inferred side: {inferred_side}")
+        detail.append(f"effective side: {sides[0] if sides else 'unknown'}")
+        if self.board_geometry is not None:
+            detail.append(f"board bbox: {self._fmt_bbox(_geometry_bbox(self.board_geometry))}")
+        if region is not None:
+            detail.append(f"requested region bbox: {self._fmt_bbox(region)}")
         detail.append(f"sides tried: {', '.join(sides)}")
         detail.append(f"candidate arrays tried: {len(attempts)}")
+        detail.append("sliding attempted: true")
         if best is not None:
             bx, by = best["anchor"]
-            detail.append(f"best candidate: side={best['side']} x={_fmt_num(bx)} y={_fmt_num(by)}; rejected: {best.get('failed_ref')!r} {best.get('reason')}")
+            if best.get("placement_region"):
+                pr = best["placement_region"]["legal_bbox"]
+                detail.append(f"placement region bbox: min=({_fmt_num(pr['min_x'])}, {_fmt_num(pr['min_y'])}) max=({_fmt_num(pr['max_x'])}, {_fmt_num(pr['max_y'])})")
+            slide = best.get("slide") or {}
+            detail.append(f"slide_applied: {str(bool(slide.get('slide_applied'))).lower()}")
+            detail.append(f"slide_dx: {_fmt_num(float(slide.get('slide_dx', 0.0)))}")
+            detail.append(f"slide_dy: {_fmt_num(float(slide.get('slide_dy', 0.0)))}")
+            if slide.get("original_array_bbox"):
+                b = slide["original_array_bbox"]
+                detail.append(f"original_array_bbox: min=({_fmt_num(b['min_x'])}, {_fmt_num(b['min_y'])}) max=({_fmt_num(b['max_x'])}, {_fmt_num(b['max_y'])})")
+            if slide.get("slid_array_bbox"):
+                b = slide["slid_array_bbox"]
+                detail.append(f"slid_array_bbox: min=({_fmt_num(b['min_x'])}, {_fmt_num(b['min_y'])}) max=({_fmt_num(b['max_x'])}, {_fmt_num(b['max_y'])})")
+            detail.append(f"best candidate after slide: side={best['side']} x={_fmt_num(bx)} y={_fmt_num(by)}; rejected: {best.get('failed_ref')!r} {best.get('reason')}")
         raise PlacementError("; ".join(detail))
 
     def _place_array_rule(self, rule: Mapping[str, Any], why: str) -> None:
@@ -3365,6 +3563,17 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         fp = footprints[ref]
         rewritten = rewritten[:fp.start] + _replace_at(fp.text, update.x, update.y, update.write_rot) + rewritten[fp.end:]
     validate_generated_uuids(rewritten, generated_uuids)
+    edge_required_refs = {
+        ref
+        for ref, rule in ((engine.resolve_ref(str(r.get("ref"))) or str(r.get("ref")), r)
+                          for r in model.rules if r.get("ref") is not None)
+        if engine._rule_flag(rule, "edge_required", False)
+    }
+    edge_required_refs.update(
+        engine.resolve_ref(str(r.get("anchor"))) or str(r.get("anchor"))
+        for r in model.rules
+        if r.get("type") == "cluster" and engine._rule_flag(r.get("placement", {}), "edge_required", False)
+    )
     report = {
         "version": __version__,
         "footprints_total": len(footprints),
@@ -3379,6 +3588,7 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "placement_policy": dataclasses.asdict(model.policy),
         "part_classes": {ref: _part_class_for(model, ref) for ref in sorted(footprints)},
         "locked_refs": sorted(engine.locked),
+        "edge_required_refs": sorted(edge_required_refs),
         "validation_errors": sum(1 for m in engine.messages if m.level == "error"),
         "board": dataclasses.asdict(model.board) | {"origin_x": model.board.origin_x, "origin_y": model.board.origin_y},
         "bounds": footprint_bounds(footprints),
