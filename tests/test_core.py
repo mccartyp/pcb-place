@@ -1580,6 +1580,65 @@ DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", pad="1", side="right", dis
     assert any("ANTENNA" in m.text for m in messages if m.level == "note")
 
 
+
+def test_decoupling_array_slides_along_bottom_inside_board(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+DecouplingArray(refs=["C1", "C2", "C3", "C4", "C5"], parent="U1", pad="1", side="bottom", distance=1.0, spacing=1.5, stagger=False)
+''')
+    out, _messages, report = apply_placements(_decoupling_array_edge_pcb(5, u_at=(2, 10), u_size=(4, 4), pad_at=(0, 1.8)), model, strict=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    for ref in ("C1", "C2", "C3", "C4", "C5"):
+        bbox = _bbox_for_text(out, model, ref)
+        assert bbox["min_x"] >= 0.0
+        assert bbox["max_x"] <= 40.0
+        assert placements[ref]["why"] == "decoupling_array"
+    search = report["placement_search"]["C1"]
+    assert search["chosen"]["metadata"]["slide_applied"] is True
+    assert search["chosen"]["metadata"]["slide_dx"] > 0
+    assert "placement_region" in search["chosen"]["metadata"]
+    assert search["chosen"]["metadata"]["single_row_capacity"] >= 1
+
+
+def test_pullup_array_uses_sliding_logic(tmp_path):
+    pcb = _decoupling_array_edge_pcb(3, u_at=(2, 10), u_size=(4, 4), pad_at=(0, 1.8)).replace('"C1"', '"R1"').replace('"C2"', '"R2"').replace('"C3"', '"R3"')
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+PullupArray(refs=["R1", "R2", "R3"], parent="U1", pad="1", side="bottom", distance=1.0, spacing=2.0)
+''')
+    out, _messages, report = apply_placements(pcb, model, strict=True)
+    for ref in ("R1", "R2", "R3"):
+        bbox = _bbox_for_text(out, model, ref)
+        assert bbox["min_x"] >= 0.0
+    attempts = report["placement_search"]["R1"]["attempted_candidates"]
+    assert any(a["metadata"].get("slide_applied") for a in attempts)
+
+
+def test_integer_board_region_keepout_geometry_accepted(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=75, height=75, origin_x=140, origin_y=52)
+Region("A", x=140, y=52, w=75, h=75)
+Keepout("K", x=200, y=100, w=1, h=1)
+Anchor("U1", region="A", rot=0)
+''')
+    _out, _messages, report = apply_placements(_decoupling_array_edge_pcb(1), model, strict=True, allow_overlap=True)
+    assert report["board"]["width"] == 75.0
+    assert report["board"]["height"] == 75.0
+    assert report["regions"]["A"]["w"] == 75.0
+    assert report["keepouts"][0]["w"] == 1.0
+
+
+def test_edge_required_connector_remains_locked_on_edge(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+Edge("U1", edge="left", y=20, edge_required=True, locked=True, mechanical=True, access_side="left", rot=0)
+Anchor("U1", x=20, y=20, rot=0)
+''')
+    with pytest.raises(PlacementError) as excinfo:
+        apply_placements(_decoupling_array_edge_pcb(1, u_at=(2, 20), u_size=(4, 4)), model, strict=True, allow_overlap=True)
+    assert "locked footprint 'U1'" in str(excinfo.value)
+
+
 def test_decoupling_array_failure_diagnostics_include_parent_bbox_and_sides(tmp_path):
     model = _load_inline(tmp_path, '''
 Board(width=8, height=8)
