@@ -44,6 +44,8 @@ layout):
 
 ```text
 board.pln                      # owned by pcb-plan
+pcb-plan-init-report.json      # pcb-plan init report for AI review
+pcb-plan-check-report.json     # pcb-plan check report for AI review
 placement.ppl                  # pcb-plan emit -> pcb-place input
 pcb-plan-report.json           # pcb-plan emit report
 pcb-place-report.json          # pcb-place dry-run/write report
@@ -63,16 +65,23 @@ iteration-summary.md           # per-iteration summary for review/autonomous mod
 pcb build board.zen
 pcb layout board.zen
 
-# 2. Plan
+# 2. Plan and AI-optimize board.pln before emit
 pcb-plan init --board layout.kicad_pcb --netlist default.net -o board.pln \
   --report-json pcb-plan-init-report.json
+# AI review/optimization of board.pln: geometry, regions, keepouts, clusters,
+# edge-required/access_side, high-speed corridors, arrays, routing/SI, sim hooks
+pcb-plan check --pln board.pln --board layout.kicad_pcb --netlist default.net \
+  --report-json pcb-plan-check-report.json
+# AI review/optimization of pcb-plan-check-report.json
 pcb-plan emit --pln board.pln --board layout.kicad_pcb --netlist default.net \
   -o placement.ppl --report-json pcb-plan-report.json \
   --emit-routing-policy routing-policy.yaml \
   --emit-openems-plan simulation/openems/openems-plan.yaml
 
-# 3. Place
+# 3. Place and AI-review the dry-run report
 pcb-place layout.kicad_pcb placement.ppl --dry-run --report-json pcb-place-report.json
+# AI review/optimization of pcb-place-report.json, feeding fixes back to board.pln
+# before writing if needed.
 pcb-place layout.kicad_pcb placement.ppl -o layout.placed.kicad_pcb --report-json pcb-place-report.json
 
 # 4. Route (external tool, driven by routing-policy.yaml)
@@ -96,9 +105,92 @@ pcb-plan update --pln board.pln --board layout.placed.kicad_pcb \
   -o board.updated.pln --patch board.pln.patch
 ```
 
-Each stage's output feeds the next: `board.pln` -> `placement.ppl` ->
-`layout.placed.kicad_pcb` -> routed board -> DRC/ERC + simulation reports ->
-`board.pln` update proposals.
+Each stage's output feeds the next: `board.pln` plus AI review ->
+`pcb-plan check` -> `placement.ppl` -> `pcb-place` dry-run report plus AI
+review -> `layout.placed.kicad_pcb` -> routed board -> DRC/ERC + simulation
+reports -> `board.pln` update proposals.
+
+## AI Optimization Loop
+
+The orchestrator has three operating modes:
+
+### Review mode (default)
+
+- Run or read the latest reports.
+- Propose `board.pln` edits, show a patch/diff, and let the user apply them.
+- Do not overwrite `board.pln` automatically.
+
+### Assisted mode
+
+- Apply `board.pln` edits directly only when the user asks Claude to optimize
+  or edit the plan.
+- Preserve user constraints, keep diffs minimal, and rerun `pcb-plan review`
+  and `pcb-plan check` after each edit.
+
+### Autonomous mode
+
+- May run bounded `init/check/edit/emit/place/route/sim/update` iterations.
+- Default `max_iterations = 3`.
+- Stop early if the score no longer improves, if changes converge, or if
+  remaining work requires human engineering judgment.
+
+Each iteration should:
+
+1. Run or read the latest init/check/emit/place/routing/simulation reports.
+2. Score the design and write or update `design-score.json`.
+3. Identify the highest-impact `board.pln` changes.
+4. Edit `board.pln` with minimal visible diffs and provenance.
+5. Re-run `pcb-plan check`.
+6. Emit `placement.ppl`.
+7. Dry-run `pcb-place` and review `pcb-place-report.json`.
+8. Route/simulate/update when configured.
+9. Stop if the score no longer improves.
+
+Scoring should consider:
+
+- plan confidence and review-required reasons;
+- components planned versus unplaced components;
+- duplicate placement owners and ownership conflicts;
+- differential-pair inference and constraint completeness;
+- high-speed constraints completeness;
+- placement collisions, spacing violations, keepout violations, and region
+  violations;
+- candidate search failures and array slide/clamp diagnostics;
+- edge-required constraints and movement attempts;
+- OpenEMS/ngspice warnings and missing simulation triggers.
+
+### Board.pln editing rules
+
+When Claude modifies `board.pln`:
+
+- preserve user comments if possible;
+- keep provenance for inferred changes;
+- avoid silently deleting user constraints;
+- prefer minimal diffs;
+- maintain valid schema;
+- rerun `pcb-plan review` and `pcb-plan check` after editing.
+
+Allowed AI edits include board geometry correction, region size/position,
+keepout additions, `edge_required` metadata, `access_side` metadata,
+`effective_side` overrides, decoupling group strategy, pullup/strap group
+strategy, stackup/routing constraints, simulation triggers, and OpenEMS/ngspice
+settings. Use provenance fields such as:
+
+```yaml
+source: ai_review
+confidence: low|medium|high
+requires_review: true|false
+rationale: "..."
+```
+
+### AI should optimize intent, not hide failures
+
+- Prefer `board.pln` edits over manual `placement.ppl` hacks.
+- Preserve provenance and user-authored constraints.
+- Emit review-required notes for inferred or uncertain changes.
+- Report uncertainty and remaining engineering decisions.
+- Never claim compliance, SI verification, EMI verification, or production
+  readiness.
 
 ## Routing Modes
 
@@ -186,31 +278,15 @@ becomes visible `provenance.update_proposals`, not silent edits.
 
 ## Iteration
 
-### Review mode (default)
-
-- Run plan/place/route/verify/simulate as requested.
-- Propose `board.pln` changes via `pcb-plan update -o board.updated.pln
-  --patch board.pln.patch`.
-- **Do not apply** `board.updated.pln` over `board.pln` automatically —
-  present the patch and report to the user for approval.
-
-### Autonomous mode
-
-- Apply `board.updated.pln` as the new `board.pln` (after `pcb-plan update`).
-- Re-run plan -> place -> route -> verify -> (simulate) for the next
-  iteration.
-- **Bounded**: default `max_iterations = 3`. Stop early if DRC passes with no
-  open `review_required_items`, or if an iteration makes no further changes
-  to `board.pln`.
-- Write `iteration-summary.md` after each iteration: what changed, current
-  `design-score.json`, remaining warnings/review items, and whether another
-  iteration is planned.
-- If `max_iterations` is reached without a clean result, stop and report
-  outstanding issues — do not silently continue or claim success.
+Use the AI Optimization Loop modes above. In all modes, `pcb-plan update` may
+incorporate placement/routing/simulation feedback into `board.updated.pln` and
+`board.pln.patch`, but the orchestrator should still inspect the proposed
+changes rather than accepting them blindly.
 
 Autonomous mode should still surface every `requires_review: true` item from
 `board.pln` provenance to the user at the end of the run, even if iteration
-completed.
+completed. If `max_iterations` is reached without a clean result, stop and
+report outstanding issues — do not silently continue or claim success.
 
 ## Safety / Limits
 
@@ -243,11 +319,18 @@ Single review-mode pass with all-net routing using existing constraints:
 pcb build board.zen
 pcb layout board.zen
 
-pcb-plan init --board layout.kicad_pcb --netlist default.net -o board.pln
+pcb-plan init --board layout.kicad_pcb --netlist default.net -o board.pln \
+  --report-json pcb-plan-init-report.json
+# Claude reviews/optimizes board.pln, e.g. HDMI edge_required/access_side,
+# U10 decoupling effective_side/stagger, POWER/HIGH_SPEED regions.
+pcb-plan check --pln board.pln --board layout.kicad_pcb --netlist default.net \
+  --report-json pcb-plan-check-report.json
 pcb-plan emit --pln board.pln --board layout.kicad_pcb --netlist default.net \
   -o placement.ppl --emit-routing-policy routing-policy.yaml \
   --emit-openems-plan simulation/openems/openems-plan.yaml
 
+pcb-place layout.kicad_pcb placement.ppl --dry-run --report-json pcb-place-report.json
+# Claude reviews the dry-run report and adjusts board.pln before writing if needed.
 pcb-place layout.kicad_pcb placement.ppl -o layout.placed.kicad_pcb --report-json pcb-place-report.json
 
 KiCadRoutingTools route layout.placed.kicad_pcb --policy routing-policy.yaml --report-json routing-report.json
@@ -263,14 +346,18 @@ Bounded autonomous loop (3 iterations max), only when explicitly requested:
 
 ```text
 for i in 1..3:
+  run/read latest init/check/place/route/sim reports
+  score design -> design-score.json
+  edit board.pln for highest-impact intent fixes, with provenance
+  pcb-plan check ... --report-json pcb-plan-check-report.json
   emit placement.ppl from board.pln
-  pcb-place ... -o layout.placed.kicad_pcb
-  route + DRC/ERC (+ optional simulation)
+  pcb-place ... --dry-run --report-json pcb-place-report.json
+  route + DRC/ERC (+ optional OpenEMS/ngspice when triggered)
   pcb-plan update ... -o board.updated.pln --patch board.pln.patch
-  if no review_required_items and DRC clean: break
-  board.pln <- board.updated.pln
+  if score no longer improves: break
+  board.pln <- reviewed/accepted board.updated.pln
   write iteration-summary.md
-report final status + outstanding review items
+report final status + outstanding review items; never claim compliance
 ```
 
 See [`../pcb-plan/SKILL.md`](../pcb-plan/SKILL.md) and

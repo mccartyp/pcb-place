@@ -54,11 +54,13 @@ pcb build
     ↓
 pcb layout
     ↓
-pcb-plan init/update/review
+pcb-plan init
     ↓
 board.pln
     ↓
-pcb-plan emit
+Claude AI review/optimization
+    ↓
+pcb-plan check / emit
     ↓
 placement.ppl
     ↓
@@ -78,7 +80,13 @@ pcb layout board.zen
 pcb-plan init \
   --board layout.kicad_pcb \
   --netlist default.net \
-  -o board.pln
+  -o board.pln \
+  --report-json pcb-plan-init-report.json
+
+# Let Claude review/optimize board.pln before emit. Typical fixes include
+# board geometry, regions, keepouts, edge_required/access_side metadata,
+# DecouplingArray/PullupArray strategy, differential pairs, routing/SI
+# constraints, and OpenEMS/ngspice triggers.
 
 pcb-plan check \
   --pln board.pln \
@@ -86,24 +94,39 @@ pcb-plan check \
   --netlist default.net \
   --report-json pcb-plan-check-report.json
 
+# Let Claude review/optimize pcb-plan-check-report.json.
+
 pcb-plan emit \
   --pln board.pln \
   --board layout.kicad_pcb \
   --netlist default.net \
   -o placement.ppl
 
-pcb-place layout.kicad_pcb placement.ppl --dry-run
+pcb-place layout.kicad_pcb placement.ppl --dry-run \
+  --report-json pcb-place-report.json
+# Let Claude review/optimize pcb-place-report.json and feed fixes back to
+# board.pln rather than hand-editing placement.ppl when possible.
 pcb-place layout.kicad_pcb placement.ppl -o layout.placed.kicad_pcb
 pcbnew layout.placed.kicad_pcb
 ```
+
+Concise AI-assisted workflow:
+
+1. Generate `board.pln` with `pcb-plan init`.
+2. Let Claude review/optimize `board.pln` before emit.
+3. Generate `placement.ppl` with `pcb-plan emit` after `pcb-plan check`.
+4. Apply with `pcb-place` after reviewing the dry-run report.
+5. Iterate using planner, placement, routing, DRC/ERC, OpenEMS, and ngspice
+   reports.
 
 Run `pcb-plan check` after `init`/`update` and before `emit` to catch
 low-confidence plans (missing nets, mostly-singleton clusters, mostly-unplaced
 components, duplicate rules, missing differential pairs, rejected `Series(...)`
 inferences, or footprint-extents board geometry) before generating
-`placement.ppl`. See [`src/pcb_plan/README.md`](src/pcb_plan/README.md) for the
-`plan_confidence` model and the `--strict-confidence`/`--allow-low-confidence`
-flags on `emit`.
+`placement.ppl`. AI review should prefer `board.pln` intent edits over manual
+`placement.ppl` hacks and should preserve provenance for inferred changes. See
+[`src/pcb_plan/README.md`](src/pcb_plan/README.md) for the `plan_confidence`
+model and the `--strict-confidence`/`--allow-low-confidence` flags on `emit`.
 
 For early use, you can skip the planner and write `placement.ppl` by hand, or
 run the planner with only a KiCad board:
@@ -134,9 +157,10 @@ plan. It may infer roles such as connectors, ICs, decoupling capacitors, ESD
 devices, high-speed differential interfaces, RF modules, power regulators,
 pullups, and series passives.
 
-Planner output is meant to be reviewed, edited, diffed, and re-run. It does
-**not** route traces, tune differential pairs, validate impedance, certify EMI
-behavior, or claim production readiness.
+Planner output is meant to be reviewed, AI-optimized, edited, diffed, and
+re-run after `init` and before `emit`. It does **not** route traces, tune
+differential pairs, validate impedance, certify EMI behavior, or claim
+production readiness.
 
 Planner quality depends on real board geometry and connectivity. Explicit
 `board.pln` geometry overrides KiCad `Edge.Cuts`, and `Edge.Cuts` overrides the
@@ -218,21 +242,25 @@ Both tools are sidecars around KiCad files:
 this repository's tools:
 
 - [`skills/pcb-plan/SKILL.md`](skills/pcb-plan/SKILL.md) — `board.pln` and
-  `placement.ppl` lifecycle: init/review/explain/update/emit, routing/SI
-  constraints, stackup, differential pairs, simulation hooks, provenance.
+  `placement.ppl` lifecycle: init, AI-assisted optimization, check, review,
+  explain, update, emit, routing/SI constraints, stackup, differential pairs,
+  simulation hooks, provenance.
 - [`skills/pcb-place/SKILL.md`](skills/pcb-place/SKILL.md) — applying and
-  debugging `placement.ppl` against a `.kicad_pcb` board: dry-run,
-  validation, collisions/spacing/keepouts/regions, troubleshooting.
+  debugging `placement.ppl` against a `.kicad_pcb` board: dry-run report
+  review, validation, collisions/spacing/keepouts/regions, array diagnostics,
+  edge-required movement attempts, troubleshooting.
 - [`skills/pcb-automation-orchestrator/SKILL.md`](skills/pcb-automation-orchestrator/SKILL.md) —
-  end-to-end iteration across `pcb-plan`, `pcb-place`, routing, DRC/ERC, and
-  optional OpenEMS/ngspice simulation, including all-net and high-speed
-  routing modes.
+  end-to-end AI iteration across `pcb-plan`, `pcb-place`, routing, DRC/ERC,
+  and optional OpenEMS/ngspice simulation, including review, assisted, and
+  bounded autonomous modes plus all-net and high-speed routing modes.
 
-Short workflow: use `pcb-plan` to own `board.pln` and emit `placement.ppl`,
-use `pcb-place` to apply/debug that `placement.ppl` against a KiCad board, and
-use `pcb-automation-orchestrator` to coordinate the full
-plan/place/route/verify/simulate loop. See [`skills/README.md`](skills/README.md)
-for details on when to use each.
+Short workflow: generate `board.pln`, let Claude review/optimize it, generate
+`placement.ppl`, apply with `pcb-place`, and iterate using reports. Use
+`pcb-plan` to own `board.pln`, use `pcb-place` to apply/debug the emitted
+`placement.ppl` against a KiCad board, and use `pcb-automation-orchestrator`
+to coordinate the full init/check/edit/emit/place/route/verify/simulate/update
+loop. See [`skills/README.md`](skills/README.md) for details on when to use
+each.
 
 ### Placement regions, support arrays, and edge-required parts
 
