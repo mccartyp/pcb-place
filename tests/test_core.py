@@ -1129,3 +1129,234 @@ Anchor("C1", x=40, y=40, priority=1)
 ''')
     with pytest.raises(PlacementError, match="locked footprint"):
         apply_placements(_pad_pcb(), model, strict=True)
+
+
+def _corner_pcb() -> str:
+    return '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 1 1 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C" (layer "F.Cu")
+    (at 50 50 0)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+)'''
+
+
+def test_nearpad_inward_near_board_corner(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=20, height=20)
+NearPad("C1", parent="U1", pad="1", distance=2, side="inward")
+''')
+    _out, _messages, report = apply_placements(_corner_pcb(), model, strict=True)
+    placed = next(p for p in report["placements"] if p["ref"] == "C1")
+    assert 0 <= placed["x"] <= 20 and 0 <= placed["y"] <= 20
+    assert report["collisions"] == []
+
+
+def test_nearpad_auto_avoids_off_board_sides(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=20, height=20)
+NearPad("C1", parent="U1", pad="1", distance=2, side="auto")
+''')
+    _out, _messages, report = apply_placements(_corner_pcb(), model, strict=True)
+    placed = next(p for p in report["placements"] if p["ref"] == "C1")
+    assert 0 <= placed["x"] <= 20 and 0 <= placed["y"] <= 20
+    assert report["collisions"] == []
+
+
+def _nearpad_obstacle_pcb() -> str:
+    return '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 5 5 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:OBS" (layer "F.Cu")
+    (at 7 5 0)
+    (property "Reference" "OBS1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1.2 1.2) (layers "F.Cu"))
+  )
+  (footprint "Test:C" (layer "F.Cu")
+    (at 50 50 0)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+)'''
+
+
+def test_nearpad_offset_search_avoids_collision(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+NearPad("C1", parent="U1", pad="1", distance=2, side="right")
+''')
+    _out, _messages, report = apply_placements(_nearpad_obstacle_pcb(), model, strict=True)
+    placed = next(p for p in report["placements"] if p["ref"] == "C1")
+    # The primary candidate (7, 5) is occupied by OBS1; the offset search must move off it.
+    assert (placed["x"], placed["y"]) != (7.0, 5.0)
+    assert report["collisions"] == []
+    assert report["auto_adjustments"]
+    search = report["placement_search"]["C1"]
+    assert search["attempted_candidates"]
+    assert search["chosen"]["legal"] is True
+    assert "search_radius_used" in search and "fallback_used" in search
+
+
+def _satellite_edge_pcb() -> str:
+    return '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 18 10 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C" (layer "F.Cu")
+    (at 50 50 0)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+)'''
+
+
+def test_satellite_searches_alternate_side_near_board_edge(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=20, height=20)
+Satellite("C1", parent="U1", side="right", distance=3)
+''')
+    _out, _messages, report = apply_placements(_satellite_edge_pcb(), model, strict=True)
+    placed = next(p for p in report["placements"] if p["ref"] == "C1")
+    # The requested point (21, 10) is off the 20x20 board; the engine must search
+    # neighboring slots, alternate sides, and perimeter offsets to find a legal spot.
+    assert 0 <= placed["x"] <= 20 and 0 <= placed["y"] <= 20
+    assert report["collisions"] == []
+    assert report["auto_adjustments"]
+    chosen = report["placement_search"]["C1"]["chosen"]
+    assert chosen is not None and chosen["legal"] is True
+
+
+def _between_pcb() -> str:
+    return '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:A" (layer "F.Cu")
+    (at 5 10 0)
+    (property "Reference" "A1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:B" (layer "F.Cu")
+    (at 25 10 0)
+    (property "Reference" "B1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:D1" (layer "F.Cu")
+    (at 50 50 0)
+    (property "Reference" "D1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1.5 1.5) (layers "F.Cu"))
+  )
+  (footprint "Test:D2" (layer "F.Cu")
+    (at 51 51 0)
+    (property "Reference" "D2" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1.5 1.5) (layers "F.Cu"))
+  )
+)'''
+
+
+def test_between_auto_spread_avoids_collision_between_members(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=20)
+Between("D1", a="A1", b="B1", t=0.5, auto_spread=True)
+Between("D2", a="A1", b="B1", t=0.5, auto_spread=True)
+''')
+    _out, _messages, report = apply_placements(_between_pcb(), model, strict=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    assert (placements["D1"]["x"], placements["D1"]["y"]) != (placements["D2"]["x"], placements["D2"]["y"])
+    assert report["collisions"] == []
+    assert report["auto_adjustments"]
+
+
+def _decoupling_array_pcb() -> str:
+    return '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 20 20 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 2 2) (layers "F.Cu"))
+  )
+  (footprint "Test:C1" (layer "F.Cu")
+    (at 50 50 0)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C2" (layer "F.Cu")
+    (at 51 51 0)
+    (property "Reference" "C2" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C3" (layer "F.Cu")
+    (at 52 52 0)
+    (property "Reference" "C3" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+)'''
+
+
+def test_decoupling_array_places_group_without_collisions(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", distance=2)
+''')
+    _out, _messages, report = apply_placements(_decoupling_array_pcb(), model, strict=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    assert {"C1", "C2", "C3"} <= set(placements)
+    coords = {(p["x"], p["y"]) for p in placements.values() if p["ref"] in ("C1", "C2", "C3")}
+    assert len(coords) == 3  # each capacitor lands at a distinct position
+    assert report["collisions"] == []
+    assert all(p["why"] in {"satellite", "near_pad"} for p in placements.values() if p["ref"] in ("C1", "C2", "C3"))
+
+
+def _cluster_soft_pcb() -> str:
+    return '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 10 10 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C" (layer "F.Cu")
+    (at 12 10 0)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:OBS" (layer "F.Cu")
+    (at 32 10 0)
+    (property "Reference" "OBS1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1.8 1.8) (layers "F.Cu"))
+  )
+)'''
+
+
+def test_cluster_soft_member_searches_within_cluster_region(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+Soft("C1")
+Cluster("grp", anchor="U1", members=["U1", "C1"], placement=Anchor(x=30, y=10))
+''')
+    _out, _messages, report = apply_placements(_cluster_soft_pcb(), model, strict=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    # C1 would land on top of OBS1 at (32, 10); the cluster-local search must move it.
+    assert (placements["C1"]["x"], placements["C1"]["y"]) != (32.0, 10.0)
+    assert report["collisions"] == []
+    assert report["auto_adjustments"]
+
+
+def test_placement_search_failure_diagnostics(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+Region("TINY", x=0, y=0, w=2, h=2)
+NearPad("C1", parent="U1", pad="1", distance=10, side="right", region="TINY")
+''')
+    with pytest.raises(PlacementError) as excinfo:
+        apply_placements(_pad_pcb(), model, strict=True)
+    message = str(excinfo.value)
+    assert "without violating clearance or board bounds" in message
+    assert "attempted" in message and "candidate" in message
+    assert "search_radius_used=" in message
+    assert "fallback_used=" in message

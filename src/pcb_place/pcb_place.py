@@ -52,7 +52,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 Number = float | int
 Point = Tuple[float, float]
@@ -196,6 +196,73 @@ class AutoAdjustment:
     placed_x: float
     placed_y: float
     reason: str
+
+
+@dataclasses.dataclass(frozen=True)
+class SearchCandidate:
+    """A single candidate location evaluated by the placement search engine."""
+
+    x: float
+    y: float
+    label: str
+    legal: bool
+    reason: Optional[str]
+    distance: float
+    clearance_margin: Optional[float]
+    edge_distance: Optional[float]
+    score: float
+
+    def as_report(self) -> Dict[str, Any]:
+        return {
+            "x": round(self.x, 6),
+            "y": round(self.y, 6),
+            "label": self.label,
+            "legal": self.legal,
+            "reason": self.reason,
+            "distance": round(self.distance, 6),
+            "clearance_margin": None if self.clearance_margin is None else round(self.clearance_margin, 6),
+            "edge_distance": None if self.edge_distance is None else round(self.edge_distance, 6),
+            "score": round(self.score, 6),
+        }
+
+
+@dataclasses.dataclass
+class SearchOutcome:
+    """The result of searching for a legal placement near a target coordinate."""
+
+    ref: str
+    target: Point
+    attempted: List[SearchCandidate]
+    chosen: Optional[SearchCandidate]
+    search_radius_used: float
+    fallback_used: bool
+
+    @property
+    def rejected(self) -> List[SearchCandidate]:
+        return [c for c in self.attempted if not c.legal]
+
+    @property
+    def best_candidate(self) -> Optional[SearchCandidate]:
+        return min(self.attempted, key=lambda c: c.score) if self.attempted else None
+
+    @property
+    def nearest_legal(self) -> Optional[SearchCandidate]:
+        legal = [c for c in self.attempted if c.legal]
+        return min(legal, key=lambda c: c.distance) if legal else None
+
+    def as_report(self) -> Dict[str, Any]:
+        best = self.best_candidate
+        nearest = self.nearest_legal
+        return {
+            "target": {"x": self.target[0], "y": self.target[1]},
+            "chosen": None if self.chosen is None else self.chosen.as_report(),
+            "attempted_candidates": [c.as_report() for c in self.attempted],
+            "rejected_candidates": [c.as_report() for c in self.rejected],
+            "best_candidate": None if best is None else best.as_report(),
+            "nearest_legal_location": None if nearest is None else nearest.as_report(),
+            "search_radius_used": self.search_radius_used,
+            "fallback_used": self.fallback_used,
+        }
 
 
 @dataclasses.dataclass
@@ -886,12 +953,14 @@ def load_ppl(path: Path) -> PlacementModel:
     def Between(ref: Optional[str] = None, *, a: str, b: str, t: Number = 0.5,
                 dx: Number = 0, dy: Number = 0, offset: Optional[Number] = None,
                 rot: Optional[Number | str] = None, align: Optional[str] = None,
+                auto_spread: bool = False,
                 role: Optional[str] = None, note: Optional[str] = None, **kwargs: Any) -> None:
         if align is not None and rot is None:
             rot = align
         rule = dict(type="between", ref=None if ref is None else _normalize_ref(ref), a=_normalize_ref(a), b=_normalize_ref(b),
                     t=float(t), dx=float(dx), dy=float(dy),
                     offset=None if offset is None else float(offset), rot=_rot_or_none(rot),
+                    auto_spread=bool(auto_spread),
                     role=role, note=note, extra=dict(kwargs))
         if ref is None:
             return rule
@@ -946,6 +1015,29 @@ def load_ppl(path: Path) -> PlacementModel:
             NearPad(ref, parent=parent, pad=pad, distance=distance, role=role, priority=priority, **kwargs)
         else:
             Satellite(ref, parent=parent, side="auto", distance=distance, role=role, priority=priority, **kwargs)
+
+    def DecouplingArray(refs: Sequence[str], *, parent: str, pads: Optional[Sequence[str | Sequence[str]]] = None,
+                        distance: Number = 1.5, role: str = "decoupling", priority: Number = 90,
+                        power_net: Optional[str] = None, ground_net: Optional[str] = None,
+                        note: Optional[str] = None, **kwargs: Any) -> None:
+        """Place a group of decoupling capacitors around `parent`, one per pad (or one per
+        slot near `parent` if `pads` is omitted), searching for legal positions individually."""
+
+        refs = list(refs)
+        if not refs:
+            return
+        kwargs.setdefault("power_net", power_net)
+        kwargs.setdefault("ground_net", ground_net)
+        for i, ref in enumerate(refs):
+            pad = pads[i] if pads is not None else None
+            if pad is not None:
+                model.add("near_pad", ref=_normalize_ref(ref), parent=_normalize_ref(parent), pad=pad,
+                          distance=float(distance), side="auto", clearance=None, role=role,
+                          priority=float(priority), rot=None, note=note, extra=dict(kwargs))
+            else:
+                model.add("satellite", ref=_normalize_ref(ref), parent=_normalize_ref(parent), side="auto",
+                          distance=float(distance), index=i, pitch=1.5, dx=0.0, dy=0.0,
+                          rot=None, role=role, priority=float(priority), note=note, extra=dict(kwargs))
 
     def Series(ref: str, *, a: str, b: str, t: Number = 0.5, offset: Number = 0,
                clearance: Optional[Number] = None, role: str = "series", priority: Number = 70,
@@ -1129,6 +1221,7 @@ def load_ppl(path: Path) -> PlacementModel:
         "Satellite": Satellite,
         "NearPad": NearPad,
         "Decoupling": Decoupling,
+        "DecouplingArray": DecouplingArray,
         "Pullup": Pullup,
         "Series": Series,
         "ESD": ESD,
@@ -1717,6 +1810,7 @@ class PlacementEngine:
         self.auto_adjustments: List[AutoAdjustment] = []
         self.clusters: List[Dict[str, Any]] = []
         self.last_cluster_by_ref: Dict[str, str] = {}
+        self.search_log: Dict[str, SearchOutcome] = {}
         for error in model.alias_diagnostics.errors:
             self.messages.append(Message("error", error))
         for warning in model.alias_diagnostics.warnings:
@@ -1777,6 +1871,7 @@ class PlacementEngine:
     def place(self, ref: str, x: float, y: float, rot: Optional[float], why: str, note: Optional[str] = None,
               *, allow_arbitrary_rotation: bool = False, avoid_overlap: bool = False,
               clearance_override: Optional[float] = None, candidate_sides: Optional[Sequence[str]] = None,
+              region_override: Optional[BBox] = None,
               rule: Optional[Mapping[str, Any]] = None) -> None:
         actual_ref = self.resolve_ref(ref)
         if actual_ref is None:
@@ -1820,15 +1915,19 @@ class PlacementEngine:
                 return
         soft = self._rule_soft(rule, actual_ref)
         if (avoid_overlap or soft) and self.model.policy.avoid_overlap:
+            region = region_override if region_override is not None else (
+                None if self.allow_outside_region else self._region_bbox(self._rule_value(rule, "region")))
             placed = self._find_non_overlapping_position(actual_ref, float(x), float(y), float(new_rot),
                                                          clearance_override=clearance_override,
                                                          candidate_sides=candidate_sides,
-                                                         region=(None if self.allow_outside_region else
-                                                                 self._region_bbox(self._rule_value(rule, "region"))),
+                                                         region=region,
                                                          allow_keepout_overlap=(self.allow_keepout_overlap or
                                                                                 self._rule_flag(rule, "allow_keepout_overlap", False)))
             if placed is None:
-                raise PlacementError(f"{actual_ref!r} could not be placed by {why} without violating clearance or board bounds; requested x={_fmt_num(x)} y={_fmt_num(y)}")
+                outcome = self.search_log.get(actual_ref)
+                raise PlacementError(self._format_search_failure(actual_ref, why, outcome, requested=(float(x), float(y)))
+                                      if outcome is not None else
+                                      f"{actual_ref!r} could not be placed by {why} without violating clearance or board bounds; requested x={_fmt_num(x)} y={_fmt_num(y)}")
             px, py, reason = placed
             if abs(px - x) > 1e-9 or abs(py - y) > 1e-9:
                 self.auto_adjustments.append(AutoAdjustment(actual_ref, float(x), float(y), px, py, reason))
@@ -1911,9 +2010,16 @@ class PlacementEngine:
         new_anchor = self._placement_target(rule["placement"])
         dx = new_anchor[0] - old_anchor[0]
         dy = new_anchor[1] - old_anchor[1]
+        targets = [(self.positions[actual][0] + dx, self.positions[actual][1] + dy) for actual in members]
+        margin = self.model.policy.max_search_radius + 5.0
+        cluster_region = BBox(
+            min(t[0] for t in targets) - margin, min(t[1] for t in targets) - margin,
+            max(t[0] for t in targets) + margin, max(t[1] for t in targets) + margin,
+        )
         for actual in members:
             x, y, rot = self.positions[actual]
-            self.place(actual, x + dx, y + dy, None, f"cluster {name}", rule.get("note"))
+            self.place(actual, x + dx, y + dy, None, f"cluster {name}", rule.get("note"),
+                       region_override=cluster_region)
             self.last_cluster_by_ref[actual] = name
         self.clusters.append({
             "name": name,
@@ -2001,13 +2107,211 @@ class PlacementEngine:
             raise PlacementError(f"unknown region {name!r}")
         return _rect_to_abs_bbox(self.model, self.model.regions[name])
 
-    def _near_point_candidates(self, x: float, y: float, distance: float, side: str) -> List[Tuple[str, float, float]]:
-        vectors = {"right": (1.0, 0.0), "left": (-1.0, 0.0), "top": (0.0, -1.0), "bottom": (0.0, 1.0)}
-        sides = ["top", "right", "bottom", "left"] if side == "auto" else [side]
-        bad = [s for s in sides if s not in vectors]
-        if bad:
-            raise PlacementError(f"Unknown side {bad[0]!r}")
-        return [(s, x + vectors[s][0] * distance, y + vectors[s][1] * distance) for s in sides]
+    # Unit vectors for the four cardinal placement sides. "top"/"bottom" point toward
+    # decreasing/increasing y because KiCad y increases downward on the board.
+    _SIDE_VECTORS: Dict[str, Point] = {"right": (1.0, 0.0), "left": (-1.0, 0.0), "top": (0.0, -1.0), "bottom": (0.0, 1.0)}
+    _NEARPAD_OFFSETS: Tuple[float, ...] = (0.0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0)
+
+    def _edge_distance(self, bbox: BBox) -> Optional[float]:
+        """Distance from bbox to the nearest board edge, or None if board geometry is unknown."""
+
+        if self.board_geometry is None:
+            return None
+        g = self.board_geometry
+        return min(bbox.min_x - g.min_x, g.max_x - bbox.max_x, bbox.min_y - g.min_y, g.max_y - bbox.max_y)
+
+    def _clearance_margin(self, ref: str, x: float, y: float, rot: float,
+                          clearance_override: Optional[float], allow_keepout_overlap: bool) -> Optional[float]:
+        """Smallest clearance margin to obstacles, keepouts, and the board edge (positive is safe)."""
+
+        if ref not in self.footprints:
+            return None
+        info = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model)
+        margins: List[float] = []
+        edge = self._edge_distance(info.bbox)
+        if edge is not None:
+            margins.append(edge)
+        for other in self.positions:
+            if other == ref or other not in self.footprints or not _same_physical_side(self.footprints[ref], self.footprints[other]):
+                continue
+            ox, oy, orot = self.positions[other]
+            other_info = footprint_bbox_at(self.footprints[other], ox, oy, orot, self.model)
+            required = clearance_override
+            if required is None:
+                required = self.model.clearance.required_for(_part_class_for(self.model, ref), _part_class_for(self.model, other))
+            margins.append(info.bbox.clearance_to(other_info.bbox) - required)
+        if not allow_keepout_overlap:
+            for keepout in keepout_rules(self.model):
+                if bool(keepout.get("extra", {}).get("allow_keepout_overlap", False)):
+                    continue
+                margins.append(info.bbox.clearance_to(_rect_to_abs_bbox(self.model, keepout)))
+        return min(margins) if margins else None
+
+    def _evaluate_candidate(self, ref: str, x: float, y: float, rot: float, target: Point, label: str,
+                            *, clearance_override: Optional[float], region: Optional[BBox],
+                            allow_keepout_overlap: bool) -> SearchCandidate:
+        """Score a single candidate location for legality, distance, clearance, and edge margin."""
+
+        reason = self._collides_at(ref, x, y, rot, clearance_override=clearance_override,
+                                   region=region, allow_keepout_overlap=allow_keepout_overlap)
+        legal = reason is None
+        distance = math.hypot(x - target[0], y - target[1])
+        margin = self._clearance_margin(ref, x, y, rot, clearance_override, allow_keepout_overlap)
+        edge = None
+        if ref in self.footprints:
+            info = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model)
+            edge = self._edge_distance(info.bbox)
+        score = distance - 0.01 * (margin if margin is not None else 0.0) - 0.01 * (edge if edge is not None else 0.0)
+        return SearchCandidate(x, y, label, legal, reason, distance, margin, edge, score)
+
+    def _search_candidates(self, ref: str, target: Point, rot: float, points: Sequence[Tuple[float, float, str]],
+                           *, clearance_override: Optional[float], region: Optional[BBox],
+                           allow_keepout_overlap: bool, search_radius_used: float,
+                           fallback_used: bool = False) -> SearchOutcome:
+        """Evaluate candidate points and choose the lowest-cost legal one. Records diagnostics on self.search_log."""
+
+        attempted: List[SearchCandidate] = []
+        seen: Set[Tuple[int, int]] = set()
+        for x, y, label in points:
+            key = (round(x / 1e-6), round(y / 1e-6))
+            if key in seen:
+                continue
+            seen.add(key)
+            attempted.append(self._evaluate_candidate(ref, x, y, rot, target, label,
+                                                       clearance_override=clearance_override, region=region,
+                                                       allow_keepout_overlap=allow_keepout_overlap))
+        legal = [c for c in attempted if c.legal]
+        chosen = min(legal, key=lambda c: c.score) if legal else None
+        outcome = SearchOutcome(ref, target, attempted, chosen, search_radius_used, fallback_used)
+        self.search_log[ref] = outcome
+        return outcome
+
+    def _mark_fallback(self, outcome: SearchOutcome, ref: str, x: float, y: float, rot: float,
+                       *, clearance_override: Optional[float], region: Optional[BBox],
+                       allow_keepout_overlap: bool) -> SearchOutcome:
+        """Append a generic grid-search fallback candidate and mark the outcome as having used it."""
+
+        candidate = self._evaluate_candidate(ref, x, y, rot, outcome.target, "fallback_grid_search",
+                                             clearance_override=clearance_override, region=region,
+                                             allow_keepout_overlap=allow_keepout_overlap)
+        attempted = outcome.attempted + [candidate]
+        chosen = candidate if candidate.legal else outcome.chosen
+        new_outcome = SearchOutcome(ref, outcome.target, attempted, chosen, outcome.search_radius_used, True)
+        self.search_log[ref] = new_outcome
+        return new_outcome
+
+    def _format_search_failure(self, ref: str, why: str, outcome: SearchOutcome, *, requested: Point) -> str:
+        parts = [
+            f"{ref!r} could not be placed by {why} without violating clearance or board bounds; "
+            f"requested x={_fmt_num(requested[0])} y={_fmt_num(requested[1])}",
+            f"attempted {len(outcome.attempted)} candidate(s)",
+        ]
+        best = outcome.best_candidate
+        if best is not None:
+            if best.legal:
+                parts.append(f"best candidate: x={_fmt_num(best.x)} y={_fmt_num(best.y)} ({best.label})")
+            else:
+                parts.append(f"best candidate: x={_fmt_num(best.x)} y={_fmt_num(best.y)} ({best.label}); rejected: {best.reason}")
+        nearest = outcome.nearest_legal
+        if nearest is not None:
+            parts.append(f"nearest legal location: x={_fmt_num(nearest.x)} y={_fmt_num(nearest.y)} ({nearest.label})")
+        else:
+            parts.append("no legal location found")
+        parts.append(f"search_radius_used={_fmt_num(outcome.search_radius_used)}")
+        parts.append(f"fallback_used={outcome.fallback_used}")
+        return "; ".join(parts)
+
+    def _board_inward_sides(self, x: float, y: float) -> List[str]:
+        """Order cardinal sides preferring the direction toward the board interior."""
+
+        if self.board_geometry is None:
+            return ["top", "right", "bottom", "left"]
+        g = self.board_geometry
+        cx, cy = (g.min_x + g.max_x) / 2.0, (g.min_y + g.max_y) / 2.0
+        horizontal = "right" if x <= cx else "left"
+        vertical = "top" if y >= cy else "bottom"
+        dist_x = min(x - g.min_x, g.max_x - x)
+        dist_y = min(y - g.min_y, g.max_y - y)
+        primary = [horizontal, vertical] if dist_x <= dist_y else [vertical, horizontal]
+        remaining = [s for s in ("top", "right", "bottom", "left") if s not in primary]
+        return primary + remaining
+
+    def _near_pad_points(self, origin: Point, sides: Sequence[str], distance: float) -> List[Tuple[float, float, str]]:
+        """Candidate points for NearPad/Satellite("auto"/"inward"): each side at `distance`, with small
+        perpendicular offsets searched before falling back to the next side."""
+
+        points: List[Tuple[float, float, str]] = []
+        for side in sides:
+            if side not in self._SIDE_VECTORS:
+                raise PlacementError(f"Unknown side {side!r}")
+            vx, vy = self._SIDE_VECTORS[side]
+            tx, ty = -vy, vx
+            bx, by = origin[0] + vx * distance, origin[1] + vy * distance
+            for off in self._NEARPAD_OFFSETS:
+                label = side if off == 0 else f"{side}{off:+g}"
+                points.append((bx + tx * off, by + ty * off, label))
+        return points
+
+    def _satellite_base(self, px: float, py: float, side: str, dist: float, idx: int, pitch: float) -> Point:
+        if side == "right":
+            return px + dist, py + idx * pitch
+        if side == "left":
+            return px - dist, py + idx * pitch
+        if side == "top":
+            return px + idx * pitch, py - dist
+        if side == "bottom":
+            return px + idx * pitch, py + dist
+        raise PlacementError(f"Unknown satellite side {side!r}")
+
+    def _satellite_points(self, px: float, py: float, side: str, dist: float, idx: int, pitch: float,
+                          dx: float, dy: float) -> List[Tuple[float, float, str]]:
+        """Candidate points for a Satellite() with an explicit side: neighboring slots along the
+        requested side, the same slot on alternate sides, and small perimeter offsets."""
+
+        points: List[Tuple[float, float, str]] = []
+        sides_order = [side] + [s for s in ("right", "left", "top", "bottom") if s != side]
+        for s_index, s in enumerate(sides_order):
+            slots = [0, -1, 1, -2, 2] if s_index == 0 else (0,)
+            for k in slots:
+                bx, by = self._satellite_base(px, py, s, dist, idx + k, pitch)
+                label = s if k == 0 else f"{s}:idx{idx + k}"
+                points.append((bx + dx, by + dy, label))
+        for s in ("right", "left", "top", "bottom"):
+            vx, vy = self._SIDE_VECTORS[s]
+            tx, ty = -vy, vx
+            bx, by = self._satellite_base(px, py, s, dist, 0, pitch)
+            for off in (0.5, -0.5, 1.0, -1.0, 2.0, -2.0):
+                points.append((bx + tx * off + dx, by + ty * off + dy, f"{s}{off:+g}"))
+        return points
+
+    def _between_points(self, rule: Mapping[str, Any], a: Point, b: Point) -> List[Tuple[float, float, str]]:
+        """Candidate points for a Between() rule: normal-offset variations in both directions, and
+        (with auto_spread=True) small shifts along the a->b line to spread grouped members out."""
+
+        t0 = float(rule.get("t", 0.5))
+        dx = float(rule.get("dx", 0.0))
+        dy = float(rule.get("dy", 0.0))
+        base_offset = rule.get("offset")
+        base_offset = 0.0 if base_offset is None else float(base_offset)
+        auto_spread = self._rule_flag(rule, "auto_spread", False)
+        vx, vy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(vx, vy) or 1.0
+        nx, ny = -vy / length, vx / length
+        offsets = [base_offset]
+        for d in (0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0):
+            offsets.append(base_offset + d)
+        t_values = [t0]
+        if auto_spread:
+            for dt in (0.08, -0.08, 0.16, -0.16, 0.24, -0.24):
+                t_values.append(max(0.0, min(1.0, t0 + dt)))
+        points: List[Tuple[float, float, str]] = []
+        for ti in t_values:
+            bx = a[0] + (b[0] - a[0]) * ti + dx
+            by = a[1] + (b[1] - a[1]) * ti + dy
+            for off in offsets:
+                label = f"t={ti:.3g},offset={off:+.3g}"
+                points.append((bx + nx * off, by + ny * off, label))
+        return points
 
     def _pad_centroid(self, parent_ref: str, pads: str | Sequence[str]) -> Point:
         actual_parent = self.resolve_ref(parent_ref)
@@ -2030,22 +2334,161 @@ class PlacementEngine:
                 sum(p[1] for p in abs_centers) / len(abs_centers))
 
     def _place_near_point(self, rule: Mapping[str, Any], origin: Point, why: str) -> None:
-        side = str(rule.get("side", "auto"))
+        actual_ref = self.resolve_ref(rule["ref"])
+        if actual_ref is None:
+            self._warn_or_raise(f"missing footprint {rule['ref']!r} for {why}")
+            return
+        side = str(rule.get("side", "auto")).lower()
         distance = float(rule.get("distance", 1.5))
-        last_error: Optional[Exception] = None
-        for candidate_side, x, y in self._near_point_candidates(origin[0], origin[1], distance, side):
-            try:
-                self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot")), why, rule.get("note"),
-                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
-                           avoid_overlap=True, clearance_override=self._clearance_override(dict(rule)),
-                           candidate_sides=[candidate_side], rule=rule)
-                return
-            except PlacementError as exc:
-                last_error = exc
-                if side != "auto":
-                    raise
-        if last_error is not None:
-            raise last_error
+        if side in ("auto", "inward"):
+            sides = self._board_inward_sides(origin[0], origin[1])
+        elif side in self._SIDE_VECTORS:
+            sides = [side] + [s for s in self._board_inward_sides(origin[0], origin[1]) if s != side]
+        else:
+            raise PlacementError(f"Unknown side {side!r}")
+
+        rot = self.resolve_rot(rule.get("rot"))
+        eval_rot = rot if rot is not None else self.positions[actual_ref][2]
+        points = self._near_pad_points(origin, sides, distance)
+        primary_x, primary_y, primary_label = points[0]
+
+        if not self.model.policy.avoid_overlap:
+            self.place(rule["ref"], primary_x, primary_y, rot, why, rule.get("note"),
+                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
+                       clearance_override=self._clearance_override(dict(rule)), rule=rule)
+            return
+
+        region = None if self.allow_outside_region else self._region_bbox(self._rule_value(rule, "region"))
+        clearance_override = self._clearance_override(dict(rule))
+        allow_keepout_overlap = self.allow_keepout_overlap or self._rule_flag(rule, "allow_keepout_overlap", False)
+        search_radius = distance + max(abs(o) for o in self._NEARPAD_OFFSETS)
+
+        outcome = self._search_candidates(actual_ref, (primary_x, primary_y), eval_rot, points,
+                                          clearance_override=clearance_override, region=region,
+                                          allow_keepout_overlap=allow_keepout_overlap,
+                                          search_radius_used=search_radius)
+        chosen = outcome.chosen
+        if chosen is None:
+            fallback = self._find_non_overlapping_position(actual_ref, primary_x, primary_y, eval_rot,
+                                                            clearance_override=clearance_override,
+                                                            candidate_sides=sides, region=region,
+                                                            allow_keepout_overlap=allow_keepout_overlap)
+            if fallback is not None:
+                outcome = self._mark_fallback(outcome, actual_ref, fallback[0], fallback[1], eval_rot,
+                                              clearance_override=clearance_override, region=region,
+                                              allow_keepout_overlap=allow_keepout_overlap)
+                chosen = outcome.chosen
+        if chosen is None:
+            raise PlacementError(self._format_search_failure(actual_ref, why, outcome, requested=(primary_x, primary_y)))
+
+        self.place(rule["ref"], chosen.x, chosen.y, rot, why, rule.get("note"),
+                   allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
+                   clearance_override=clearance_override, rule=rule)
+        if chosen.label != primary_label:
+            self.auto_adjustments.append(AutoAdjustment(actual_ref, primary_x, primary_y, chosen.x, chosen.y,
+                                                         f"search candidate {chosen.label}"))
+            self.messages.append(Message("note", f"adjusted {actual_ref}: requested x={_fmt_num(primary_x)} "
+                                         f"y={_fmt_num(primary_y)} placed x={_fmt_num(chosen.x)} y={_fmt_num(chosen.y)}; "
+                                         f"search candidate {chosen.label}"))
+
+    def _place_satellite(self, rule: Mapping[str, Any], px: float, py: float, side: str, dist: float,
+                         idx: int, pitch: float, dx: float, dy: float) -> None:
+        actual_ref = self.resolve_ref(rule["ref"])
+        if actual_ref is None:
+            self._warn_or_raise(f"missing footprint {rule['ref']!r} for satellite")
+            return
+        rot = self.resolve_rot(rule.get("rot"))
+        eval_rot = rot if rot is not None else self.positions[actual_ref][2]
+        points = self._satellite_points(px, py, side, dist, idx, pitch, dx, dy)
+        primary_x, primary_y, primary_label = points[0]
+
+        if not self.model.policy.avoid_overlap:
+            self.place(rule["ref"], primary_x, primary_y, rot, "satellite", rule.get("note"),
+                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
+                       clearance_override=self._clearance_override(dict(rule)), rule=rule)
+            return
+
+        region = None if self.allow_outside_region else self._region_bbox(self._rule_value(rule, "region"))
+        clearance_override = self._clearance_override(dict(rule))
+        allow_keepout_overlap = self.allow_keepout_overlap or self._rule_flag(rule, "allow_keepout_overlap", False)
+        search_radius = dist + abs(idx) * pitch + 2.0
+
+        outcome = self._search_candidates(actual_ref, (primary_x, primary_y), eval_rot, points,
+                                          clearance_override=clearance_override, region=region,
+                                          allow_keepout_overlap=allow_keepout_overlap,
+                                          search_radius_used=search_radius)
+        chosen = outcome.chosen
+        if chosen is None:
+            fallback = self._find_non_overlapping_position(actual_ref, primary_x, primary_y, eval_rot,
+                                                            clearance_override=clearance_override,
+                                                            candidate_sides=[side], region=region,
+                                                            allow_keepout_overlap=allow_keepout_overlap)
+            if fallback is not None:
+                outcome = self._mark_fallback(outcome, actual_ref, fallback[0], fallback[1], eval_rot,
+                                              clearance_override=clearance_override, region=region,
+                                              allow_keepout_overlap=allow_keepout_overlap)
+                chosen = outcome.chosen
+        if chosen is None:
+            raise PlacementError(self._format_search_failure(actual_ref, "satellite", outcome, requested=(primary_x, primary_y)))
+
+        self.place(rule["ref"], chosen.x, chosen.y, rot, "satellite", rule.get("note"),
+                   allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
+                   clearance_override=clearance_override, rule=rule)
+        if chosen.label != primary_label:
+            self.auto_adjustments.append(AutoAdjustment(actual_ref, primary_x, primary_y, chosen.x, chosen.y,
+                                                         f"search candidate {chosen.label}"))
+            self.messages.append(Message("note", f"adjusted {actual_ref}: requested x={_fmt_num(primary_x)} "
+                                         f"y={_fmt_num(primary_y)} placed x={_fmt_num(chosen.x)} y={_fmt_num(chosen.y)}; "
+                                         f"search candidate {chosen.label}"))
+
+    def _place_between(self, rule: Mapping[str, Any], a: Point, b: Point) -> None:
+        actual_ref = self.resolve_ref(rule["ref"])
+        if actual_ref is None:
+            self._warn_or_raise(f"missing footprint {rule['ref']!r} for between")
+            return
+        rot = self.resolve_rot(rule.get("rot"), a, b)
+        eval_rot = rot if rot is not None else self.positions[actual_ref][2]
+        points = self._between_points(rule, a, b)
+        primary_x, primary_y, primary_label = points[0]
+
+        if not self.model.policy.avoid_overlap:
+            self.place(rule["ref"], primary_x, primary_y, rot, "between", rule.get("note"),
+                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                       clearance_override=self._clearance_override(rule), rule=rule)
+            return
+
+        region = None if self.allow_outside_region else self._region_bbox(self._rule_value(rule, "region"))
+        clearance_override = self._clearance_override(rule)
+        allow_keepout_overlap = self.allow_keepout_overlap or self._rule_flag(rule, "allow_keepout_overlap", False)
+        search_radius = self.model.policy.max_search_radius
+
+        outcome = self._search_candidates(actual_ref, (primary_x, primary_y), eval_rot, points,
+                                          clearance_override=clearance_override, region=region,
+                                          allow_keepout_overlap=allow_keepout_overlap,
+                                          search_radius_used=search_radius)
+        chosen = outcome.chosen
+        if chosen is None:
+            fallback = self._find_non_overlapping_position(actual_ref, primary_x, primary_y, eval_rot,
+                                                            clearance_override=clearance_override,
+                                                            candidate_sides=None, region=region,
+                                                            allow_keepout_overlap=allow_keepout_overlap)
+            if fallback is not None:
+                outcome = self._mark_fallback(outcome, actual_ref, fallback[0], fallback[1], eval_rot,
+                                              clearance_override=clearance_override, region=region,
+                                              allow_keepout_overlap=allow_keepout_overlap)
+                chosen = outcome.chosen
+        if chosen is None:
+            raise PlacementError(self._format_search_failure(actual_ref, "between", outcome, requested=(primary_x, primary_y)))
+
+        self.place(rule["ref"], chosen.x, chosen.y, rot, "between", rule.get("note"),
+                   allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                   clearance_override=clearance_override, rule=rule)
+        if chosen.label != primary_label:
+            self.auto_adjustments.append(AutoAdjustment(actual_ref, primary_x, primary_y, chosen.x, chosen.y,
+                                                         f"search candidate {chosen.label}"))
+            self.messages.append(Message("note", f"adjusted {actual_ref}: requested x={_fmt_num(primary_x)} "
+                                         f"y={_fmt_num(primary_y)} placed x={_fmt_num(chosen.x)} y={_fmt_num(chosen.y)}; "
+                                         f"search candidate {chosen.label}"))
 
     def _collides_at(self, ref: str, x: float, y: float, rot: float, *, clearance_override: Optional[float] = None,
                     region: Optional[BBox] = None, allow_keepout_overlap: bool = False) -> Optional[str]:
@@ -2086,34 +2529,35 @@ class PlacementEngine:
         step = self.model.policy.search_step
         max_r = self.model.policy.max_search_radius
         sides = list(candidate_sides or ["top", "right", "bottom", "left"])
-        vectors = {"right": (1.0, 0.0), "left": (-1.0, 0.0), "top": (0.0, -1.0), "bottom": (0.0, 1.0)}
-        candidates: List[Tuple[float, float]] = []
+        vectors = self._SIDE_VECTORS
+        points: List[Tuple[float, float, str]] = [(x, y, "requested")]
         n = int(max_r / step)
         # Slide along the requested side first, then search outward in side directions.
         for side in sides:
             if side in {"top", "bottom"}:
                 for k in range(1, n + 1):
                     d = k * step
-                    candidates.extend([(x + d, y), (x - d, y)])
+                    points.append((x + d, y, f"slide{side}+{d:g}"))
+                    points.append((x - d, y, f"slide{side}-{d:g}"))
             elif side in {"left", "right"}:
                 for k in range(1, n + 1):
                     d = k * step
-                    candidates.extend([(x, y + d), (x, y - d)])
+                    points.append((x, y + d, f"slide{side}+{d:g}"))
+                    points.append((x, y - d, f"slide{side}-{d:g}"))
         for k in range(1, n + 1):
             d = k * step
             for side in sides:
                 vx, vy = vectors.get(side, (0.0, 0.0))
-                candidates.append((x + vx * d, y + vy * d))
-        seen: Set[Tuple[int, int]] = set()
-        for cx, cy in candidates:
-            key = (round(cx / 1e-6), round(cy / 1e-6))
-            if key in seen:
-                continue
-            seen.add(key)
-            if self._collides_at(ref, cx, cy, rot, clearance_override=clearance_override,
-                                 region=region, allow_keepout_overlap=allow_keepout_overlap) is None:
-                return (cx, cy, first)
-        return None
+                points.append((x + vx * d, y + vy * d, f"radial{side}{d:g}"))
+        outcome = self._search_candidates(ref, (x, y), rot, points, clearance_override=clearance_override,
+                                          region=region, allow_keepout_overlap=allow_keepout_overlap,
+                                          search_radius_used=max_r)
+        chosen = outcome.chosen
+        if chosen is None:
+            return None
+        if chosen.label == "requested":
+            return (x, y, "requested location is legal")
+        return (chosen.x, chosen.y, first)
 
     def _allow_arbitrary_rotation(self, rule: Dict[str, Any]) -> bool:
         return bool(rule.get("allow_arbitrary_rotation") or rule.get("extra", {}).get("allow_arbitrary_rotation"))
@@ -2175,6 +2619,9 @@ class PlacementEngine:
             elif typ in {"between", "inline"}:
                 a = self.get_pos(rule["a"])
                 b = self.get_pos(rule["b"])
+                if typ == "between":
+                    self._place_between(rule, a, b)
+                    continue
                 x, y = self._placement_target(rule)
                 self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot"), a, b), typ, rule.get("note"),
                            allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
@@ -2182,29 +2629,18 @@ class PlacementEngine:
 
             elif typ == "satellite":
                 px, py = self.get_pos(rule["parent"])
-                side = rule.get("side", "right")
-                if side == "auto":
+                side = str(rule.get("side", "right")).lower()
+                if side in ("auto", "inward"):
                     self._place_near_point(rule, (px, py), typ)
                     continue
+                if side not in self._SIDE_VECTORS:
+                    raise PlacementError(f"Unknown satellite side {side!r}")
                 dist = float(rule.get("distance", 2.0))
                 idx = int(rule.get("index", 0))
                 pitch = float(rule.get("pitch", 1.5))
                 dx = float(rule.get("dx", 0.0))
                 dy = float(rule.get("dy", 0.0))
-                if side == "right":
-                    x, y = px + dist, py + idx * pitch
-                elif side == "left":
-                    x, y = px - dist, py + idx * pitch
-                elif side == "top":
-                    x, y = px + idx * pitch, py - dist
-                elif side == "bottom":
-                    x, y = px + idx * pitch, py + dist
-                else:
-                    raise PlacementError(f"Unknown satellite side {side!r}")
-                self.place(rule["ref"], x + dx, y + dy, self.resolve_rot(rule.get("rot")), typ, rule.get("note"),
-                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
-                           avoid_overlap=True, clearance_override=self._clearance_override(rule),
-                           candidate_sides=[side] if side in {"top", "right", "bottom", "left"} else None, rule=rule)
+                self._place_satellite(rule, px, py, side, dist, idx, pitch, dx, dy)
 
             elif typ == "near_pad":
                 origin = self._pad_centroid(str(rule["parent"]), rule["pad"])
@@ -2464,6 +2900,7 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "spacing_violations": spacing_violations,
         "bbox_warnings": bbox_warnings,
         "auto_adjustments": [dataclasses.asdict(a) for a in engine.auto_adjustments],
+        "placement_search": {ref: outcome.as_report() for ref, outcome in engine.search_log.items()},
         "generated_uuids": [dataclasses.asdict(item) for item in generated_uuids],
         "collision_count": len(collisions),
         "spacing_violation_count": len(spacing_violations),
