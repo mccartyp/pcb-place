@@ -178,6 +178,23 @@ Semantic helpers are deterministic wrappers that expand to existing primitives. 
 
 These helpers preserve rotation unless a rule explicitly supplies `rot=...`.
 
+### Grouped Arrays
+
+`DecouplingArray(refs, parent, pad=None, side="auto", distance=2.0, spacing=1.5, role="decoupling", priority=90, power_net=None, ground_net=None, rot=None, note=None)` and `PullupArray(refs, parent, nets=None, pad=None, side="auto", distance=4.0, spacing=2.0, role="pullup", priority=60, rot=None, note=None)` place a group of related footprints (e.g. several decoupling capacitors on the same power pin, or several pull-up/pull-down resistors owned by the same IC) as a single row near `parent` (or near `pad` on `parent` if given):
+
+```python
+DecouplingArray(refs=["C31", "C32", "C33"], parent="U10", pad="1", side="auto",
+                distance=2.0, spacing=1.5, role="decoupling",
+                power_net="3V3", ground_net="GND")
+
+PullupArray(refs=["R21", "R22"], parent="U10", nets=["SDA", "SCL"],
+            side="auto", distance=4.0, spacing=2.0, role="pullup")
+```
+
+`side="auto"` (the default) evaluates each cardinal side in turn, preferring the side that points into the board interior, and uses `_pad_centroid`/the parent's position as the origin. Members are spread along the chosen side by `spacing` and kept together as a group whenever a side fits without board-bounds, collision, keepout, or region violations. Rotations are preserved unless `rot=...` is supplied explicitly.
+
+If the whole group does not fit together on any side, `pcb-place` emits `note` diagnostics describing each rejected side (the side tried, the candidate anchor point, and the collision/keepout/bounds reason), then falls back to placing each member individually via the normal search-based placement (the same machinery used by `Satellite`/`NearPad`), emitting a `warn` message that the group could not be kept together.
+
 ### Keepouts and Regions
 
 `Keepout(name, x, y, w, h, layers="all", role=None, emit=False)` declares a board-local rectangular exclusion area. Placement validation rejects footprint bounding boxes that overlap keepouts unless `allow_keepout_overlap=True` is supplied globally (`--allow-keepout-overlap`) or on the rule. Collision avoidance also treats keepouts as obstacles. `emit=True` is accepted but currently reports a clear warning rather than writing KiCad keepout graphics.
@@ -518,6 +535,8 @@ Explicit rotations are normalized into `[0, 360)`. With `--cardinal-rotations`, 
 | `Inline` | Like `Between`; preserves rotation by default and aligns to the path only with `rot="path"` or `align="path"`. |
 | `Satellite` | Places a support part near a parent footprint. |
 | `Orbit` | Distributes support parts around a parent footprint. |
+| `DecouplingArray` | Places a group of decoupling capacitors as a single row near a parent (or pad). |
+| `PullupArray` | Places a group of pull-up/pull-down resistors as a single row near a parent (or pad). |
 | `Array` | Places references with arbitrary pitch. |
 | `Row` / `Column` | Convenience linear placement rules. |
 | `Grid` | Row-major rectangular placement. |

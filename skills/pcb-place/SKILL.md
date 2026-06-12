@@ -153,7 +153,8 @@ When asked to apply or debug a `placement.ppl`:
   pairs and spacing violations. Adjust `Spacing(...)`/`PartClass(...)` or
   rule-level `clearance=...`, or allow `PlacementPolicy(avoid_overlap=True,
   ...)` to search nearby legal positions for relative/automatic primitives
-  (`Satellite`, `Orbit`, `Row`, `Column`, `Array`, `Between`, `Inline`).
+  (`Satellite`, `Orbit`, `DecouplingArray`, `PullupArray`, `Row`, `Column`,
+  `Array`, `Between`, `Inline`).
   Explicit `Anchor` placements are not auto-adjusted unless `soft=True`.
 - **Cluster strategy** — use `Cluster(name, anchor=..., members=[...],
   placement=...)` to move a functional neighborhood as a unit (anchor delta

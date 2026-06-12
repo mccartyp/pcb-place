@@ -90,17 +90,16 @@ nets to validate primitive selection rather than relying on shared-net
 heuristics alone:
 
 - **Decoupling capacitors** that share the same IC and power pin are grouped
-  into a single `Orbit(...)` decoupling array distributed across the IC's
-  legal perimeter sides (avoiding board edges, keepouts, and connector
-  footprints), instead of one `Decoupling(...)`/`NearPad(...)` pair per
-  capacitor. A lone decoupling capacitor for a pin still gets a single
-  `Decoupling(...)` rule.
+  into a single `DecouplingArray(...)` rule that places the whole group as one
+  row near the IC (or its power pad), instead of one `Decoupling(...)`/
+  `NearPad(...)` pair per capacitor. A lone decoupling capacitor for a pin
+  still gets a single `Decoupling(...)` rule.
 - **Pullup/pulldown resistors** are assigned to the component that owns the
   signal they bias (connector, MCU, transceiver/RF module, other IC, or
   regulator, in that priority order), determined via the connectivity graph.
-  Multiple pullups/pulldowns owned by the same component are grouped into an
-  `Orbit(...)` array near that owner instead of context-less `Pullup(...)`
-  rules.
+  Multiple pullups/pulldowns owned by the same component are grouped into a
+  single `PullupArray(...)` rule near that owner instead of context-less
+  `Pullup(...)` rules.
 - **Series components** (e.g. damping or filter resistors on a signal path)
   are only emitted as `Series(...)` if the connectivity graph finds a true
   A -> component -> B topology: exactly two non-ground nets, each connecting
@@ -558,6 +557,21 @@ Legacy one-shot invocation remains available for compatibility:
 pcb-plan --board layout.kicad_pcb --netlist default.net --intent board.pln -o placement.ppl
 ```
 
+## pcb-plan check
+
+`check` evaluates plan quality without writing `placement.ppl`:
+
+```bash
+pcb-plan check \
+  --pln board.pln \
+  --board layout.kicad_pcb \
+  --netlist default.net \
+  --report-json pcb-plan-check-report.json
+```
+
+See "Plan quality gates" below for the report fields and the `plan_confidence`
+model shared with `emit`.
+
 ## Routing Constraints
 
 Routing intent is optional and advisory. `pcb-plan` parses, validates, explains,
@@ -705,10 +719,11 @@ provenance, confidence, warnings, and review-required items.
 `pcb-plan` reports also include placement-quality metrics:
 
 - `primitive_counts`: number of generated rules per placement primitive (e.g.
-  `Decoupling`, `Orbit`, `Pullup`, `Series`, `Cluster`).
+  `Decoupling`, `DecouplingArray`, `Pullup`, `PullupArray`, `Series`, `Cluster`).
 - `decoupling_groups` / `pullup_groups`: per-IC/owner grouping summaries
-  showing which components were grouped into `Orbit(...)` arrays versus given
-  a single `Decoupling(...)`/`Pullup(...)` rule.
+  showing which components were grouped into a single `DecouplingArray(...)`/
+  `PullupArray(...)` rule (`"grouped": true`) versus given a single
+  `Decoupling(...)`/`Pullup(...)` rule (`"grouped": false`).
 - `series_components_validated`: count of `Series(...)` rules that passed
   connectivity-graph topology validation.
 - `failed_topology_inference`: components where a series/pullup inference was
@@ -719,6 +734,91 @@ provenance, confidence, warnings, and review-required items.
 - `cluster_quality_score`: fraction of inferred clusters that are multi-member
   (higher is better; single-member clusters likely indicate missing
   connectivity).
+- `plan_confidence`: an overall `{score, level, reasons}` summary of how
+  trustworthy the plan is (see "Plan quality gates" below).
+
+## Plan quality gates
+
+`pcb-plan check` evaluates plan quality **without** writing `placement.ppl`:
+
+```bash
+pcb-plan check \
+  --pln board.pln \
+  --board layout.kicad_pcb \
+  --netlist default.net \
+  --report-json pcb-plan-check-report.json
+```
+
+It prints (and optionally writes via `--report-json`) a JSON report containing:
+
+- `nets_parsed`, `components_parsed`, `components_planned`,
+  `unplaced_components`
+- `clusters_total`, `single_member_clusters`, `multi_member_clusters`
+- `duplicate_rule_refs`
+- `decoupling_groups`, `pullup_groups`
+- `series_components_validated`, `invalid_series_candidates`
+- `differential_pairs_inferred`, `high_speed_constraints_complete`
+- `simulation_triggers`
+- `warnings`
+- `plan_confidence`
+
+Use `pcb-plan check` between `init`/`update` and `emit` to catch weak plans
+before generating a placement file.
+
+### Plan confidence
+
+Every `pcb-plan` report (including `check` and `emit`) includes a
+`plan_confidence` block:
+
+```json
+{
+  "score": 100,
+  "level": "high",
+  "reasons": []
+}
+```
+
+`level` is `"high"` (score >= 80), `"medium"` (score >= 50), or `"low"`
+(score < 50). The score starts at 100 and is reduced when any of the
+following conditions are detected, each adding a human-readable entry to
+`reasons`:
+
+- no nets were parsed from the board/netlist
+- more than half of the inferred clusters are single-member
+- more than 25% of components have no placement rule
+- duplicate placement rules were detected
+- high-speed connector(s) are present but no differential pairs were inferred
+- one or more `Series(...)` inferences were rejected as invalid topology
+- board geometry was inferred from footprint extents (no `board.pln` or
+  `Edge.Cuts` geometry was available)
+
+`pcb-plan emit` always prints `WARNING:` lines to stderr (and includes a
+`# Plan confidence: low` / `# Reasons:` / `# - ...` header comment block at
+the top of `placement.ppl`) when the plan is low-confidence, but otherwise
+continues by default. Pass `--strict-confidence` to make `emit` fail on a
+low-confidence plan, and `--allow-low-confidence` to acknowledge the warning
+and proceed anyway despite `--strict-confidence`:
+
+```bash
+pcb-plan emit --pln board.pln --board layout.kicad_pcb --netlist default.net \
+  -o placement.ppl --strict-confidence
+# fails with a non-zero exit code if plan confidence is low
+
+pcb-plan emit --pln board.pln --board layout.kicad_pcb --netlist default.net \
+  -o placement.ppl --strict-confidence --allow-low-confidence
+# proceeds anyway, still printing the WARNING lines
+```
+
+Recommended workflow:
+
+```bash
+pcb-plan init --board layout.kicad_pcb --netlist default.net -o board.pln
+pcb-plan check --pln board.pln --board layout.kicad_pcb --netlist default.net \
+  --report-json pcb-plan-check-report.json
+pcb-plan emit --pln board.pln --board layout.kicad_pcb --netlist default.net \
+  -o placement.ppl
+pcb-place layout.kicad_pcb placement.ppl --dry-run
+```
 
 ## Syntax and safety
 

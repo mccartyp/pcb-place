@@ -145,6 +145,18 @@ def _q(value: Any) -> str:
     return json.dumps(value)
 
 
+def _qn(value: Any) -> str:
+    """Like _q(), but renders None as the Python literal `None` instead of `null`."""
+    if value is None:
+        return "None"
+    return json.dumps(value)
+
+
+def _q_list_with_none(items: Sequence[Any]) -> str:
+    """Render a list literal where individual `None` elements stay valid Python."""
+    return "[" + ", ".join(_qn(v) for v in items) + "]"
+
+
 def _ref_prefix(ref: str) -> str:
     return re.match(r"[A-Za-z]+", ref).group(0).upper() if re.match(r"[A-Za-z]+", ref) else ""
 
@@ -1079,9 +1091,6 @@ _PASSIVE_SUPPORT_ROLES = {
     "inductor", "ferrite", "testpoint", "esd_protection",
 }
 
-_CARDINAL_DIRECTIONS: List[Tuple[float, str]] = [(0.0, "right"), (90.0, "bottom"), (180.0, "left"), (270.0, "top")]
-
-
 class ConnectivityGraph:
     """Lightweight component/pin/net connectivity graph for topology queries.
 
@@ -1149,81 +1158,6 @@ class ConnectivityGraph:
             return None
         candidates.sort(key=lambda c: (priority.get(c.role, 9), c.ref))
         return candidates[0]
-
-
-def _orbit_point(cx: float, cy: float, radius: float, angle_deg: float) -> Point:
-    theta = math.radians(angle_deg)
-    return cx + radius * math.cos(theta), cy + radius * math.sin(theta)
-
-
-def _blocked_rects(board: BoardGeometry, components: Mapping[str, PlanComponent], keepouts: Sequence[Any], exclude_ref: str) -> List[Dict[str, float]]:
-    rects: List[Dict[str, float]] = []
-    for k in keepouts:
-        if isinstance(k, dict) and all(f in k for f in ("x", "y", "w", "h")):
-            try:
-                rects.append({"x": float(k["x"]), "y": float(k["y"]), "w": float(k["w"]), "h": float(k["h"])})
-            except (TypeError, ValueError):
-                continue
-    for comp in components.values():
-        if comp.ref == exclude_ref or "connector" not in comp.role or comp.bbox is None:
-            continue
-        rects.append({
-            "x": comp.bbox.min_x - board.origin_x - 1.0,
-            "y": comp.bbox.min_y - board.origin_y - 1.0,
-            "w": (comp.bbox.max_x - comp.bbox.min_x) + 2.0,
-            "h": (comp.bbox.max_y - comp.bbox.min_y) + 2.0,
-        })
-    return rects
-
-
-def _point_legal(x: float, y: float, board: BoardGeometry, rects: Sequence[Mapping[str, float]], margin: float = 0.5) -> bool:
-    if x < margin or y < margin or x > board.width - margin or y > board.height - margin:
-        return False
-    for r in rects:
-        if r["x"] - margin <= x <= r["x"] + r["w"] + margin and r["y"] - margin <= y <= r["y"] + r["h"] + margin:
-            return False
-    return True
-
-
-def _distribute_around(
-    anchor: PlanComponent,
-    refs: Sequence[str],
-    board: BoardGeometry,
-    components: Mapping[str, PlanComponent],
-    keepouts: Sequence[Any],
-    base_radius: float = 2.0,
-) -> Tuple[List[Tuple[List[str], float, float, float, str]], bool]:
-    """Group `refs` onto legal perimeter sides of `anchor` for Orbit() placement.
-
-    Returns (layout, degraded). `layout` is a list of
-    (refs_subset, radius, start_angle, step_angle, side_label) tuples, one
-    per side used, suitable for emitting Orbit(). `degraded` is True if no
-    side avoided the board edges, keepouts, or nearby connectors, in which
-    case all four cardinal sides are used as a last resort and the caller
-    should warn that the result requires review.
-    """
-    cx = anchor.x - board.origin_x
-    cy = anchor.y - board.origin_y
-    rects = _blocked_rects(board, components, keepouts, anchor.ref)
-    legal: List[Tuple[float, str]] = []
-    for angle, label in _CARDINAL_DIRECTIONS:
-        x, y = _orbit_point(cx, cy, base_radius, angle)
-        if _point_legal(x, y, board, rects):
-            legal.append((angle, label))
-    degraded = not legal
-    if not legal:
-        legal = list(_CARDINAL_DIRECTIONS)
-    groups: Dict[Tuple[float, str], List[str]] = {key: [] for key in legal}
-    for i, ref in enumerate(refs):
-        key = legal[i % len(legal)]
-        groups[key].append(ref)
-    layout: List[Tuple[List[str], float, float, float, str]] = []
-    for (angle, label), members in groups.items():
-        if not members:
-            continue
-        step = 8.0 if len(members) > 1 else 0.0
-        layout.append((members, base_radius, angle, step, label))
-    return layout, degraded
 
 
 _SEMANTIC_CLUSTER_HINTS: Tuple[Tuple[str, str], ...] = (
@@ -1473,17 +1407,15 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             explanations[cap.ref] = {"role": cap.role, "nets": cap.nets, "parent_candidate": parent_ref, "generated_rule": text, "primitive_selected": "Decoupling", "primitive_scores": {"NearPad": 70 if pad else 0, "Decoupling": 90, "Cluster": 0, "Anchor": 10}}
             decoupling_groups.append({"parent": parent_ref, "power_net": power_net, "pad": pad, "members": members, "primitive": "Decoupling", "grouped": False})
         else:
-            layout, degraded = _distribute_around(parent, members, board, components, keepouts, base_radius=2.0)
-            if degraded:
-                warnings.append(f"WARNING: no board-edge/keepout-clear side was found for the decoupling array near {parent_ref}; defaulted to all four cardinal sides and requires review.")
-            sides_used: List[str] = []
-            for refs_subset, radius, start_angle, step_angle, side in layout:
-                text = f'Orbit(refs={_q(refs_subset)}, parent={_q(parent_ref)}, radius={radius:g}, start_angle={start_angle:g}, step_angle={step_angle:g}, role="decoupling")'
-                rules.append(PlanRule("decoupling_array", text, list(refs_subset), f"{', '.join(refs_subset)} grouped decoupling array for {parent_ref} ({power_net or 'unknown net'}) on the {side} side; replaces per-capacitor Decoupling()/NearPad() rules."))
-                sides_used.append(side)
-                for cref in refs_subset:
-                    explanations[cref] = {"role": "decoupling", "nets": components[cref].nets, "parent_candidate": parent_ref, "generated_rule": text, "primitive_selected": "Orbit (decoupling array)", "primitive_scores": {"NearPad": 0, "Decoupling": 40, "Cluster": 80, "Anchor": 10}}
-            decoupling_groups.append({"parent": parent_ref, "power_net": power_net, "pad": pad, "members": members, "primitive": "Orbit", "grouped": True, "sides": sides_used})
+            pad_kw = f"pad={_q(pad)}, " if pad else ""
+            text = (f'DecouplingArray(refs={_q(members)}, parent={_q(parent_ref)}, {pad_kw}side="auto", '
+                    f'distance=2.0, spacing=1.5, role="decoupling", power_net={_qn(power_net)}, ground_net="GND")')
+            rules.append(PlanRule("decoupling_array", text, list(members),
+                                   f"{', '.join(members)} grouped decoupling array for {parent_ref} ({power_net or 'unknown net'}); "
+                                   "replaces per-capacitor Decoupling()/NearPad() rules."))
+            for cref in members:
+                explanations[cref] = {"role": "decoupling", "nets": components[cref].nets, "parent_candidate": parent_ref, "generated_rule": text, "primitive_selected": "DecouplingArray", "primitive_scores": {"NearPad": 0, "Decoupling": 40, "DecouplingArray": 90, "Cluster": 80, "Anchor": 10}}
+            decoupling_groups.append({"parent": parent_ref, "power_net": power_net, "pad": pad, "members": members, "primitive": "DecouplingArray", "grouped": True})
 
     # Pullup/pulldown resistors: determine the true owning signal source
     # (connector/MCU/peripheral) via the connectivity graph and group
@@ -1516,17 +1448,15 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             pullup_groups.append({"owner": owner_ref, "members": [r.ref], "primitive": "Pullup", "grouped": False})
         else:
             members = [r.ref for r, _ in items]
-            layout, degraded = _distribute_around(owner, members, board, components, keepouts, base_radius=3.0)
-            if degraded:
-                warnings.append(f"WARNING: no board-edge/keepout-clear side was found for the pullup array near {owner_ref}; defaulted to all four cardinal sides and requires review.")
-            sides_used = []
-            for refs_subset, radius, start_angle, step_angle, side in layout:
-                text = f'Orbit(refs={_q(refs_subset)}, parent={_q(owner_ref)}, radius={radius:g}, start_angle={start_angle:g}, step_angle={step_angle:g}, role="pullup")'
-                rules.append(PlanRule("pullup_array", text, list(refs_subset), f"{', '.join(refs_subset)} grouped pullup/pulldown array near owning {owner.role} {owner_ref} on the {side} side."))
-                sides_used.append(side)
-                for rref in refs_subset:
-                    explanations[rref] = {"role": "pullup_pulldown", "nets": components[rref].nets, "parent_candidate": owner_ref, "generated_rule": text, "primitive_selected": "Orbit (pullup array)", "primitive_scores": {"NearPad": 0, "Pullup": 40, "Cluster": 80, "Anchor": 10}}
-            pullup_groups.append({"owner": owner_ref, "members": members, "primitive": "Orbit", "grouped": True, "sides": sides_used})
+            signal_nets = [signal_net for _r, signal_net in items]
+            text = (f'PullupArray(refs={_q(members)}, parent={_q(owner_ref)}, nets={_q_list_with_none(signal_nets)}, '
+                    f'side="auto", distance=4.0, spacing=2.0, role="pullup")')
+            rules.append(PlanRule("pullup_array", text, list(members),
+                                   f"{', '.join(members)} grouped pullup/pulldown array near owning {owner.role} {owner_ref}; "
+                                   "replaces per-resistor Pullup() rules."))
+            for rref in members:
+                explanations[rref] = {"role": "pullup_pulldown", "nets": components[rref].nets, "parent_candidate": owner_ref, "generated_rule": text, "primitive_selected": "PullupArray", "primitive_scores": {"NearPad": 0, "Pullup": 40, "PullupArray": 90, "Cluster": 80, "Anchor": 10}}
+            pullup_groups.append({"owner": owner_ref, "members": members, "primitive": "PullupArray", "grouped": True})
 
     # Series passives: only infer Series() when the connectivity graph shows
     # a true A -> resistor -> B path (each non-ground net connects the
@@ -1793,6 +1723,13 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
         f"# Source netlist: {netlist_path if netlist_path else 'none'}",
         "",
     ]
+    confidence = compute_plan_confidence(plan)
+    if confidence["level"] == "low":
+        lines.append(f"# Plan confidence: {confidence['level']} (score {confidence['score']})")
+        lines.append("# Reasons:")
+        for reason in confidence["reasons"]:
+            lines.append(f"# - {reason}")
+        lines.append("")
     lines.extend(routing_summary_comments(plan))
     lines.extend([
         f"Board(width={plan.board.width:.6g}, height={plan.board.height:.6g}, origin_x={plan.board.origin_x:.6g}, origin_y={plan.board.origin_y:.6g})",
@@ -1828,6 +1765,63 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
             lines.append(rule.text)
         lines.append("")
     return "\n".join(lines)
+
+
+def compute_plan_confidence(plan: Plan) -> Dict[str, Any]:
+    """Score how trustworthy this plan is before placement.
+
+    Checks the conditions that most often indicate a plan was generated from
+    incomplete board/netlist/intent inputs: missing nets, mostly-singleton
+    clusters, mostly-unplaced components, duplicate placement rules, missing
+    differential pairs despite high-speed connectors, suppressed Series()
+    inferences, and footprint-extents board geometry fallback.
+    """
+
+    reasons: List[str] = []
+    score = 100
+
+    if not plan.nets:
+        reasons.append("no nets were parsed from the board/netlist")
+        score -= 40
+
+    total_clusters = len(plan.clusters)
+    single_clusters = sum(1 for c in plan.clusters if len(c.get("members", [])) <= 1)
+    if total_clusters and single_clusters / total_clusters > 0.5:
+        reasons.append(f"{single_clusters}/{total_clusters} clusters are single-member")
+        score -= 15
+
+    placed_refs = {ref for rule in plan.rules for ref in rule.refs if ref in plan.components}
+    unplaced = [ref for ref in plan.components if ref not in placed_refs]
+    if plan.components and len(unplaced) / len(plan.components) > 0.25:
+        reasons.append(f"{len(unplaced)}/{len(plan.components)} components are unplaced")
+        score -= 20
+
+    if plan.duplicate_rules:
+        reasons.append(f"{len(plan.duplicate_rules)} duplicate placement rule(s) found")
+        score -= 15
+
+    hs_connectors = any("connector" in c.role and any(is_high_speed(n) for n in c.nets) for c in plan.components.values())
+    if hs_connectors and not plan.differential_pairs:
+        reasons.append("high-speed connector(s) present but no differential pairs were inferred")
+        score -= 15
+
+    invalid_series = [f for f in plan.topology_failures if "rejected Series()" in f]
+    if invalid_series:
+        reasons.append(f"{len(invalid_series)} Series() inference(s) were rejected as invalid")
+        score -= 10
+
+    if plan.board.source == "inferred_from_footprints":
+        reasons.append("board geometry was inferred from footprint extents (no board.pln or Edge.Cuts available)")
+        score -= 15
+
+    score = max(0, min(100, score))
+    if score >= 80:
+        level = "high"
+    elif score >= 50:
+        level = "medium"
+    else:
+        level = "low"
+    return {"score": score, "level": level, "reasons": reasons}
 
 
 def report(plan: Plan) -> Dict[str, Any]:
@@ -1873,6 +1867,7 @@ def report(plan: Plan) -> Dict[str, Any]:
         "cluster_quality_score": cluster_quality_score,
         "decoupling_groups": plan.decoupling_groups,
         "pullup_groups": plan.pullup_groups,
+        "plan_confidence": compute_plan_confidence(plan),
         "series_components_validated": rule_count("series"),
         "routing": {
             "mode": plan.routing.get("mode"),
@@ -1896,6 +1891,33 @@ def report(plan: Plan) -> Dict[str, Any]:
             "export_dir": openems.get("export_dir"),
             "warnings": plan.simulation_warnings,
         },
+    }
+
+
+def build_check_report(plan: Plan) -> Dict[str, Any]:
+    """Plan-quality report for `pcb-plan check`: evaluates plan quality without
+    writing placement.ppl. See compute_plan_confidence() for the confidence score."""
+
+    payload = report(plan)
+    invalid_series = [f for f in plan.topology_failures if "rejected Series()" in f]
+    return {
+        "nets_parsed": payload["nets_parsed"],
+        "components_parsed": payload["components_parsed"],
+        "components_planned": payload["components_placed"],
+        "unplaced_components": payload["unplaced_components"],
+        "clusters_total": payload["clusters_single_member"] + payload["clusters_multi_member"],
+        "single_member_clusters": payload["clusters_single_member"],
+        "multi_member_clusters": payload["clusters_multi_member"],
+        "duplicate_rule_refs": payload["duplicate_rules"],
+        "decoupling_groups": payload["decoupling_groups"],
+        "pullup_groups": payload["pullup_groups"],
+        "series_components_validated": payload["series_components_validated"],
+        "invalid_series_candidates": invalid_series,
+        "differential_pairs_inferred": payload["diff_pairs_inferred"],
+        "high_speed_constraints_complete": payload["routing"]["high_speed_constraints_complete"],
+        "simulation_triggers": payload["simulation"]["triggers"],
+        "warnings": payload["warnings"],
+        "plan_confidence": payload["plan_confidence"],
     }
 
 
@@ -2286,6 +2308,16 @@ def build_parser() -> argparse.ArgumentParser:
     emit.add_argument("--emit-routing-policy", type=Path, help="Write routing-policy.yaml handoff from .pln routing constraints")
     emit.add_argument("--emit-openems-plan", type=Path, help="Write OpenEMS handoff plan when simulation.openems is enabled")
     emit.add_argument("--summary-md", type=Path, help="Write human-readable summary markdown")
+    emit.add_argument("--strict-confidence", action="store_true",
+                      help="Fail if the plan is low-confidence (requires --allow-low-confidence to proceed anyway)")
+    emit.add_argument("--allow-low-confidence", action="store_true",
+                      help="Acknowledge a low-confidence plan and proceed despite --strict-confidence")
+
+    check = sub.add_parser("check", help="Evaluate plan quality without writing placement.ppl")
+    check.add_argument("--pln", "--intent", dest="pln", type=Path, help="board.pln planning-intent file")
+    check.add_argument("--board", required=True, type=Path, help="Input KiCad .kicad_pcb board")
+    check.add_argument("--netlist", type=Path, help="Optional Zener/pcb netlist artifact")
+    check.add_argument("--report-json", type=Path, help="Write plan quality report JSON")
 
     # Legacy one-shot placement generation flags kept for compatibility.
     parser.add_argument("--board", type=Path, help=argparse.SUPPRESS)
@@ -2349,7 +2381,16 @@ def run_emit(args: argparse.Namespace, *, legacy: bool = False) -> int:
     _ensure_exists(args.netlist, "Netlist")
     _ensure_exists(pln_path, "board.pln")
     plan, _ = _load_plan_from_inputs(args.board, args.netlist, pln_path)
-    _write_report(args.report_json, report(plan))
+    payload = report(plan)
+    _write_report(args.report_json, payload)
+    confidence = payload["plan_confidence"]
+    if confidence["level"] == "low":
+        sys.stderr.write(f"WARNING: plan confidence is low (score {confidence['score']}):\n")
+        for reason in confidence["reasons"]:
+            sys.stderr.write(f"WARNING: - {reason}\n")
+        if getattr(args, "strict_confidence", False) and not getattr(args, "allow_low_confidence", False):
+            raise SystemExit("pcb-plan emit: plan confidence is low; re-run with --allow-low-confidence to "
+                             "proceed despite --strict-confidence, or improve board.pln/netlist coverage")
     if getattr(args, "emit_routing_policy", None):
         _write_text(args.emit_routing_policy, emit_routing_policy(plan, args.board))
     if getattr(args, "emit_openems_plan", None) and openems_plan_should_emit(plan):
@@ -2410,6 +2451,18 @@ def run_update(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_check(args: argparse.Namespace) -> int:
+    pln_path = getattr(args, "pln", None)
+    _ensure_exists(args.board, "Board")
+    _ensure_exists(args.netlist, "Netlist")
+    _ensure_exists(pln_path, "board.pln")
+    plan, _ = _load_plan_from_inputs(args.board, args.netlist, pln_path)
+    payload = build_check_report(plan)
+    _write_report(args.report_json, payload)
+    sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return 0
+
+
 def run_review(args: argparse.Namespace) -> int:
     _ensure_exists(args.pln, "board.pln")
     sys.stdout.write(review_pln_text(load_pln(args.pln)))
@@ -2444,6 +2497,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return run_explain(args)
     if command == "emit":
         return run_emit(args)
+    if command == "check":
+        return run_check(args)
     if not args.board:
         raise SystemExit("Board file not found: provide --board or use a subcommand such as 'pcb-plan init' or 'pcb-plan emit'.")
     return run_emit(args, legacy=True)

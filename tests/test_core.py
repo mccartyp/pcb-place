@@ -1310,7 +1310,125 @@ DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", distance=2)
     coords = {(p["x"], p["y"]) for p in placements.values() if p["ref"] in ("C1", "C2", "C3")}
     assert len(coords) == 3  # each capacitor lands at a distinct position
     assert report["collisions"] == []
-    assert all(p["why"] in {"satellite", "near_pad"} for p in placements.values() if p["ref"] in ("C1", "C2", "C3"))
+    assert all(p["why"] == "decoupling_array" for p in placements.values() if p["ref"] in ("C1", "C2", "C3"))
+
+
+def _pullup_array_pcb() -> str:
+    return '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 20 20 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 2 2) (layers "F.Cu"))
+  )
+  (footprint "Test:R" (layer "F.Cu")
+    (at 50 50 0)
+    (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:R" (layer "F.Cu")
+    (at 51 51 0)
+    (property "Reference" "R2" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+)'''
+
+
+def test_pullup_array_places_group_without_collisions(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+PullupArray(refs=["R1", "R2"], parent="U1", distance=4, spacing=2)
+''')
+    _out, _messages, report = apply_placements(_pullup_array_pcb(), model, strict=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    assert {"R1", "R2"} <= set(placements)
+    coords = {(p["x"], p["y"]) for p in placements.values() if p["ref"] in ("R1", "R2")}
+    assert len(coords) == 2  # each resistor lands at a distinct position
+    assert report["collisions"] == []
+    assert all(p["why"] == "pullup_array" for p in placements.values() if p["ref"] in ("R1", "R2"))
+
+
+def test_decoupling_array_avoids_board_edge(tmp_path):
+    # U1 sits on the left edge of the board; requesting side="left" would push the
+    # group off-board, so the array must fall back to a side that stays on the board.
+    pcb = '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 1 20 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 2 2) (layers "F.Cu"))
+  )
+  (footprint "Test:C1" (layer "F.Cu")
+    (at 50 50 0)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C2" (layer "F.Cu")
+    (at 51 51 0)
+    (property "Reference" "C2" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C3" (layer "F.Cu")
+    (at 52 52 0)
+    (property "Reference" "C3" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+)'''
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", distance=2, spacing=1.5, side="left")
+''')
+    _out, messages, report = apply_placements(pcb, model, strict=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    for ref in ("C1", "C2", "C3"):
+        x, y = placements[ref]["x"], placements[ref]["y"]
+        assert 0.0 <= x <= 40.0
+        assert 0.0 <= y <= 40.0
+    assert report["collisions"] == []
+    # the rejected "left" side (which would leave the board) should be noted
+    assert any("left" in m.text and "board bounds" in m.text for m in messages if m.level == "note")
+
+
+def test_decoupling_array_avoids_collision_with_existing_component(tmp_path):
+    # R99 occupies the board's preferred ("right") side of U1, so the grouped array
+    # must fall back to the next preferred side ("top") to avoid colliding with it.
+    pcb = '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 20 20 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 2 2) (layers "F.Cu"))
+  )
+  (footprint "Test:R" (layer "F.Cu")
+    (at 22 20 0)
+    (property "Reference" "R99" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 2 2) (layers "F.Cu"))
+  )
+  (footprint "Test:C1" (layer "F.Cu")
+    (at 50 50 0)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C2" (layer "F.Cu")
+    (at 51 51 0)
+    (property "Reference" "C2" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C3" (layer "F.Cu")
+    (at 52 52 0)
+    (property "Reference" "C3" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+)'''
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", distance=2, spacing=1.5)
+''')
+    _out, messages, report = apply_placements(pcb, model, strict=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    assert {"C1", "C2", "C3"} <= set(placements)
+    assert report["collisions"] == []
+    for ref in ("C1", "C2", "C3"):
+        x = placements[ref]["x"]
+        assert x < 22.0  # placed away from R99, which sits on the right side of U1
+    assert any("right" in m.text and "collision" in m.text for m in messages if m.level == "note")
 
 
 def _cluster_soft_pcb() -> str:

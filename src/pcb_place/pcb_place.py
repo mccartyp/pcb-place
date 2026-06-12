@@ -1016,28 +1016,44 @@ def load_ppl(path: Path) -> PlacementModel:
         else:
             Satellite(ref, parent=parent, side="auto", distance=distance, role=role, priority=priority, **kwargs)
 
-    def DecouplingArray(refs: Sequence[str], *, parent: str, pads: Optional[Sequence[str | Sequence[str]]] = None,
-                        distance: Number = 1.5, role: str = "decoupling", priority: Number = 90,
+    def DecouplingArray(refs: Sequence[str], *, parent: str, pad: Optional[str | Sequence[str]] = None,
+                        side: str = "auto", distance: Number = 2.0, spacing: Number = 1.5,
+                        role: str = "decoupling", priority: Number = 90,
                         power_net: Optional[str] = None, ground_net: Optional[str] = None,
-                        note: Optional[str] = None, **kwargs: Any) -> None:
-        """Place a group of decoupling capacitors around `parent`, one per pad (or one per
-        slot near `parent` if `pads` is omitted), searching for legal positions individually."""
+                        rot: Optional[Number | str] = None, note: Optional[str] = None, **kwargs: Any) -> None:
+        """Place a group of decoupling capacitors as a single row near `parent` (or near
+        `pad` on `parent` if given), spread by `spacing` along the chosen `side`. The whole
+        group is kept together when possible; if it does not fit, members fall back to
+        individual search-based placement."""
 
         refs = list(refs)
         if not refs:
             return
         kwargs.setdefault("power_net", power_net)
         kwargs.setdefault("ground_net", ground_net)
-        for i, ref in enumerate(refs):
-            pad = pads[i] if pads is not None else None
-            if pad is not None:
-                model.add("near_pad", ref=_normalize_ref(ref), parent=_normalize_ref(parent), pad=pad,
-                          distance=float(distance), side="auto", clearance=None, role=role,
-                          priority=float(priority), rot=None, note=note, extra=dict(kwargs))
-            else:
-                model.add("satellite", ref=_normalize_ref(ref), parent=_normalize_ref(parent), side="auto",
-                          distance=float(distance), index=i, pitch=1.5, dx=0.0, dy=0.0,
-                          rot=None, role=role, priority=float(priority), note=note, extra=dict(kwargs))
+        model.add("decoupling_array", refs=[_normalize_ref(r) for r in refs], parent=_normalize_ref(parent),
+                  pad=pad, side=side.lower().replace("-", "_"), distance=float(distance),
+                  spacing=float(spacing), role=role, priority=float(priority),
+                  rot=_rot_or_none(rot), note=note, extra=dict(kwargs))
+
+    def PullupArray(refs: Sequence[str], *, parent: str, nets: Optional[Sequence[str]] = None,
+                    pad: Optional[str | Sequence[str]] = None, side: str = "auto",
+                    distance: Number = 4.0, spacing: Number = 2.0, role: str = "pullup",
+                    priority: Number = 60, rot: Optional[Number | str] = None,
+                    note: Optional[str] = None, **kwargs: Any) -> None:
+        """Place a group of pull-up/pull-down resistors (or similar support parts) as a
+        single row near `parent` (or near `pad` on `parent` if given), spread by `spacing`
+        along the chosen `side`. The whole group is kept together when possible; if it does
+        not fit, members fall back to individual search-based placement."""
+
+        refs = list(refs)
+        if not refs:
+            return
+        kwargs.setdefault("nets", list(nets) if nets is not None else None)
+        model.add("pullup_array", refs=[_normalize_ref(r) for r in refs], parent=_normalize_ref(parent),
+                  pad=pad, side=side.lower().replace("-", "_"), distance=float(distance),
+                  spacing=float(spacing), role=role, priority=float(priority),
+                  rot=_rot_or_none(rot), note=note, extra=dict(kwargs))
 
     def Series(ref: str, *, a: str, b: str, t: Number = 0.5, offset: Number = 0,
                clearance: Optional[Number] = None, role: str = "series", priority: Number = 70,
@@ -1223,6 +1239,7 @@ def load_ppl(path: Path) -> PlacementModel:
         "Decoupling": Decoupling,
         "DecouplingArray": DecouplingArray,
         "Pullup": Pullup,
+        "PullupArray": PullupArray,
         "Series": Series,
         "ESD": ESD,
         "Orbit": Orbit,
@@ -2490,6 +2507,129 @@ class PlacementEngine:
                                          f"y={_fmt_num(primary_y)} placed x={_fmt_num(chosen.x)} y={_fmt_num(chosen.y)}; "
                                          f"search candidate {chosen.label}"))
 
+    def _array_candidates(self, origin: Point, side: str, distance: float, spacing: float,
+                          n: int) -> List[Tuple[float, float]]:
+        """Centered row of `n` candidate points `distance` from `origin` along `side`,
+        spread by `spacing` along the perpendicular (tangent) direction."""
+
+        vx, vy = self._SIDE_VECTORS[side]
+        tx, ty = -vy, vx
+        anchor = (origin[0] + vx * distance, origin[1] + vy * distance)
+        points: List[Tuple[float, float]] = []
+        for i in range(n):
+            offset = spacing * (i - (n - 1) / 2.0)
+            points.append((anchor[0] + tx * offset, anchor[1] + ty * offset))
+        return points
+
+    def _try_grouped_spread(self, refs: Sequence[str], actual_refs: Sequence[Optional[str]],
+                            candidates: Sequence[Tuple[float, float]], rot: Optional[float],
+                            *, clearance_override: Optional[float], region: Optional[BBox],
+                            allow_keepout_overlap: bool) -> Dict[str, Any]:
+        """Tentatively place each member of a group at its candidate point, checking each
+        against the board, region, keepouts, and the previously-placed members of the
+        same group. Reverts all tentative writes before returning."""
+
+        saved: Dict[str, Tuple[float, float, float]] = {}
+        try:
+            for ref, actual, (x, y) in zip(refs, actual_refs, candidates):
+                if actual is None:
+                    continue
+                eval_rot = rot if rot is not None else self.positions[actual][2]
+                reason = self._collides_at(actual, x, y, eval_rot, clearance_override=clearance_override,
+                                           region=region, allow_keepout_overlap=allow_keepout_overlap)
+                if reason is not None:
+                    return {"ok": False, "failed_ref": ref, "reason": reason}
+                saved[actual] = self.positions[actual]
+                self.positions[actual] = (x, y, eval_rot)
+            return {"ok": True}
+        finally:
+            for actual, pos in saved.items():
+                self.positions[actual] = pos
+
+    def place_array_near_target(self, rule: Mapping[str, Any], refs: Sequence[str], origin: Point,
+                                why: str) -> None:
+        """Place a row of `refs` near `origin`, trying each candidate side in turn and
+        keeping the group together (spread by `spacing`) when a side fits without
+        collisions, board-bound, keepout, or region violations. Falls back to placing
+        each member individually (reusing the standard search-based placement) when no
+        side fits the whole group, emitting diagnostics describing what was tried."""
+
+        refs = list(refs)
+        n = len(refs)
+        if n == 0:
+            return
+
+        side = str(rule.get("side", "auto")).lower().replace("-", "_")
+        if side in ("auto", "inward"):
+            sides = self._board_inward_sides(origin[0], origin[1])
+        elif side in self._SIDE_VECTORS:
+            sides = [side] + [s for s in self._board_inward_sides(origin[0], origin[1]) if s != side]
+        else:
+            raise PlacementError(f"Unknown side {side!r}")
+
+        distance = float(rule.get("distance", 2.0))
+        spacing = float(rule.get("spacing", 1.5))
+        rot = self.resolve_rot(rule.get("rot"))
+        region = None if self.allow_outside_region else self._region_bbox(self._rule_value(rule, "region"))
+        clearance_override = self._clearance_override(dict(rule))
+        allow_keepout_overlap = self.allow_keepout_overlap or self._rule_flag(rule, "allow_keepout_overlap", False)
+        allow_arbitrary_rotation = self._allow_arbitrary_rotation(dict(rule))
+
+        actual_refs: List[Optional[str]] = []
+        for ref in refs:
+            actual = self.resolve_ref(ref)
+            if actual is None:
+                self._warn_or_raise(f"missing footprint {ref!r} for {why}")
+            actual_refs.append(actual)
+
+        attempts: List[Dict[str, Any]] = []
+        succeeded: Optional[List[Tuple[float, float]]] = None
+        for side_name in sides:
+            candidates = self._array_candidates(origin, side_name, distance, spacing, n)
+            result = self._try_grouped_spread(refs, actual_refs, candidates, rot,
+                                              clearance_override=clearance_override, region=region,
+                                              allow_keepout_overlap=allow_keepout_overlap)
+            if result["ok"]:
+                succeeded = candidates
+                break
+            attempts.append({"side": side_name, "anchor": candidates[len(candidates) // 2],
+                             "candidates": candidates, **result})
+
+        for attempt in attempts:
+            anchor = attempt["anchor"]
+            self.messages.append(Message("note",
+                f"{why}: side {attempt['side']!r} (anchor ~ x={_fmt_num(anchor[0])} y={_fmt_num(anchor[1])}) "
+                f"rejected: {attempt['failed_ref']!r} {attempt['reason']}"))
+
+        if succeeded is not None:
+            for ref, (x, y) in zip(refs, succeeded):
+                self.place(ref, x, y, rot, why, rule.get("note"),
+                           allow_arbitrary_rotation=allow_arbitrary_rotation,
+                           clearance_override=clearance_override, rule=rule)
+            return
+
+        self.messages.append(Message("warn",
+            f"{why}: could not fit all {n} member(s) as a group on any side ({', '.join(sides)}); "
+            "falling back to individual placement"))
+
+        for ref, candidates0 in zip(refs, self._array_candidates(origin, sides[0], distance, spacing, n)):
+            x, y = candidates0
+            self.place(ref, x, y, rot, why, rule.get("note"),
+                       allow_arbitrary_rotation=allow_arbitrary_rotation,
+                       avoid_overlap=True, clearance_override=clearance_override,
+                       candidate_sides=sides, region_override=region, rule=rule)
+
+    def _place_array_rule(self, rule: Mapping[str, Any], why: str) -> None:
+        refs = rule.get("refs") or []
+        if not refs:
+            return
+        pad = rule.get("pad")
+        if pad is not None:
+            origin = self._pad_centroid(str(rule["parent"]), pad)
+        else:
+            origin = self.get_pos(rule["parent"])
+        self.place_array_near_target(rule, refs, origin, why)
+
     def _collides_at(self, ref: str, x: float, y: float, rot: float, *, clearance_override: Optional[float] = None,
                     region: Optional[BBox] = None, allow_keepout_overlap: bool = False) -> Optional[str]:
         if ref not in self.footprints:
@@ -2645,6 +2785,9 @@ class PlacementEngine:
             elif typ == "near_pad":
                 origin = self._pad_centroid(str(rule["parent"]), rule["pad"])
                 self._place_near_point(rule, origin, "near_pad")
+
+            elif typ in {"decoupling_array", "pullup_array"}:
+                self._place_array_rule(rule, typ)
 
             elif typ == "orbit":
                 cx, cy = self.get_pos(rule["parent"])

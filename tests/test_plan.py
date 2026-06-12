@@ -508,25 +508,29 @@ def test_grouped_decoupling_and_pullup_arrays_and_series_validation():
     payload = pcb_plan.report(plan)
 
     # Three decoupling caps sharing U10's 3V3 pad are grouped into a single
-    # decoupling array using Orbit(), not per-cap Decoupling()/NearPad() rules.
+    # DecouplingArray(), not per-cap Decoupling()/NearPad() rules.
     assert len(plan.decoupling_groups) == 1
     decoupling_group = plan.decoupling_groups[0]
     assert decoupling_group["parent"] == "U10"
-    assert decoupling_group["primitive"] == "Orbit"
+    assert decoupling_group["primitive"] == "DecouplingArray"
     assert decoupling_group["grouped"] is True
     assert sorted(decoupling_group["members"]) == ["C31", "C32", "C33"]
     assert not any(rule.kind in {"decoupling", "nearpad"} for rule in plan.rules if rule.kind != "decoupling_array")
-    assert all(rule.text.startswith("Orbit(") for rule in plan.rules if rule.kind == "decoupling_array")
+    assert all(rule.text.startswith("DecouplingArray(") for rule in plan.rules if rule.kind == "decoupling_array")
+    decoupling_array_rules = [rule for rule in plan.rules if rule.kind == "decoupling_array"]
+    assert len(decoupling_array_rules) == 1  # one rule covers all members, no duplicates
 
     # Two pullups on different signal nets owned by the same MCU are grouped
     # by ownership rather than emitted as context-less Pullup() rules.
     assert len(plan.pullup_groups) == 1
     pullup_group = plan.pullup_groups[0]
     assert pullup_group["owner"] == "U10"
-    assert pullup_group["primitive"] == "Orbit"
+    assert pullup_group["primitive"] == "PullupArray"
     assert pullup_group["grouped"] is True
     assert sorted(pullup_group["members"]) == ["R21", "R22"]
-    assert all(rule.text.startswith("Orbit(") for rule in plan.rules if rule.kind == "pullup_array")
+    assert all(rule.text.startswith("PullupArray(") for rule in plan.rules if rule.kind == "pullup_array")
+    pullup_array_rules = [rule for rule in plan.rules if rule.kind == "pullup_array"]
+    assert len(pullup_array_rules) == 1  # one rule covers all members, no duplicates
 
     # R10 sits on a true A -> resistor -> B signal path (J1 -> R10 -> U10)
     # and is validated as a Series() component.
@@ -539,3 +543,99 @@ def test_grouped_decoupling_and_pullup_arrays_and_series_validation():
     assert any("R11" in failure and "rejected Series()" in failure for failure in payload["failed_topology_inference"])
 
     assert payload["duplicate_rules"] == []
+
+
+def test_pcb_plan_check_report(tmp_path):
+    board_path = ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb"
+    report_path = tmp_path / "pcb-plan-check-report.json"
+    result = subprocess.run(
+        [sys.executable, str(PLAN_CLI), "check", "--board", str(board_path), "--report-json", str(report_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload == json.loads(report_path.read_text())
+
+    expected_fields = {
+        "nets_parsed", "components_parsed", "components_planned", "unplaced_components",
+        "clusters_total", "single_member_clusters", "multi_member_clusters", "duplicate_rule_refs",
+        "decoupling_groups", "pullup_groups", "series_components_validated", "invalid_series_candidates",
+        "differential_pairs_inferred", "high_speed_constraints_complete", "simulation_triggers",
+        "warnings", "plan_confidence",
+    }
+    assert expected_fields <= set(payload)
+    assert payload["nets_parsed"] > 0
+    assert payload["components_parsed"] == 3
+    assert payload["differential_pairs_inferred"] == 1
+    assert payload["plan_confidence"]["level"] in {"high", "medium", "low"}
+    assert isinstance(payload["plan_confidence"]["score"], int)
+    assert isinstance(payload["plan_confidence"]["reasons"], list)
+
+
+_LOW_CONFIDENCE_BOARD = '''(kicad_pcb (version 20240108) (generator "pcb-plan-test")
+  (footprint "Package_QFP:TQFP-32" (layer "F.Cu")
+    (at 25 15 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (property "Value" "MCU" (at 0 1 0) (layer "F.Fab"))
+    (pad "1" smd rect (at -2 -2) (size 0.4 1.2) (layers "F.Cu"))
+    (pad "2" smd rect (at 2 -2) (size 0.4 1.2) (layers "F.Cu"))
+  )
+  (footprint "Capacitor_SMD:C_0402" (layer "F.Cu")
+    (at 21 12 90)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+    (property "Value" "100nF" (at 0 1 0) (layer "F.Fab"))
+    (pad "1" smd rect (at -0.4 0) (size 0.5 0.6) (layers "F.Cu"))
+    (pad "2" smd rect (at 0.4 0) (size 0.5 0.6) (layers "F.Cu"))
+  )
+)
+'''
+
+
+def test_pcb_plan_emit_warns_on_low_confidence_plan(tmp_path):
+    board_path = tmp_path / "layout.kicad_pcb"
+    board_path.write_text(_LOW_CONFIDENCE_BOARD, encoding="utf-8")
+    out = tmp_path / "placement.ppl"
+    report_path = tmp_path / "report.json"
+    result = subprocess.run(
+        [sys.executable, str(PLAN_CLI), "emit", "--board", str(board_path), "-o", str(out), "--report-json", str(report_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "WARNING" in result.stderr
+    assert "plan confidence is low" in result.stderr
+    payload = json.loads(report_path.read_text())
+    assert payload["plan_confidence"]["level"] == "low"
+    assert "# Plan confidence: low" in out.read_text()
+
+
+def test_pcb_plan_emit_strict_confidence_fails(tmp_path):
+    board_path = tmp_path / "layout.kicad_pcb"
+    board_path.write_text(_LOW_CONFIDENCE_BOARD, encoding="utf-8")
+    out = tmp_path / "placement.ppl"
+    result = subprocess.run(
+        [sys.executable, str(PLAN_CLI), "emit", "--board", str(board_path), "-o", str(out), "--strict-confidence"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "plan confidence is low" in result.stderr
+    assert "--allow-low-confidence" in result.stderr
+
+
+def test_pcb_plan_emit_allow_low_confidence_override(tmp_path):
+    board_path = tmp_path / "layout.kicad_pcb"
+    board_path.write_text(_LOW_CONFIDENCE_BOARD, encoding="utf-8")
+    out = tmp_path / "placement.ppl"
+    result = subprocess.run(
+        [sys.executable, str(PLAN_CLI), "emit", "--board", str(board_path), "-o", str(out),
+         "--strict-confidence", "--allow-low-confidence"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert out.exists()
+    assert "# Plan confidence: low" in out.read_text()
