@@ -1018,13 +1018,12 @@ def load_ppl(path: Path) -> PlacementModel:
 
     def DecouplingArray(refs: Sequence[str], *, parent: str, pad: Optional[str | Sequence[str]] = None,
                         side: str = "auto", distance: Number = 2.0, spacing: Number = 1.5,
+                        stagger: bool = True, rows: int | str = "auto", max_per_row: Optional[int] = None,
                         role: str = "decoupling", priority: Number = 90,
                         power_net: Optional[str] = None, ground_net: Optional[str] = None,
                         rot: Optional[Number | str] = None, note: Optional[str] = None, **kwargs: Any) -> None:
-        """Place a group of decoupling capacitors as a single row near `parent` (or near
-        `pad` on `parent` if given), spread by `spacing` along the chosen `side`. The whole
-        group is kept together when possible; if it does not fit, members fall back to
-        individual search-based placement."""
+        """Place a group of decoupling capacitors outside the parent footprint body,
+        near `pad` when supplied, spreading and staggering the array as needed."""
 
         refs = list(refs)
         if not refs:
@@ -1033,7 +1032,8 @@ def load_ppl(path: Path) -> PlacementModel:
         kwargs.setdefault("ground_net", ground_net)
         model.add("decoupling_array", refs=[_normalize_ref(r) for r in refs], parent=_normalize_ref(parent),
                   pad=pad, side=side.lower().replace("-", "_"), distance=float(distance),
-                  spacing=float(spacing), role=role, priority=float(priority),
+                  spacing=float(spacing), stagger=bool(stagger), rows=rows, max_per_row=max_per_row,
+                  role=role, priority=float(priority),
                   rot=_rot_or_none(rot), note=note, extra=dict(kwargs))
 
     def PullupArray(refs: Sequence[str], *, parent: str, nets: Optional[Sequence[str]] = None,
@@ -2507,27 +2507,117 @@ class PlacementEngine:
                                          f"y={_fmt_num(primary_y)} placed x={_fmt_num(chosen.x)} y={_fmt_num(chosen.y)}; "
                                          f"search candidate {chosen.label}"))
 
+    def _fmt_bbox(self, bbox: BBox) -> str:
+        return (f"min=({_fmt_num(bbox.min_x)}, {_fmt_num(bbox.min_y)}) "
+                f"max=({_fmt_num(bbox.max_x)}, {_fmt_num(bbox.max_y)})")
+
+    def _nearest_bbox_side(self, point: Point, bbox: BBox) -> str:
+        x, y = point
+        distances = {
+            "left": abs(x - bbox.min_x),
+            "right": abs(x - bbox.max_x),
+            "top": abs(y - bbox.min_y),
+            "bottom": abs(y - bbox.max_y),
+        }
+        return min(distances, key=distances.get)
+
+    def _ordered_array_sides(self, side: str, origin: Point, parent_bbox: Optional[BBox],
+                             pad_side: Optional[str]) -> List[str]:
+        side = side.lower().replace("-", "_")
+        if side == "auto":
+            preferred: List[str] = []
+            if pad_side is not None:
+                preferred.append(pad_side)
+            preferred.extend(self._board_inward_sides(origin[0], origin[1]))
+        elif side == "inward":
+            if parent_bbox is not None:
+                cx = (parent_bbox.min_x + parent_bbox.max_x) / 2.0
+                cy = (parent_bbox.min_y + parent_bbox.max_y) / 2.0
+                preferred = self._board_inward_sides(cx, cy)
+            else:
+                preferred = self._board_inward_sides(origin[0], origin[1])
+        elif side in self._SIDE_VECTORS:
+            preferred = [side] + [s for s in self._board_inward_sides(origin[0], origin[1]) if s != side]
+        else:
+            raise PlacementError(f"Unknown side {side!r}")
+        out: List[str] = []
+        for s in preferred + ["top", "right", "bottom", "left"]:
+            if s not in out:
+                out.append(s)
+        return out
+
+    def _part_half_size_at_rot(self, ref: str, rot: float) -> Tuple[float, float]:
+        fp = self.footprints[ref]
+        info = footprint_bbox_at(fp, 0.0, 0.0, rot, self.model)
+        return info.bbox.width / 2.0, info.bbox.height / 2.0
+
     def _array_candidates(self, origin: Point, side: str, distance: float, spacing: float,
                           n: int) -> List[Tuple[float, float]]:
-        """Centered row of `n` candidate points `distance` from `origin` along `side`,
-        spread by `spacing` along the perpendicular (tangent) direction."""
+        """Backward-compatible centered row of `n` candidate points near `origin`."""
 
         vx, vy = self._SIDE_VECTORS[side]
         tx, ty = -vy, vx
         anchor = (origin[0] + vx * distance, origin[1] + vy * distance)
+        return [(anchor[0] + tx * spacing * (i - (n - 1) / 2.0),
+                 anchor[1] + ty * spacing * (i - (n - 1) / 2.0)) for i in range(n)]
+
+    def _array_layout_candidates(self, refs: Sequence[str], actual_refs: Sequence[Optional[str]], origin: Point,
+                                 side: str, distance: float, spacing: float, *, shift: float,
+                                 staggered: bool, parent_expanded: Optional[BBox], rot: Optional[float],
+                                 max_per_row: Optional[int]) -> List[Tuple[float, float]]:
+        """Generate a complete DecouplingArray candidate outside the parent keepout.
+
+        `origin` supplies the tangent coordinate (usually the selected pad). The normal
+        coordinate is anchored from the expanded parent bbox so item bodies remain
+        outside the IC footprint instead of centered on the pad.
+        """
+
+        n = len(refs)
+        if n == 0:
+            return []
+        horizontal_edge = side in {"top", "bottom"}
+        outward = -1.0 if side in {"left", "top"} else 1.0
+        if staggered:
+            per_row = max_per_row or min(3, max(1, math.ceil(n / 2)))
+            per_row = max(1, min(per_row, n))
+        else:
+            per_row = n
+
         points: List[Tuple[float, float]] = []
-        for i in range(n):
-            offset = spacing * (i - (n - 1) / 2.0)
-            points.append((anchor[0] + tx * offset, anchor[1] + ty * offset))
+        for idx, actual in enumerate(actual_refs):
+            row = idx // per_row
+            col = idx % per_row
+            row_count = min(per_row, n - row * per_row)
+            tangent = spacing * (col - (row_count - 1) / 2.0) + shift
+            if staggered and row % 2 == 1:
+                tangent += spacing / 2.0
+            eval_rot = rot if rot is not None else (self.positions[actual][2] if actual is not None else 0.0)
+            half_w = half_h = 0.5
+            if actual is not None and actual in self.footprints:
+                half_w, half_h = self._part_half_size_at_rot(actual, eval_rot)
+            row_gap = row * spacing
+            if parent_expanded is None:
+                vx, vy = self._SIDE_VECTORS[side]
+                tx, ty = -vy, vx
+                anchor = (origin[0] + vx * (distance + row_gap), origin[1] + vy * (distance + row_gap))
+                points.append((anchor[0] + tx * tangent, anchor[1] + ty * tangent))
+            elif horizontal_edge:
+                y = (parent_expanded.min_y - distance - row_gap - half_h
+                     if side == "top" else parent_expanded.max_y + distance + row_gap + half_h)
+                x = origin[0] + tangent
+                points.append((x, y))
+            else:
+                x = (parent_expanded.min_x - distance - row_gap - half_w
+                     if side == "left" else parent_expanded.max_x + distance + row_gap + half_w)
+                y = origin[1] + tangent
+                points.append((x, y))
         return points
 
     def _try_grouped_spread(self, refs: Sequence[str], actual_refs: Sequence[Optional[str]],
                             candidates: Sequence[Tuple[float, float]], rot: Optional[float],
                             *, clearance_override: Optional[float], region: Optional[BBox],
-                            allow_keepout_overlap: bool) -> Dict[str, Any]:
-        """Tentatively place each member of a group at its candidate point, checking each
-        against the board, region, keepouts, and the previously-placed members of the
-        same group. Reverts all tentative writes before returning."""
+                            allow_keepout_overlap: bool, parent_expanded: Optional[BBox] = None) -> Dict[str, Any]:
+        """Tentatively place each member of a group and reject any illegal candidate."""
 
         saved: Dict[str, Tuple[float, float, float]] = {}
         try:
@@ -2535,6 +2625,11 @@ class PlacementEngine:
                 if actual is None:
                     continue
                 eval_rot = rot if rot is not None else self.positions[actual][2]
+                if parent_expanded is not None and actual in self.footprints:
+                    test_info = footprint_bbox_at(self.footprints[actual], x, y, eval_rot, self.model)
+                    if test_info.bbox.overlaps(parent_expanded):
+                        return {"ok": False, "failed_ref": ref,
+                                "reason": "would overlap expanded parent bbox"}
                 reason = self._collides_at(actual, x, y, eval_rot, clearance_override=clearance_override,
                                            region=region, allow_keepout_overlap=allow_keepout_overlap)
                 if reason is not None:
@@ -2547,28 +2642,40 @@ class PlacementEngine:
                 self.positions[actual] = pos
 
     def place_array_near_target(self, rule: Mapping[str, Any], refs: Sequence[str], origin: Point,
-                                why: str) -> None:
-        """Place a row of `refs` near `origin`, trying each candidate side in turn and
-        keeping the group together (spread by `spacing`) when a side fits without
-        collisions, board-bound, keepout, or region violations. Falls back to placing
-        each member individually (reusing the standard search-based placement) when no
-        side fits the whole group, emitting diagnostics describing what was tried."""
+                                why: str, *, parent_ref: Optional[str] = None,
+                                pad_origin: Optional[Point] = None) -> None:
+        """Place an array as a group, using the parent bbox/perimeter for legal anchors."""
 
         refs = list(refs)
         n = len(refs)
         if n == 0:
             return
 
+        parent_bbox: Optional[BBox] = None
+        parent_expanded: Optional[BBox] = None
+        inferred_side: Optional[str] = None
+        if parent_ref is not None:
+            actual_parent = self.resolve_ref(parent_ref) or parent_ref
+            if actual_parent in self.footprints and actual_parent in self.positions:
+                px, py, prot = self.positions[actual_parent]
+                parent_bbox = footprint_bbox_at(self.footprints[actual_parent], px, py, prot, self.model).bbox
+                clearance = self._clearance_override(dict(rule))
+                if clearance is None:
+                    clearance = self.model.clearance.default
+                array_margin = float(self._rule_value(rule, "array_margin", 0.5))
+                parent_expanded = parent_bbox.expanded(clearance + array_margin)
+                if pad_origin is not None:
+                    inferred_side = self._nearest_bbox_side(pad_origin, parent_bbox)
+
         side = str(rule.get("side", "auto")).lower().replace("-", "_")
-        if side in ("auto", "inward"):
-            sides = self._board_inward_sides(origin[0], origin[1])
-        elif side in self._SIDE_VECTORS:
-            sides = [side] + [s for s in self._board_inward_sides(origin[0], origin[1]) if s != side]
-        else:
-            raise PlacementError(f"Unknown side {side!r}")
+        side_origin = pad_origin or origin
+        sides = self._ordered_array_sides(side, side_origin, parent_bbox, inferred_side)
 
         distance = float(rule.get("distance", 2.0))
         spacing = float(rule.get("spacing", 1.5))
+        stagger_requested = bool(rule.get("stagger", False))
+        max_per_row_value = rule.get("max_per_row")
+        max_per_row = None if max_per_row_value is None else int(max_per_row_value)
         rot = self.resolve_rot(rule.get("rot"))
         region = None if self.allow_outside_region else self._region_bbox(self._rule_value(rule, "region"))
         clearance_override = self._clearance_override(dict(rule))
@@ -2584,22 +2691,45 @@ class PlacementEngine:
 
         attempts: List[Dict[str, Any]] = []
         succeeded: Optional[List[Tuple[float, float]]] = None
-        for side_name in sides:
-            candidates = self._array_candidates(origin, side_name, distance, spacing, n)
-            result = self._try_grouped_spread(refs, actual_refs, candidates, rot,
-                                              clearance_override=clearance_override, region=region,
-                                              allow_keepout_overlap=allow_keepout_overlap)
-            if result["ok"]:
-                succeeded = candidates
+        distances = [distance + delta for delta in (0.0, 1.0, 2.0, 3.0)]
+        shifts = [0.0, spacing / 2.0, -spacing / 2.0, spacing, -spacing, 2.0 * spacing, -2.0 * spacing]
+        stagger_options = [False, True] if stagger_requested else [False]
+        for dist in distances:
+            for side_name in sides:
+                for staggered in stagger_options:
+                    for shift in shifts:
+                        candidates = self._array_layout_candidates(
+                            refs, actual_refs, side_origin, side_name, dist, spacing, shift=shift,
+                            staggered=staggered, parent_expanded=parent_expanded, rot=rot,
+                            max_per_row=max_per_row)
+                        result = self._try_grouped_spread(
+                            refs, actual_refs, candidates, rot, clearance_override=clearance_override,
+                            region=region, allow_keepout_overlap=allow_keepout_overlap,
+                            parent_expanded=parent_expanded)
+                        attempts.append({"side": side_name, "distance": dist, "shift": shift,
+                                         "staggered": staggered,
+                                         "anchor": candidates[len(candidates) // 2] if candidates else side_origin,
+                                         "candidates": candidates, **result})
+                        if result["ok"]:
+                            succeeded = candidates
+                            break
+                    if succeeded is not None:
+                        break
+                if succeeded is not None:
+                    break
+            if succeeded is not None:
                 break
-            attempts.append({"side": side_name, "anchor": candidates[len(candidates) // 2],
-                             "candidates": candidates, **result})
 
+        rejected_by_side: Set[str] = set()
         for attempt in attempts:
+            if attempt.get("ok") or attempt["side"] in rejected_by_side:
+                continue
+            rejected_by_side.add(attempt["side"])
             anchor = attempt["anchor"]
             self.messages.append(Message("note",
-                f"{why}: side {attempt['side']!r} (anchor ~ x={_fmt_num(anchor[0])} y={_fmt_num(anchor[1])}) "
-                f"rejected: {attempt['failed_ref']!r} {attempt['reason']}"))
+                f"{why}: side {attempt['side']!r} (anchor ~ x={_fmt_num(anchor[0])} y={_fmt_num(anchor[1])}, "
+                f"distance={_fmt_num(attempt['distance'])}, shift={_fmt_num(attempt['shift'])}, "
+                f"stagger={attempt['staggered']}) rejected: {attempt.get('failed_ref')!r} {attempt.get('reason')}"))
 
         if succeeded is not None:
             for ref, (x, y) in zip(refs, succeeded):
@@ -2608,27 +2738,35 @@ class PlacementEngine:
                            clearance_override=clearance_override, rule=rule)
             return
 
-        self.messages.append(Message("warn",
-            f"{why}: could not fit all {n} member(s) as a group on any side ({', '.join(sides)}); "
-            "falling back to individual placement"))
-
-        for ref, candidates0 in zip(refs, self._array_candidates(origin, sides[0], distance, spacing, n)):
-            x, y = candidates0
-            self.place(ref, x, y, rot, why, rule.get("note"),
-                       allow_arbitrary_rotation=allow_arbitrary_rotation,
-                       avoid_overlap=True, clearance_override=clearance_override,
-                       candidate_sides=sides, region_override=region, rule=rule)
+        failed = [a for a in attempts if not a.get("ok")]
+        best = min(failed, key=lambda a: math.hypot(a["anchor"][0] - side_origin[0], a["anchor"][1] - side_origin[1])) if failed else None
+        detail = [f"{refs[0]} could not be placed by {why}"]
+        if parent_ref is not None:
+            detail.append(f"parent {parent_ref} bbox: {self._fmt_bbox(parent_bbox)}" if parent_bbox else f"parent {parent_ref} bbox: unavailable")
+            detail.append(f"expanded parent bbox: {self._fmt_bbox(parent_expanded)}" if parent_expanded else "expanded parent bbox: unavailable")
+        if pad_origin is not None:
+            detail.append(f"pad at x={_fmt_num(pad_origin[0])} y={_fmt_num(pad_origin[1])}")
+        if inferred_side is not None:
+            detail.append(f"inferred side: {inferred_side}")
+        detail.append(f"sides tried: {', '.join(sides)}")
+        detail.append(f"candidate arrays tried: {len(attempts)}")
+        if best is not None:
+            bx, by = best["anchor"]
+            detail.append(f"best candidate: side={best['side']} x={_fmt_num(bx)} y={_fmt_num(by)}; rejected: {best.get('failed_ref')!r} {best.get('reason')}")
+        raise PlacementError("; ".join(detail))
 
     def _place_array_rule(self, rule: Mapping[str, Any], why: str) -> None:
         refs = rule.get("refs") or []
         if not refs:
             return
         pad = rule.get("pad")
+        pad_origin = None
         if pad is not None:
             origin = self._pad_centroid(str(rule["parent"]), pad)
+            pad_origin = origin
         else:
             origin = self.get_pos(rule["parent"])
-        self.place_array_near_target(rule, refs, origin, why)
+        self.place_array_near_target(rule, refs, origin, why, parent_ref=str(rule.get("parent")), pad_origin=pad_origin)
 
     def _collides_at(self, ref: str, x: float, y: float, rot: float, *, clearance_override: Optional[float] = None,
                     region: Optional[BBox] = None, allow_keepout_overlap: bool = False) -> Optional[str]:

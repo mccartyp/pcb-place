@@ -1028,6 +1028,37 @@ def _synthesized_rf_keepout(
     _distance, rect = min(candidates, key=lambda item: (item[0], -item[1]["w"] * item[1]["h"]))
     return rect
 
+
+
+def _component_pad_side(parent: PlanComponent, pad: Optional[str]) -> Optional[str]:
+    if parent.bbox is None or pad is None:
+        return None
+    matches = [p for p in parent.pads if p.number == pad or p.name == pad]
+    if not matches:
+        return None
+    px = sum(p.abs_x for p in matches) / len(matches)
+    py = sum(p.abs_y for p in matches) / len(matches)
+    distances = {
+        "left": abs(px - parent.bbox.min_x),
+        "right": abs(px - parent.bbox.max_x),
+        "top": abs(py - parent.bbox.min_y),
+        "bottom": abs(py - parent.bbox.max_y),
+    }
+    return min(distances, key=distances.get)
+
+
+def _component_near_board_edge(parent: PlanComponent, board: BoardGeometry, threshold: float = 3.0) -> bool:
+    if parent.bbox is None:
+        x = parent.x - board.origin_x
+        y = parent.y - board.origin_y
+        return min(x, board.width - x, y, board.height - y) <= threshold
+    return min(
+        parent.bbox.min_x - board.origin_x,
+        board.origin_x + board.width - parent.bbox.max_x,
+        parent.bbox.min_y - board.origin_y,
+        board.origin_y + board.height - parent.bbox.max_y,
+    ) <= threshold
+
 def _nearest_parent(comp: PlanComponent, candidates: Iterable[PlanComponent], shared_nets: Optional[set[str]] = None) -> Optional[PlanComponent]:
     best: Tuple[float, Optional[PlanComponent]] = (1e99, None)
     for cand in candidates:
@@ -1408,14 +1439,27 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             decoupling_groups.append({"parent": parent_ref, "power_net": power_net, "pad": pad, "members": members, "primitive": "Decoupling", "grouped": False})
         else:
             pad_kw = f"pad={_q(pad)}, " if pad else ""
-            text = (f'DecouplingArray(refs={_q(members)}, parent={_q(parent_ref)}, {pad_kw}side="auto", '
-                    f'distance=2.0, spacing=1.5, role="decoupling", power_net={_qn(power_net)}, ground_net="GND")')
+            inferred_pad_side = _component_pad_side(parent, pad)
+            parent_near_edge = _component_near_board_edge(parent, board)
+            stagger_recommended = len(caps) > 3
+            side_value = "inward" if parent_near_edge else "auto"
+            array_opts = 'stagger=True, rows="auto", '
+            if len(caps) > 3:
+                array_opts += 'max_per_row=3, '
+            text = (f'DecouplingArray(refs={_q(members)}, parent={_q(parent_ref)}, {pad_kw}side={_q(side_value)}, '
+                    f'distance=2.0, spacing=1.5, {array_opts}role="decoupling", '
+                    f'power_net={_qn(power_net)}, ground_net="GND")')
             rules.append(PlanRule("decoupling_array", text, list(members),
                                    f"{', '.join(members)} grouped decoupling array for {parent_ref} ({power_net or 'unknown net'}); "
-                                   "replaces per-capacitor Decoupling()/NearPad() rules."))
+                                   f"pad_side={inferred_pad_side or 'unknown'}, parent_near_board_edge={parent_near_edge}, "
+                                   f"stagger_recommended={stagger_recommended}; replaces per-capacitor Decoupling()/NearPad() rules."))
             for cref in members:
                 explanations[cref] = {"role": "decoupling", "nets": components[cref].nets, "parent_candidate": parent_ref, "generated_rule": text, "primitive_selected": "DecouplingArray", "primitive_scores": {"NearPad": 0, "Decoupling": 40, "DecouplingArray": 90, "Cluster": 80, "Anchor": 10}}
-            decoupling_groups.append({"parent": parent_ref, "power_net": power_net, "pad": pad, "members": members, "primitive": "DecouplingArray", "grouped": True})
+            decoupling_groups.append({"parent": parent_ref, "power_net": power_net, "pad": pad, "members": members,
+                                        "primitive": "DecouplingArray", "grouped": True,
+                                        "inferred_pad_side": inferred_pad_side,
+                                        "parent_near_board_edge": parent_near_edge,
+                                        "stagger_recommended": stagger_recommended})
 
     # Pullup/pulldown resistors: determine the true owning signal source
     # (connector/MCU/peripheral) via the connectivity graph and group

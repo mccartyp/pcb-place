@@ -1279,7 +1279,7 @@ def _decoupling_array_pcb() -> str:
   (footprint "Test:U" (layer "F.Cu")
     (at 20 20 0)
     (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
-    (pad "1" smd rect (at 0 0) (size 2 2) (layers "F.Cu"))
+    (pad "1" smd rect (at 0 0) (size 4 8) (layers "F.Cu"))
   )
   (footprint "Test:C1" (layer "F.Cu")
     (at 50 50 0)
@@ -1397,9 +1397,9 @@ def test_decoupling_array_avoids_collision_with_existing_component(tmp_path):
     (pad "1" smd rect (at 0 0) (size 2 2) (layers "F.Cu"))
   )
   (footprint "Test:R" (layer "F.Cu")
-    (at 22 20 0)
+    (at 24 20 0)
     (property "Reference" "R99" (at 0 0 0) (layer "F.SilkS"))
-    (pad "1" smd rect (at 0 0) (size 2 2) (layers "F.Cu"))
+    (pad "1" smd rect (at 0 0) (size 4 8) (layers "F.Cu"))
   )
   (footprint "Test:C1" (layer "F.Cu")
     (at 50 50 0)
@@ -1427,7 +1427,7 @@ DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", distance=2, spacing=1.5)
     assert report["collisions"] == []
     for ref in ("C1", "C2", "C3"):
         x = placements[ref]["x"]
-        assert x < 22.0  # placed away from R99, which sits on the right side of U1
+        assert x < 24.0  # placed away from R99, which sits on the right side of U1
     assert any("right" in m.text and "collision" in m.text for m in messages if m.level == "note")
 
 
@@ -1478,3 +1478,95 @@ NearPad("C1", parent="U1", pad="1", distance=10, side="right", region="TINY")
     assert "attempted" in message and "candidate" in message
     assert "search_radius_used=" in message
     assert "fallback_used=" in message
+
+
+def _decoupling_array_edge_pcb(cap_count=5, u_at=(2, 20), u_size=(4, 6), pad_at=(-1.8, 0)) -> str:
+    caps = []
+    for i in range(1, cap_count + 1):
+        caps.append(f'''  (footprint "Test:C{i}" (layer "F.Cu")
+    (at {50+i} 50 0)
+    (property "Reference" "C{i}" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )''')
+    return f'''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at {u_at[0]} {u_at[1]} 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at {pad_at[0]} {pad_at[1]}) (size 0.6 0.6) (layers "F.Cu"))
+    (fp_rect (start {-u_size[0]/2} {-u_size[1]/2}) (end {u_size[0]/2} {u_size[1]/2}) (stroke (width 0.1) (type solid)) (fill none) (layer "F.CrtYd"))
+  )
+{chr(10).join(caps)}
+)'''
+
+
+def _bbox_for_text(text, model, ref):
+    fps = parse_footprints(text)
+    fp = fps[ref]
+    return pcb_place.footprint_bbox_at(fp, fp.x, fp.y, fp.rot, model).bbox.as_report()
+
+
+def _overlaps(a, b):
+    return not (a["max_x"] <= b["min_x"] or b["max_x"] <= a["min_x"] or a["max_y"] <= b["min_y"] or b["max_y"] <= a["min_y"])
+
+
+def test_decoupling_array_near_left_edge_ic_chooses_inward_right_side(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", pad="1", side="auto", distance=1.0, spacing=1.5)
+''')
+    _out, messages, report = apply_placements(_decoupling_array_edge_pcb(3), model, strict=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    assert all(placements[ref]["x"] > 4.0 for ref in ("C1", "C2", "C3"))
+    assert any("side 'left'" in m.text and "board bounds" in m.text for m in messages if m.level == "note")
+
+
+def test_decoupling_array_never_overlaps_parent_bbox(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=50, height=40)
+DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", pad="1", side="auto", distance=0.1, spacing=1.2)
+''')
+    out, _messages, _report = apply_placements(_decoupling_array_edge_pcb(3, u_at=(20, 20)), model, strict=True)
+    parent_bbox = _bbox_for_text(out, model, "U1")
+    for ref in ("C1", "C2", "C3"):
+        assert not _overlaps(_bbox_for_text(out, model, ref), parent_bbox)
+
+
+def test_decoupling_array_staggers_five_capacitors_when_needed(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=16, height=20)
+Region("LOCAL", x=0, y=7.5, w=16, h=5.0)
+DecouplingArray(refs=["C1", "C2", "C3", "C4", "C5"], parent="U1", pad="1", side="right", distance=1.0, spacing=1.5, stagger=True, max_per_row=3, region="LOCAL")
+''')
+    _out, _messages, report = apply_placements(_decoupling_array_edge_pcb(5, u_at=(6, 10), u_size=(4, 6), pad_at=(1.8, 0)), model, strict=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    xs = {round(placements[ref]["x"], 3) for ref in ("C1", "C2", "C3", "C4", "C5")}
+    assert len(xs) >= 2  # second staggered column is farther from the parent
+    assert placements["C4"]["y"] != placements["C1"]["y"]
+
+
+def test_decoupling_array_avoids_antenna_keepout(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=30)
+Keepout("ANTENNA", x=23, y=8, w=8, h=10)
+DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", pad="1", side="right", distance=1.0, spacing=1.5)
+''')
+    out, messages, _report = apply_placements(_decoupling_array_edge_pcb(3, u_at=(20, 15), u_size=(4, 6), pad_at=(1.8, 0)), model, strict=True)
+    for ref in ("C1", "C2", "C3"):
+        bbox = _bbox_for_text(out, model, ref)
+        assert not _overlaps(bbox, {"min_x": 23, "min_y": 8, "max_x": 31, "max_y": 18})
+    assert any("ANTENNA" in m.text for m in messages if m.level == "note")
+
+
+def test_decoupling_array_failure_diagnostics_include_parent_bbox_and_sides(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=8, height=8)
+Keepout("ALL", x=0, y=0, w=8, h=8)
+DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", pad="1", side="auto", distance=1.0, spacing=1.5)
+''')
+    with pytest.raises(PlacementError) as excinfo:
+        apply_placements(_decoupling_array_edge_pcb(3, u_at=(4, 4), u_size=(2, 2), pad_at=(-0.8, 0)), model, strict=True)
+    message = str(excinfo.value)
+    assert "parent U1 bbox" in message
+    assert "expanded parent bbox" in message
+    assert "sides tried" in message
+    assert "candidate arrays tried" in message
