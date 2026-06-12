@@ -105,6 +105,29 @@ def test_parse_xml_and_sexp_netlist_aliases():
     assert sexp_aliases["MCU.C_VDD_1.C"] == "C1"
 
 
+def test_parse_kicad_export_sheetpath_aliases(tmp_path):
+    netlist = tmp_path / "default.net"
+    netlist.write_text(
+        '''(export (version "E")
+  (components
+    (comp (ref "C1")
+      (value "GCM155R71H104KE02D")
+      (sheetpath (names "FLASH.C_FLASH1.C") (tstamps "70236bd1-45ac-5720-9e45-dee83b6621cd")))
+    (comp (ref "J1")
+      (value "TBD_HDMI_IN")
+      (sheetpath (names "HDMI_IN.J1") (tstamps "a4ca3564-4ba5-5edf-b282-c172e4ff0e5f")))))
+''',
+        encoding="utf-8",
+    )
+
+    aliases, diagnostics = parse_netlist_aliases(netlist)
+
+    assert diagnostics.parser == "sexp"
+    assert diagnostics.warnings == []
+    assert aliases["FLASH.C_FLASH1.C"] == "C1"
+    assert aliases["HDMI_IN.J1"] == "J1"
+
+
 def test_imported_aliases_place_semantic_refs(tmp_path):
     ppl = tmp_path / "semantic.ppl"
     ppl.write_text('''
