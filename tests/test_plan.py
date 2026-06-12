@@ -519,6 +519,11 @@ def test_grouped_decoupling_and_pullup_arrays_and_series_validation():
     assert all(rule.text.startswith("DecouplingArray(") for rule in plan.rules if rule.kind == "decoupling_array")
     decoupling_array_rules = [rule for rule in plan.rules if rule.kind == "decoupling_array"]
     assert len(decoupling_array_rules) == 1  # one rule covers all members, no duplicates
+    assert 'stagger=True' in decoupling_array_rules[0].text
+    assert 'rows="auto"' in decoupling_array_rules[0].text
+    assert "inferred_pad_side" in decoupling_group
+    assert "parent_near_board_edge" in decoupling_group
+    assert "stagger_recommended" in decoupling_group
 
     # Two pullups on different signal nets owned by the same MCU are grouped
     # by ownership rather than emitted as context-less Pullup() rules.
