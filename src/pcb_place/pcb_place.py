@@ -52,7 +52,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 Number = float | int
 Point = Tuple[float, float]

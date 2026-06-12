@@ -672,6 +672,21 @@ def test_pcb_plan_emit_strict_confidence_fails(tmp_path):
     assert "--allow-low-confidence" in result.stderr
 
 
+def test_pcb_plan_emit_omits_outline_for_inferred_geometry(tmp_path):
+    # When board geometry is inferred from footprint extents (no Edge.Cuts
+    # or board.pln), emit_outline must not be set, since drawing a low-
+    # confidence rectangle as the real Edge.Cuts outline could cut through
+    # components.
+    board_path = tmp_path / "layout.kicad_pcb"
+    board_path.write_text(_LOW_CONFIDENCE_BOARD, encoding="utf-8")
+    board, components, nets, warnings = pcb_plan.parse_board(board_path)
+    plan = pcb_plan.generate_plan(board, components, nets, {}, pcb_plan.AliasDiagnostics(), {}, warnings)
+    assert plan.board.source == "inferred_from_footprints"
+    ppl = pcb_plan.emit_ppl(plan, board_path, None)
+    assert "emit_outline=False" in ppl
+    assert "emit_outline=True" not in ppl
+
+
 def test_pcb_plan_emit_allow_low_confidence_override(tmp_path):
     board_path = tmp_path / "layout.kicad_pcb"
     board_path.write_text(_LOW_CONFIDENCE_BOARD, encoding="utf-8")
@@ -686,3 +701,97 @@ def test_pcb_plan_emit_allow_low_confidence_override(tmp_path):
     assert result.returncode == 0
     assert out.exists()
     assert "# Plan confidence: low" in out.read_text()
+
+
+def _plan_component(ref, x, y, role, nets, pad_count=None):
+    pads = []
+    for i, net in enumerate(nets, start=1):
+        pads.append(pcb_plan.PlanPad(
+            number=str(i), name="", local_x=0.0, local_y=0.0, abs_x=x, abs_y=y,
+            layers=["F.Cu"], shape="rect", size=(0.5, 0.5), net=net,
+        ))
+    return pcb_plan.PlanComponent(
+        ref=ref, footprint="Test:Test", uuid=None, value=None,
+        x=x, y=y, rot=0.0, layer="F.Cu", pads=pads, bbox=None, role=role,
+    )
+
+
+def _plan_nets(components):
+    nets: dict[str, pcb_plan.PlanNet] = {}
+    for comp in components.values():
+        for pad in comp.pads:
+            if pad.net is None:
+                continue
+            net = nets.setdefault(pad.net, pcb_plan.PlanNet(pad.net))
+            net.pads.append((comp.ref, pad.number))
+    return nets
+
+
+def test_cluster_members_excludes_power_and_ground_only_connections():
+    # U1 and U2 are within the cluster radius but only share a power rail and
+    # ground - that alone should not pull U2 into U1's cluster.
+    components = {
+        "U1": _plan_component("U1", 0.0, 0.0, "ic", ["3V3", "GND", "SIG_A"]),
+        "U2": _plan_component("U2", 8.0, 0.0, "ic", ["3V3", "GND", "SIG_B"]),
+    }
+    nets = _plan_nets(components)
+    members = pcb_plan._cluster_members(components["U1"], components, nets, {}, radius=12.0)
+    assert "U2" not in members
+
+
+def test_cluster_members_caps_distant_signal_connected_refs_by_radius():
+    # U3 shares a real signal net with U1 (legitimate connectivity), but it
+    # sits far outside the cluster radius, so it should not be swept into a
+    # rigidly-moved cluster.
+    components = {
+        "U1": _plan_component("U1", 0.0, 0.0, "ic", ["SIG_A", "GND"]),
+        "U3": _plan_component("U3", 100.0, 100.0, "ic", ["SIG_A", "GND"]),
+    }
+    nets = _plan_nets(components)
+    members = pcb_plan._cluster_members(components["U1"], components, nets, {}, radius=12.0)
+    assert "U3" not in members
+
+
+def test_cluster_members_keeps_nearby_signal_connected_and_support_parts():
+    # A nearby decoupling cap (support role, shares only power/ground) and a
+    # nearby IC connected via a real signal net should both stay clustered.
+    components = {
+        "U1": _plan_component("U1", 0.0, 0.0, "ic", ["3V3", "GND", "SIG_A"]),
+        "C1": _plan_component("C1", 1.0, 1.0, "decoupling", ["3V3", "GND"]),
+        "U4": _plan_component("U4", 5.0, 0.0, "ic", ["SIG_A", "GND"]),
+    }
+    nets = _plan_nets(components)
+    members = pcb_plan._cluster_members(components["U1"], components, nets, {}, radius=12.0)
+    assert "C1" in members
+    assert "U4" in members
+
+
+def test_cluster_members_connector_proximity_any_role_disabled():
+    # With proximity_any_role disabled (used for connector clusters), a
+    # nearby but electrically-unrelated IC should not be swept into the
+    # connector's rigidly-moved cluster just because it is close by.
+    components = {
+        "J1": _plan_component("J1", 0.0, 0.0, "connector", ["USB_DP", "USB_DM", "GND"]),
+        "U5": _plan_component("U5", 4.0, 0.0, "ic", ["3V3", "GND", "SIG_C"]),
+    }
+    nets = _plan_nets(components)
+    members = pcb_plan._cluster_members(components["J1"], components, nets, {}, radius=18.0, proximity_any_role=False)
+    assert "U5" not in members
+
+    members_default = pcb_plan._cluster_members(components["J1"], components, nets, {}, radius=18.0)
+    assert "U5" in members_default
+
+
+def test_cluster_members_connector_excludes_unrelated_nearby_support_part():
+    # With proximity_any_role disabled, a nearby decoupling cap that shares
+    # no signal/power net and isn't otherwise connected to the connector
+    # should not be dragged into the connector's rigidly-moved Edge() cluster.
+    components = {
+        "J1": _plan_component("J1", 0.0, 0.0, "connector", ["USB_DP", "USB_DM", "GND"]),
+        "C1": _plan_component("C1", 1.0, 1.0, "decoupling", ["3V3", "GND"]),
+        "C2": _plan_component("C2", 1.0, -1.0, "decoupling", ["USB_DP", "GND"]),
+    }
+    nets = _plan_nets(components)
+    members = pcb_plan._cluster_members(components["J1"], components, nets, {}, radius=18.0, proximity_any_role=False)
+    assert "C1" not in members
+    assert "C2" in members
