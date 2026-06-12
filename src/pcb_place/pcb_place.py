@@ -3067,8 +3067,9 @@ class PlacementEngine:
                         placement_region = self._placement_region_for_side(
                             parent_ref or "", parent_bbox, parent_expanded, side_name, region, str(rule.get("role", why)))
                         original_boxes = self._array_item_bboxes(actual_refs, original_candidates, rot)
+                        slide_bounds = placement_region.legal_bbox if placement_region is not None else _geometry_bbox(self.board_geometry)
                         slide = slide_array_bbox_into_bounds(
-                            original_candidates, side_name, _geometry_bbox(self.board_geometry), 0.0, item_bboxes=original_boxes)
+                            original_candidates, side_name, slide_bounds, 0.0, item_bboxes=original_boxes)
                         candidates = list(slide["items"])
                         result = self._try_grouped_spread(
                             refs, actual_refs, candidates, rot, clearance_override=clearance_override,
@@ -3085,6 +3086,7 @@ class PlacementEngine:
                                     "slide_dy": round(float(slide["slide_dy"]), 6),
                                     "original_array_bbox": None if slide["original_array_bbox"] is None else slide["original_array_bbox"].as_report(),
                                     "slid_array_bbox": None if slide["slid_array_bbox"] is None else slide["slid_array_bbox"].as_report(),
+                                    "slide_bounds_bbox": None if slide_bounds is None else slide_bounds.as_report(),
                                     "placement_region": None if placement_region is None else placement_region.as_report(),
                                     **self._capacity_metadata(n, side_name, spacing, placement_region, staggered, max_per_row)}
                         label = (f"side={side_name},distance={dist:g},shape={shape},"

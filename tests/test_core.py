@@ -1600,6 +1600,29 @@ DecouplingArray(refs=["C1", "C2", "C3", "C4", "C5"], parent="U1", pad="1", side=
     assert search["chosen"]["metadata"]["single_row_capacity"] >= 1
 
 
+def test_decoupling_array_slides_into_strict_region(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+Region("LOCAL", x=1, y=12, w=12, h=8)
+DecouplingArray(refs=["C1", "C2", "C3"], parent="U1", pad="1", side="bottom", distance=1.0, spacing=1.5, stagger=False, region="LOCAL")
+''')
+    out, _messages, report = apply_placements(
+        _decoupling_array_edge_pcb(3, u_at=(2, 10), u_size=(4, 4), pad_at=(0, 1.8)),
+        model,
+        strict=True,
+    )
+    region = {"min_x": 1.0, "min_y": 12.0, "max_x": 13.0, "max_y": 20.0}
+    for ref in ("C1", "C2", "C3"):
+        bbox = _bbox_for_text(out, model, ref)
+        assert bbox["min_x"] >= region["min_x"]
+        assert bbox["max_x"] <= region["max_x"]
+        assert bbox["min_y"] >= region["min_y"]
+        assert bbox["max_y"] <= region["max_y"]
+    metadata = report["placement_search"]["C1"]["chosen"]["metadata"]
+    assert metadata["slide_applied"] is True
+    assert metadata["slide_dx"] > 0
+    assert metadata["slide_bounds_bbox"]["min_x"] == 1.0
+
 def test_pullup_array_uses_sliding_logic(tmp_path):
     pcb = _decoupling_array_edge_pcb(3, u_at=(2, 10), u_size=(4, 4), pad_at=(0, 1.8)).replace('"C1"', '"R1"').replace('"C2"', '"R2"').replace('"C3"', '"R3"')
     model = _load_inline(tmp_path, '''
