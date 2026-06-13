@@ -5797,7 +5797,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _main(argv: Optional[List[str]] = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if args.list_aliases:
@@ -5948,11 +5948,14 @@ def _main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
+_uncaught_main = main
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point that reports placement failures without a Python traceback."""
 
     try:
-        return _main(argv)
+        return _uncaught_main(argv)
     except PlacementError as exc:
         print(f"pcb-place error: {exc}", file=sys.stderr)
         return 2
