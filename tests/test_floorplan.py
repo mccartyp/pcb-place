@@ -305,3 +305,34 @@ def test_best_effort_never_raises_but_strict_does(tmp_path):
     # strict
     with pytest.raises(PlacementError):
         _run(tmp_path, pcb, ppl, strict=True)
+
+
+# ---------------------------------------------------------------------------
+# AI edit hints surface floorplan health
+# ---------------------------------------------------------------------------
+
+def test_ai_edit_hints_surface_parked_components(tmp_path):
+    """ai-edit-hints.md steers editors to the floorplan when parts are parked."""
+    from pcb_place.pcb_place import ai_edit_hints_md
+
+    pcb, ppl = _decoupling_scene(obstacles_locked=True, allow_anchor_move=False)
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    assert report["floorplan"]["parking_fallback_used"] >= 1
+
+    hints = ai_edit_hints_md(report)
+    assert "## Floorplan health" in hints
+    assert "Parked components" in hints
+    assert "[review-required]" in hints
+    # Points editors at regions/islands/paths before individual rules.
+    assert "regions, power islands, path definitions" in hints
+
+
+def test_ai_edit_hints_clean_board_has_floorplan_section(tmp_path):
+    from pcb_place.pcb_place import ai_edit_hints_md
+
+    pcb = _pcb([_fp("U1", "U", 20, 20)])
+    ppl = "Board(width=40, height=40)\nAnchor(\"U1\", x=20, y=20, rot=0)\n"
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    hints = ai_edit_hints_md(report)
+    assert "## Floorplan health" in hints
+    assert "placement quality score" in hints

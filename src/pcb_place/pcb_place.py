@@ -4787,6 +4787,39 @@ def ai_edit_hints_md(report: Mapping[str, Any]) -> str:
         lines.append("- none")
     lines.append("")
 
+    floorplan = report.get("floorplan", {})
+    quality = floorplan.get("placement_quality_score", {})
+    quality_total = quality.get("score") if isinstance(quality, Mapping) else quality
+    lines.append("## Floorplan health")
+    lines.append("")
+    if quality_total is not None:
+        lines.append(f"- placement quality score: {quality_total:g} (lower is better)")
+    iterations = floorplan.get("iterations", [])
+    lines.append(f"- floorplan iterations run: {len(iterations)} of {floorplan.get('max_iterations', 0)} max")
+    reflow_attempts = floorplan.get("reflow_attempts", [])
+    moved_parents = floorplan.get("moved_parents", [])
+    moved_components = floorplan.get("moved_components", [])
+    lines.append(f"- reflow attempts: {len(reflow_attempts)}; parents moved: {len(moved_parents)}; "
+                 f"support parts repacked: {len(moved_components)}")
+    for ref in moved_parents:
+        lines.append(f"- [review-required] movable parent {ref} was reflowed to satisfy a neighbour; "
+                     "confirm this is acceptable, or Lock() / Anchor() it to pin it down.")
+    parked = floorplan.get("parked", [])
+    if parked:
+        lines.append("")
+        lines.append("### Parked components (degraded placement — edit the floorplan, not just the rule)")
+        lines.append("")
+        lines.append("Prefer editing regions, power islands, path definitions, edge-required")
+        lines.append("constraints, stackup, and routing constraints before tweaking individual")
+        lines.append("placement rules. A parked part usually means the surrounding floorplan is")
+        lines.append("over-constrained:")
+        for entry in parked:
+            reason = entry.get("reason", "no legal location after reflow")
+            lines.append(f"- [review-required] {entry['ref']} parked by {entry.get('why', 'placement')}: "
+                         f"{reason}. Enlarge its Region(), free space near its parent, or relax spacing "
+                         "for the neighbourhood.")
+    lines.append("")
+
     lines.append("## Suggested placement.ppl edits")
     lines.append("")
     suggestions = False
