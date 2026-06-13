@@ -133,6 +133,49 @@ When asked to apply or debug a `placement.ppl`:
     `board.pln` changes first. Use manual `Anchor` edits only as a last resort
     when the planning primitive cannot express the needed intent.
 
+## Iterative Floorplanner: No-Abort Placement and Reflow
+
+`pcb-place` behaves like a constraint-driven floorplanner, not a collection of
+independent placement primitives. A single component that cannot place legally
+is treated as evidence that the surrounding floorplan is over-constrained, not
+as a hard failure.
+
+- **No-abort default (`best_effort`, on by default).** When a primitive cannot
+  satisfy its constraints, the engine runs a reflow ladder before, as a last
+  resort, *parking* the component (leaving it at its current position with a
+  `DEGRADED PLACEMENT … [review-required]` warning and a quality penalty).
+  Placement never aborts in this mode.
+- **Reflow ladder.** Level 1 repacks within the array (spacing/stagger/rows/
+  sides/slide — built into the array primitive). Levels 2–4 repack nearby
+  movable support parts (test points, LEDs, pull-ups/straps) outward. Level 5
+  moves a *movable* parent (e.g. nudges a regulator/IC) if doing so lets the
+  group place. Level 7 is parking.
+- **Mechanical authority is absolute.** Locked parts, edge-required connectors,
+  and mechanical anchors (mounting holes) are never moved by reflow.
+- **Global optimization.** After the first pass the floorplanner iterates
+  (`--max-floorplan-iterations`, default 10), re-scoring and re-attempting the
+  worst constraints, keeping the best-scoring floorplan.
+- **Quality scoring.** The report's `floorplan` section carries
+  `placement_quality_score` (lower is better; parking dominates, then
+  collisions/spacing, then high-speed/power/congestion soft penalties),
+  `iteration_scores`, `score_deltas`, `reflow_attempts`, `moved_parents`,
+  `moved_components`, `parked`, `congestion_map`, `high_speed_path_score`, and
+  `power_island_score`.
+
+Flags:
+
+- `--strict` / `--fail-fast` — restore legacy behavior: abort on the first
+  unsatisfiable placement (the only modes that may fail).
+- `--no-best-effort` — disable no-abort; parked components become errors.
+- `--max-floorplan-iterations N` — cap global optimization iterations.
+
+When you see parked components or moved parents in the report, **fix the
+floorplan, not just the rule**: enlarge the relevant `Region()`, free space near
+the parent, adjust the power island / high-speed path, or relax spacing for the
+neighbourhood. `board.pln` remains the primary optimization artifact. The
+`ai-edit-hints.md` "Floorplan health" section lists these `[review-required]`
+items with concrete suggestions.
+
 ## Placement Ownership, Edge Connectors, and Review Reports
 
 The report's `ownership` section records the unique winning rule per ref;

@@ -40,7 +40,7 @@ from pcb_place import (
     parse_netlist_aliases,
 )
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 Point = Tuple[float, float]
 _POWER_RE = re.compile(r"^(?:\+?(?:1V[0-9]|1V[0-9]|[0-9]+V[0-9]*|VCC|VDD|VBAT|VIN|VBUS|AVDD|DVDD|PVDD|3V3|5V|12V))", re.I)
