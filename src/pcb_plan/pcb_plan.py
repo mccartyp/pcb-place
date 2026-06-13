@@ -29,6 +29,7 @@ from pcb_place import (
     AliasDiagnostics,
     BBox,
     BoardGeometry,
+    DEFAULT_FOOTPRINT_MARGIN_MM,
     PlacementError,
     _find_matching_paren,
     _normalize_ref,
@@ -346,7 +347,10 @@ def parse_board(path: Path) -> Tuple[BoardGeometry, Dict[str, PlanComponent], Di
         board = edge_board
     else:
         board = infer_geometry_from_footprints(fps)
-        warnings.append("WARNING: No board.pln geometry or Edge.Cuts rectangle was available while parsing the board; using footprint extents only as a last-resort board-size fallback. Supply board.width/height/origin in board.pln for authoritative dimensions.")
+        warnings.append("WARNING: geometry inferred from footprint extents; review board.pln. "
+                        f"A {DEFAULT_FOOTPRINT_MARGIN_MM:g} mm margin was added around footprint extents "
+                        "as a last-resort board-size fallback (no board.pln geometry or Edge.Cuts rectangle "
+                        "was available). Supply board.width/height/origin in board.pln for authoritative dimensions.")
     components: Dict[str, PlanComponent] = {}
     nets: Dict[str, PlanNet] = {}
     for ref, fp in sorted(fps.items()):
@@ -2541,7 +2545,7 @@ def emit_ppl(plan: Plan, board_path: Path, netlist_path: Optional[Path]) -> str:
             lines.append(f"# - {reason}")
         lines.append("")
     lines.extend(routing_summary_comments(plan))
-    emit_outline = plan.board.source != "inferred_from_footprints"
+    emit_outline = plan.board.source != "footprint_extents"
     if not emit_outline:
         lines.append("# Edge.Cuts outline not emitted: board geometry was inferred from footprint extents (low confidence).")
     sp = plan.spacing
@@ -2630,7 +2634,7 @@ def compute_plan_confidence(plan: Plan) -> Dict[str, Any]:
         reasons.append(f"{len(invalid_series)} Series() inference(s) were rejected as invalid")
         score -= 10
 
-    if plan.board.source == "inferred_from_footprints":
+    if plan.board.source == "footprint_extents":
         reasons.append("board geometry was inferred from footprint extents (no board.pln or Edge.Cuts available)")
         score -= 15
 
@@ -2642,6 +2646,43 @@ def compute_plan_confidence(plan: Plan) -> Dict[str, Any]:
     else:
         level = "low"
     return {"score": score, "level": level, "reasons": reasons}
+
+
+# Map internal BoardGeometry.source strings to the stable report vocabulary.
+_GEOMETRY_SOURCE_LABELS = {
+    "cli": "cli",
+    "board.pln": "pln",
+    "placement_file": "pln",
+    "edge_cuts": "edge_cuts",
+    "footprint_extents": "footprint_extents",
+}
+
+
+def geometry_source_label(source: str) -> str:
+    return _GEOMETRY_SOURCE_LABELS.get(source, source)
+
+
+def _validate_board_geometry(board: BoardGeometry) -> None:
+    """Reject only when the final resolved width/height is non-positive."""
+
+    if board.width <= 0 or board.height <= 0:
+        raise PlacementError(
+            f"invalid board geometry: width={board.width:g} height={board.height:g} "
+            f"source={geometry_source_label(board.source)}")
+
+
+def board_geometry_report(board: BoardGeometry) -> Dict[str, Any]:
+    """Report block describing the resolved board geometry and its provenance."""
+
+    source = geometry_source_label(board.source)
+    return {
+        "source": source,
+        "width": board.width,
+        "height": board.height,
+        "origin_x": board.origin_x,
+        "origin_y": board.origin_y,
+        "margin_applied": DEFAULT_FOOTPRINT_MARGIN_MM if source == "footprint_extents" else 0.0,
+    }
 
 
 def report(plan: Plan) -> Dict[str, Any]:
@@ -2664,6 +2705,7 @@ def report(plan: Plan) -> Dict[str, Any]:
     semantic_groups = compute_semantic_groups(plan.clusters, plan.functional_paths,
                                               plan.power_islands, plan.decoupling_groups)
     return {
+        "board_geometry": board_geometry_report(plan.board),
         "components_parsed": len(plan.components),
         "nets_parsed": len(plan.nets),
         "components_placed": len(placed_refs),
@@ -3172,6 +3214,7 @@ def _load_plan_from_inputs(board_path: Path, netlist_path: Optional[Path], pln_p
             source="cli",
         )
         warnings = [w for w in warnings if "footprint extents" not in w]
+    _validate_board_geometry(board)
     plan = generate_plan(board, components, nets, aliases, alias_diag, intent, warnings)
     return plan, raw_intent
 

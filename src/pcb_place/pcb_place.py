@@ -475,7 +475,9 @@ class BoardGeometry:
         return {"min_x": self.min_x, "min_y": self.min_y, "max_x": self.max_x, "max_y": self.max_y}
 
     def as_report(self) -> Dict[str, Any]:
-        return dataclasses.asdict(self) | self.bounds()
+        report = dataclasses.asdict(self) | self.bounds()
+        report["margin_applied"] = DEFAULT_FOOTPRINT_MARGIN_MM if self.source == "footprint_extents" else 0.0
+        return report
 
     def nearly_equals(self, other: "BoardGeometry", *, eps: float = 1e-6) -> bool:
         return (abs(self.origin_x - other.origin_x) <= eps and abs(self.origin_y - other.origin_y) <= eps
@@ -616,11 +618,59 @@ def board_bounds(board: BoardInfo) -> Optional[Dict[str, float]]:
     return None if geometry is None else geometry.bounds()
 
 
-def infer_geometry_from_footprints(footprints: Mapping[str, Footprint]) -> BoardGeometry:
-    bounds = footprint_bounds(footprints)
-    return BoardGeometry(bounds["min_x"], bounds["min_y"],
-                         bounds["max_x"] - bounds["min_x"], bounds["max_y"] - bounds["min_y"],
-                         "inferred_from_footprints")
+# Last-resort margin (mm) added around footprint extents when neither board.pln
+# geometry nor an Edge.Cuts rectangle is available. Keeps the inferred board from
+# clipping pads/courtyards and guarantees a non-zero size for valid footprints.
+DEFAULT_FOOTPRINT_MARGIN_MM = 5.0
+
+
+def _footprint_abs_bbox(fp: Footprint) -> BBox:
+    """Absolute-coordinate bounding box for a single footprint.
+
+    Uses the footprint's parsed pad/graphic extents when available; if no bbox
+    can be parsed, falls back to the footprint at-position as a zero-size point so
+    a board with a single placed part still yields a sane extent after margin.
+    """
+
+    local = _parse_fp_local_bbox(fp)
+    if local is not None:
+        return _transform_local_bbox(local, fp.x, fp.y, fp.rot)
+    return BBox(fp.x, fp.y, fp.x, fp.y)
+
+
+def footprint_extents_bounds(footprints: Mapping[str, Footprint]) -> Dict[str, float]:
+    """Min/max over footprint *bounding boxes* (not just at-positions)."""
+
+    if not footprints:
+        return {"min_x": 0.0, "min_y": 0.0, "max_x": 0.0, "max_y": 0.0}
+    boxes = [_footprint_abs_bbox(fp) for fp in footprints.values()]
+    return {
+        "min_x": min(b.min_x for b in boxes),
+        "min_y": min(b.min_y for b in boxes),
+        "max_x": max(b.max_x for b in boxes),
+        "max_y": max(b.max_y for b in boxes),
+    }
+
+
+def infer_geometry_from_footprints(footprints: Mapping[str, Footprint],
+                                   *, margin: float = DEFAULT_FOOTPRINT_MARGIN_MM) -> BoardGeometry:
+    """Last-resort board geometry from footprint extents.
+
+    Uses footprint bounding boxes (with a per-footprint at-position fallback) plus
+    a fixed margin so valid footprints never collapse to a zero-size board. This is
+    a low-confidence fallback: callers should warn and ask the user to review.
+    """
+
+    bounds = footprint_extents_bounds(footprints)
+    if not footprints:
+        # Nothing to infer from: stay invalid (zero size) so callers reject it with
+        # a clear, sourced error instead of inventing a 2*margin square board.
+        return BoardGeometry(bounds["min_x"], bounds["min_y"], 0.0, 0.0, "footprint_extents")
+    margin = max(0.0, float(margin))
+    width = bounds["max_x"] - bounds["min_x"] + 2.0 * margin
+    height = bounds["max_y"] - bounds["min_y"] + 2.0 * margin
+    return BoardGeometry(bounds["min_x"] - margin, bounds["min_y"] - margin,
+                         width, height, "footprint_extents")
 
 
 def _normalize_ref(ref: str) -> str:
@@ -949,7 +999,9 @@ def load_ppl(path: Path) -> PlacementModel:
         if kwargs:
             raise PlacementError(f"Board() unknown parameter(s): {', '.join(sorted(kwargs))}")
         if float(width) <= 0 or float(height) <= 0:
-            raise PlacementError("Board(width=..., height=...) dimensions must be positive")
+            raise PlacementError(f"invalid board geometry: width={_fmt_num(float(width))} "
+                                 f"height={_fmt_num(float(height))} source=placement_file "
+                                 "(Board(width=..., height=...) dimensions must be positive)")
         if origin_x is not None or origin_y is not None:
             base_x, base_y = _as_point(origin, field="origin")
             origin = (base_x if origin_x is None else float(origin_x),
@@ -4251,13 +4303,17 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
         return "warn" if any(r in degraded for r in refs) else base
 
     geometry = engine.board_geometry
-    if geometry is not None and geometry.source != "inferred_from_footprints":
+    if geometry is not None:
         if geometry.width <= 0 or geometry.height <= 0:
-            messages.append(Message("error", "Board geometry dimensions must be positive"))
-        for ref in sorted(engine.updates):
-            x, y, _rot = engine.positions[ref]
-            if not geometry.contains(x, y) and not allow_outside_board:
-                messages.append(Message(_level(ref), f"{ref!r} is outside Board geometry ({geometry.source}): x={_fmt_num(x)} y={_fmt_num(y)}"))
+            # Non-positive dimensions are always invalid, even for the low-confidence
+            # footprint_extents fallback (e.g. a board with no parseable footprints).
+            messages.append(Message("error", f"invalid board geometry: width={_fmt_num(geometry.width)} "
+                                              f"height={_fmt_num(geometry.height)} source={geometry.source}"))
+        elif geometry.source != "footprint_extents":
+            for ref in sorted(engine.updates):
+                x, y, _rot = engine.positions[ref]
+                if not geometry.contains(x, y) and not allow_outside_board:
+                    messages.append(Message(_level(ref), f"{ref!r} is outside Board geometry ({geometry.source}): x={_fmt_num(x)} y={_fmt_num(y)}"))
 
     # Near-coincident origins are usually accidental overlaps in generated placements.
     # Limit this initial check to footprints touched by this run; otherwise an
@@ -5196,7 +5252,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise PlacementError("Could not infer origin: no Edge.Cuts, Board(...), or footprint bounds available")
         model.board.origin = (inferred_geometry.origin_x, inferred_geometry.origin_y)
         source_label = {"edge_cuts": "edge_cuts", "placement_file": "board_definition",
-                        "inferred_from_footprints": "footprint_bounds_fallback"}.get(inferred_geometry.source, inferred_geometry.source)
+                        "footprint_extents": "footprint_bounds_fallback"}.get(inferred_geometry.source, inferred_geometry.source)
         print(f"origin source: {source_label}")
         print(f"origin: inferred origin_x={_fmt_num(model.board.origin_x)} origin_y={_fmt_num(model.board.origin_y)}")
     run_validation = bool(args.validate or args.check)

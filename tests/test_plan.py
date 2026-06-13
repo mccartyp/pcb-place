@@ -681,7 +681,7 @@ def test_pcb_plan_emit_omits_outline_for_inferred_geometry(tmp_path):
     board_path.write_text(_LOW_CONFIDENCE_BOARD, encoding="utf-8")
     board, components, nets, warnings = pcb_plan.parse_board(board_path)
     plan = pcb_plan.generate_plan(board, components, nets, {}, pcb_plan.AliasDiagnostics(), {}, warnings)
-    assert plan.board.source == "inferred_from_footprints"
+    assert plan.board.source == "footprint_extents"
     ppl = pcb_plan.emit_ppl(plan, board_path, None)
     assert "emit_outline=False" in ppl
     assert "emit_outline=True" not in ppl
@@ -701,6 +701,121 @@ def test_pcb_plan_emit_allow_low_confidence_override(tmp_path):
     assert result.returncode == 0
     assert out.exists()
     assert "# Plan confidence: low" in out.read_text()
+
+
+# Two coincident footprints (both at 10,10) regressed to a zero-size board because
+# the old fallback used only footprint at-positions, not their bounding boxes.
+_COINCIDENT_FOOTPRINT_BOARD = '''(kicad_pcb (version 20240108) (generator "pcb-plan-test")
+  (footprint "Resistor_SMD:R_0402" (layer "F.Cu")
+    (at 10 10 0)
+    (property "Reference" "R1" (at 0 0 0))
+    (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu"))
+    (pad "2" smd rect (at 0.5 0) (size 0.5 0.5) (layers "F.Cu"))
+  )
+  (footprint "Resistor_SMD:R_0402" (layer "F.Cu")
+    (at 10 10 0)
+    (property "Reference" "R2" (at 0 0 0))
+    (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu"))
+    (pad "2" smd rect (at 0.5 0) (size 0.5 0.5) (layers "F.Cu"))
+  )
+)
+'''
+
+
+def test_plan_init_width_height_integer_cli(tmp_path):
+    # pcb-plan init must accept --width/--height and treat integers as valid.
+    board_path = tmp_path / "layout.kicad_pcb"
+    board_path.write_text(_LOW_CONFIDENCE_BOARD, encoding="utf-8")
+    pln = tmp_path / "board.pln"
+    subprocess.run(
+        [sys.executable, str(PLAN_CLI), "init", "--board", str(board_path),
+         "--width", "75", "--height", "75", "-o", str(pln)],
+        check=True, capture_output=True, text=True,
+    )
+    plain = pcb_plan.unwrap_provenance(pcb_plan.load_intent(pln))
+    assert plain["board"]["width"] == 75
+    assert plain["board"]["height"] == 75
+
+
+def test_pln_integer_width_height_accepted(tmp_path):
+    pln = tmp_path / "board.pln"
+    pln.write_text("board:\n  width: 75\n  height: 75\n  origin_x: 0\n  origin_y: 0\n", encoding="utf-8")
+    payload = pcb_plan.load_pln(pln)
+    assert payload["board"]["width"] == 75
+    assert payload["board"]["height"] == 75
+    assert pcb_plan.validate_pln(payload) == []
+
+
+def test_pcb_place_board_integer_dimensions_accepted(tmp_path):
+    from pcb_place import load_ppl
+    ppl = tmp_path / "p.ppl"
+    ppl.write_text("Board(width=75, height=75)\n", encoding="utf-8")
+    model = load_ppl(ppl)
+    assert model.board.width == 75.0
+    assert model.board.height == 75.0
+
+
+def test_footprint_fallback_nonzero_for_valid_footprints(tmp_path):
+    board_path = tmp_path / "layout.kicad_pcb"
+    board_path.write_text(_COINCIDENT_FOOTPRINT_BOARD, encoding="utf-8")
+    board, _components, _nets, warnings = pcb_plan.parse_board(board_path)
+    assert board.source == "footprint_extents"
+    assert board.width > 0 and board.height > 0
+    # The 5 mm default margin is applied on every side.
+    assert board.width >= 2 * pcb_plan.DEFAULT_FOOTPRINT_MARGIN_MM
+    assert any("footprint extents" in w for w in warnings)
+
+
+def test_zero_geometry_fails_with_sourced_message():
+    from pcb_place import BoardGeometry, PlacementError
+    try:
+        pcb_plan._validate_board_geometry(BoardGeometry(0, 0, 0, 0, "footprint_extents"))
+    except PlacementError as exc:
+        assert str(exc) == "invalid board geometry: width=0 height=0 source=footprint_extents"
+    else:
+        raise AssertionError("expected PlacementError for zero geometry")
+
+
+def test_empty_footprints_stay_invalid(tmp_path):
+    # With no parseable footprints there is nothing to infer from; the margin must
+    # not fabricate a board. Geometry stays zero-size and is rejected with a
+    # clear, sourced message rather than producing a 10x10 board.
+    from pcb_place import infer_geometry_from_footprints, PlacementError
+    geom = infer_geometry_from_footprints({})
+    assert geom.source == "footprint_extents"
+    assert geom.width == 0 and geom.height == 0
+    board_path = tmp_path / "empty.kicad_pcb"
+    board_path.write_text("(kicad_pcb (version 20240108) (generator \"t\"))\n", encoding="utf-8")
+    try:
+        pcb_plan._load_plan_from_inputs(board_path, None, None)
+    except PlacementError as exc:
+        assert "invalid board geometry" in str(exc)
+        assert "source=footprint_extents" in str(exc)
+    else:
+        raise AssertionError("expected PlacementError for empty footprints")
+
+
+def test_cli_geometry_overrides_footprint_extents(tmp_path):
+    board_path = tmp_path / "layout.kicad_pcb"
+    board_path.write_text(_COINCIDENT_FOOTPRINT_BOARD, encoding="utf-8")
+    plan, _ = pcb_plan._load_plan_from_inputs(
+        board_path, None, None, board_override={"width": 75.0, "height": 75.0, "origin_x": 0.0, "origin_y": 0.0})
+    assert plan.board.source == "cli"
+    assert plan.board.width == 75.0
+    assert plan.board.height == 75.0
+    payload = pcb_plan.report(plan)
+    assert payload["board_geometry"]["source"] == "cli"
+    assert payload["board_geometry"]["width"] == 75.0
+
+
+def test_report_includes_geometry_source(tmp_path):
+    board_path = tmp_path / "layout.kicad_pcb"
+    board_path.write_text(_COINCIDENT_FOOTPRINT_BOARD, encoding="utf-8")
+    plan, _ = pcb_plan._load_plan_from_inputs(board_path, None, None)
+    geom = pcb_plan.report(plan)["board_geometry"]
+    assert geom["source"] == "footprint_extents"
+    assert geom["margin_applied"] == pcb_plan.DEFAULT_FOOTPRINT_MARGIN_MM
+    assert set(geom) == {"source", "width", "height", "origin_x", "origin_y", "margin_applied"}
 
 
 def _plan_component(ref, x, y, role, nets, pad_count=None):
