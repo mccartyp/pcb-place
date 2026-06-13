@@ -29,21 +29,6 @@ Current scope:
 * Parses Keepout() and Corridor() rules and reports them for review.
 * Does not yet emit KiCad keepout zones, drawings, tracks, vias, or locked flags.
 
-Floorplanning model:
-
-pcb-place behaves like a constraint-driven iterative floorplanner rather than a
-set of independent placement primitives. By default (best_effort) a component
-that cannot place legally triggers a reflow ladder — repack the array, repack
-nearby movable support parts, then move a movable parent — and is only parked
-(left in place with a degraded-placement warning and a quality penalty) as a
-last resort. Placement never aborts in this mode; only --strict / --fail-fast
-restore the legacy abort-on-first-failure behaviour. A global optimizer iterates
-place -> score -> reflow -> place, keeping the best-scoring floorplan, and the
-report's `floorplan` section records the quality score, reflow attempts, moved
-parents/support parts, parking, and a congestion map. Mechanical constraints
-(locked parts, edge-required connectors, mounting holes) are authoritative and
-never moved by reflow.
-
 Security note:
 
 The .ppl file is executed in a restricted namespace containing only DSL
@@ -67,7 +52,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-__version__ = "0.14.0"
+__version__ = "0.13.0"
 
 Number = float | int
 Point = Tuple[float, float]
@@ -80,18 +65,6 @@ Point = Tuple[float, float]
 
 class PlacementError(RuntimeError):
     """Raised for invalid DSL input, invalid KiCad input, or failed placement."""
-
-
-class PlacementUnsatisfiable(PlacementError):
-    """Raised when a primitive cannot find a legal position for its components.
-
-    Distinct from a configuration error (missing footprint, unknown pad, unknown
-    side): a PlacementUnsatisfiable means the *geometry/constraints* could not be
-    satisfied here and now. In best-effort mode the floorplanner treats this as
-    evidence that the local floorplan is suboptimal and responds by reflowing
-    nearby objects rather than aborting. Only strict / fail-fast mode lets it
-    propagate.
-    """
 
 
 @dataclasses.dataclass(frozen=True)
@@ -344,6 +317,104 @@ class SearchOutcome:
 
 
 @dataclasses.dataclass
+class ReflowAttempt:
+    """A record of one reflow attempt triggered by a local placement failure.
+
+    The floorplanner treats a local placement failure as evidence that the
+    surrounding floorplan is suboptimal, not that the component is at fault.
+    Each attempt records which level of the reflow ladder was reached, what was
+    moved, and whether the conflict was resolved.
+    """
+
+    trigger_ref: str
+    why: str
+    level: int
+    strategy: str
+    moved_components: List[str] = dataclasses.field(default_factory=list)
+    moved_parents: List[str] = dataclasses.field(default_factory=list)
+    score_before: Optional[float] = None
+    score_after: Optional[float] = None
+    resolved: bool = False
+
+    @property
+    def score_delta(self) -> Optional[float]:
+        if self.score_before is None or self.score_after is None:
+            return None
+        return round(self.score_after - self.score_before, 6)
+
+    def as_report(self) -> Dict[str, Any]:
+        return {
+            "trigger_ref": self.trigger_ref,
+            "why": self.why,
+            "level": self.level,
+            "strategy": self.strategy,
+            "moved_components": list(self.moved_components),
+            "moved_parents": list(self.moved_parents),
+            "score_before": None if self.score_before is None else round(self.score_before, 6),
+            "score_after": None if self.score_after is None else round(self.score_after, 6),
+            "score_delta": self.score_delta,
+            "resolved": self.resolved,
+        }
+
+
+@dataclasses.dataclass
+class ParkedPlacement:
+    """A component the floorplanner could not place legally after reflow.
+
+    Parking is the last resort.  The component is still placed (at its best
+    effort position) so downstream tools have a coordinate, but it is flagged as
+    degraded and carries a quality penalty plus a review-required marker.
+    """
+
+    ref: str
+    why: str
+    reason: str
+    x: float
+    y: float
+    penalty: float
+    review_required: bool = True
+
+    def as_report(self) -> Dict[str, Any]:
+        return {
+            "ref": self.ref,
+            "why": self.why,
+            "reason": self.reason,
+            "x": round(self.x, 6),
+            "y": round(self.y, 6),
+            "penalty": round(self.penalty, 6),
+            "review_required": self.review_required,
+        }
+
+
+@dataclasses.dataclass
+class ArraySearch:
+    """The outcome of searching for a legal grouped-array layout.
+
+    Separated from committing/parking so the reflow loop can re-run the search
+    after relocating obstacles or nudging a movable parent.
+    """
+
+    refs: List[str]
+    why: str
+    rot: float
+    requested_spacing: float
+    clearance_override: Optional[float]
+    allow_arbitrary_rotation: bool
+    succeeded: Optional[List[Tuple[float, float]]]
+    chosen_attempt: Optional[Dict[str, Any]]
+    attempts: List[Dict[str, Any]]
+    side_origin: Point
+    sides: List[str]
+    region: Optional[BBox]
+    parent_ref: Optional[str]
+    parent_bbox: Optional[BBox]
+    parent_expanded: Optional[BBox]
+    inferred_side: Optional[str]
+    pad_origin: Optional[Point]
+    detail: str = ""
+
+
+@dataclasses.dataclass
 class PlacementUpdate:
     """A requested footprint placement and how its rotation should be written."""
 
@@ -404,7 +475,9 @@ class BoardGeometry:
         return {"min_x": self.min_x, "min_y": self.min_y, "max_x": self.max_x, "max_y": self.max_y}
 
     def as_report(self) -> Dict[str, Any]:
-        return dataclasses.asdict(self) | self.bounds()
+        report = dataclasses.asdict(self) | self.bounds()
+        report["margin_applied"] = DEFAULT_FOOTPRINT_MARGIN_MM if self.source == "footprint_extents" else 0.0
+        return report
 
     def nearly_equals(self, other: "BoardGeometry", *, eps: float = 1e-6) -> bool:
         return (abs(self.origin_x - other.origin_x) <= eps and abs(self.origin_y - other.origin_y) <= eps
@@ -477,7 +550,8 @@ class PlacementModel:
         self.aliases[name] = ref
 
     def region(self, name: str, *, x: Number, y: Number, w: Number, h: Number,
-               role: Optional[str] = None, note: Optional[str] = None, priority: Optional[Number] = None) -> None:
+               role: Optional[str] = None, note: Optional[str] = None, priority: Optional[Number] = None,
+               kind: Optional[str] = None, movable: Optional[bool] = None) -> None:
         if not name:
             raise PlacementError("Region(name, ...) requires a non-empty name")
         if w <= 0 or h <= 0:
@@ -485,6 +559,10 @@ class PlacementModel:
         self.regions[name] = {
             "name": name, "x": float(x), "y": float(y), "w": float(w), "h": float(h),
             "role": role, "note": note, "priority": None if priority is None else float(priority),
+            # Region typing + a movable flag let the floorplanner decide whether a
+            # region may be reflowed (decoupling/support/power island) or is a hard
+            # keepout it must respect (RF, high-speed corridor, mechanical).
+            "kind": kind, "movable": True if movable is None else bool(movable),
         }
 
 
@@ -540,11 +618,59 @@ def board_bounds(board: BoardInfo) -> Optional[Dict[str, float]]:
     return None if geometry is None else geometry.bounds()
 
 
-def infer_geometry_from_footprints(footprints: Mapping[str, Footprint]) -> BoardGeometry:
-    bounds = footprint_bounds(footprints)
-    return BoardGeometry(bounds["min_x"], bounds["min_y"],
-                         bounds["max_x"] - bounds["min_x"], bounds["max_y"] - bounds["min_y"],
-                         "inferred_from_footprints")
+# Last-resort margin (mm) added around footprint extents when neither board.pln
+# geometry nor an Edge.Cuts rectangle is available. Keeps the inferred board from
+# clipping pads/courtyards and guarantees a non-zero size for valid footprints.
+DEFAULT_FOOTPRINT_MARGIN_MM = 5.0
+
+
+def _footprint_abs_bbox(fp: Footprint) -> BBox:
+    """Absolute-coordinate bounding box for a single footprint.
+
+    Uses the footprint's parsed pad/graphic extents when available; if no bbox
+    can be parsed, falls back to the footprint at-position as a zero-size point so
+    a board with a single placed part still yields a sane extent after margin.
+    """
+
+    local = _parse_fp_local_bbox(fp)
+    if local is not None:
+        return _transform_local_bbox(local, fp.x, fp.y, fp.rot)
+    return BBox(fp.x, fp.y, fp.x, fp.y)
+
+
+def footprint_extents_bounds(footprints: Mapping[str, Footprint]) -> Dict[str, float]:
+    """Min/max over footprint *bounding boxes* (not just at-positions)."""
+
+    if not footprints:
+        return {"min_x": 0.0, "min_y": 0.0, "max_x": 0.0, "max_y": 0.0}
+    boxes = [_footprint_abs_bbox(fp) for fp in footprints.values()]
+    return {
+        "min_x": min(b.min_x for b in boxes),
+        "min_y": min(b.min_y for b in boxes),
+        "max_x": max(b.max_x for b in boxes),
+        "max_y": max(b.max_y for b in boxes),
+    }
+
+
+def infer_geometry_from_footprints(footprints: Mapping[str, Footprint],
+                                   *, margin: float = DEFAULT_FOOTPRINT_MARGIN_MM) -> BoardGeometry:
+    """Last-resort board geometry from footprint extents.
+
+    Uses footprint bounding boxes (with a per-footprint at-position fallback) plus
+    a fixed margin so valid footprints never collapse to a zero-size board. This is
+    a low-confidence fallback: callers should warn and ask the user to review.
+    """
+
+    bounds = footprint_extents_bounds(footprints)
+    if not footprints:
+        # Nothing to infer from: stay invalid (zero size) so callers reject it with
+        # a clear, sourced error instead of inventing a 2*margin square board.
+        return BoardGeometry(bounds["min_x"], bounds["min_y"], 0.0, 0.0, "footprint_extents")
+    margin = max(0.0, float(margin))
+    width = bounds["max_x"] - bounds["min_x"] + 2.0 * margin
+    height = bounds["max_y"] - bounds["min_y"] + 2.0 * margin
+    return BoardGeometry(bounds["min_x"] - margin, bounds["min_y"] - margin,
+                         width, height, "footprint_extents")
 
 
 def _normalize_ref(ref: str) -> str:
@@ -873,7 +999,9 @@ def load_ppl(path: Path) -> PlacementModel:
         if kwargs:
             raise PlacementError(f"Board() unknown parameter(s): {', '.join(sorted(kwargs))}")
         if float(width) <= 0 or float(height) <= 0:
-            raise PlacementError("Board(width=..., height=...) dimensions must be positive")
+            raise PlacementError(f"invalid board geometry: width={_fmt_num(float(width))} "
+                                 f"height={_fmt_num(float(height))} source=placement_file "
+                                 "(Board(width=..., height=...) dimensions must be positive)")
         if origin_x is not None or origin_y is not None:
             base_x, base_y = _as_point(origin, field="origin")
             origin = (base_x if origin_x is None else float(origin_x),
@@ -892,10 +1020,12 @@ def load_ppl(path: Path) -> PlacementModel:
 
     def Region(name: str, *, x: Number, y: Number, w: Number, h: Number,
                role: Optional[str] = None, note: Optional[str] = None,
-               priority: Optional[Number] = None, **kwargs: Any) -> None:
+               priority: Optional[Number] = None, kind: Optional[str] = None,
+               movable: Optional[bool] = None, **kwargs: Any) -> None:
         if kwargs:
             raise PlacementError(f"Region() unknown parameter(s): {', '.join(sorted(kwargs))}")
-        model.region(str(name), x=x, y=y, w=w, h=h, role=role, note=note, priority=priority)
+        model.region(str(name), x=x, y=y, w=w, h=h, role=role, note=note, priority=priority,
+                     kind=kind, movable=movable)
 
     def Spacing(*, default: Number = 0.25, passive_to_passive: Number = 0.25,
                 passive_to_ic: Number = 0.40, ic_to_ic: Number = 0.75,
@@ -2048,23 +2178,17 @@ class PlacementEngine:
         self.footprints = dict(footprints)
         self.model = model
         self.strict = strict
+        # No-abort placement: by default the floorplanner never aborts.  A local
+        # placement failure triggers reflow and, as a last resort, parking.
+        # Only --strict or --fail-fast turn unplaceable components into errors.
+        self.fail_fast = fail_fast
+        self.best_effort = best_effort and not strict and not fail_fast
+        self.max_floorplan_iterations = max(1, int(max_floorplan_iterations))
         self.allow_suffix_match = allow_suffix_match
         self.cardinal_rotations = cardinal_rotations
         self.board_geometry = board_geometry
         self.allow_keepout_overlap = allow_keepout_overlap
         self.allow_outside_region = allow_outside_region
-        # No-abort floorplanning. best_effort reflows and parks rather than
-        # aborting; strict / fail-fast restores the legacy "raise on the first
-        # unsatisfiable primitive" behaviour.
-        self.fail_fast = bool(fail_fast or strict)
-        self.best_effort = bool(best_effort) and not self.fail_fast
-        self.max_floorplan_iterations = max(1, int(max_floorplan_iterations))
-        # Reflow / floorplan audit trail.
-        self.parked: List[Dict[str, Any]] = []
-        self.reflow_log: List[Dict[str, Any]] = []
-        self.moved_parents: List[Dict[str, Any]] = []
-        self.moved_supports: List[Dict[str, Any]] = []
-        self.iteration_scores: List[Dict[str, Any]] = []
         self.messages: List[Message] = []
         self.positions: Dict[str, Tuple[float, float, float]] = {
             ref: (fp.x, fp.y, fp.rot) for ref, fp in self.footprints.items()
@@ -2082,8 +2206,13 @@ class PlacementEngine:
         self.clusters: List[Dict[str, Any]] = []
         self.last_cluster_by_ref: Dict[str, str] = {}
         self.search_log: Dict[str, SearchOutcome] = {}
+        # Floorplanner state: reflow history, parked components, and the
+        # per-iteration score trajectory used by the iterative optimizer.
+        self.reflow_attempts: List[ReflowAttempt] = []
+        self.parked: Dict[str, ParkedPlacement] = {}
+        self.degraded_warnings: List[str] = []
+        self.iteration_scores: List[Dict[str, Any]] = []
         self.allow_body_outside_refs: Set[str] = self._collect_allow_body_outside_refs()
-        self.edge_required_refs: Set[str] = self._collect_edge_required_refs()
         for error in model.alias_diagnostics.errors:
             self.messages.append(Message("error", error))
         for warning in model.alias_diagnostics.warnings:
@@ -2119,33 +2248,6 @@ class PlacementEngine:
                 if actual is not None:
                     allowed.add(actual)
         return allowed
-
-    def _collect_edge_required_refs(self) -> Set[str]:
-        """Refs marked edge_required (connectors that must stay on a board edge).
-
-        Edge-required connectors are a hard mechanical constraint: the
-        floorplanner must never pull them inward for optimization, and reflow
-        must never select them as movable parents or movable support parts.
-        """
-
-        required: Set[str] = set()
-
-        def flagged(spec: Mapping[str, Any]) -> bool:
-            return bool(self._rule_flag(spec, "edge_required", False))
-
-        for rule in self.model.rules:
-            if rule.get("type") == "cluster":
-                placement = rule.get("placement") or {}
-                if isinstance(placement, Mapping) and flagged(placement):
-                    anchor = self.resolve_ref(str(rule.get("anchor")))
-                    if anchor is not None:
-                        required.add(anchor)
-                continue
-            if rule.get("ref") is not None and flagged(rule):
-                actual = self.resolve_ref(str(rule["ref"]))
-                if actual is not None:
-                    required.add(actual)
-        return required
 
     def alias_map(self) -> Dict[str, str]:
         """Return the effective alias map used by the resolver."""
@@ -2262,11 +2364,24 @@ class PlacementEngine:
                                                          region=region,
                                                          allow_keepout_overlap=(self.allow_keepout_overlap or
                                                                                 self._rule_flag(rule, "allow_keepout_overlap", False)))
+            if placed is None and self.best_effort:
+                placed = self._reflow_single(
+                    actual_ref, float(x), float(y), float(new_rot),
+                    clearance_override=clearance_override, region=region,
+                    allow_keepout_overlap=(self.allow_keepout_overlap or
+                                           self._rule_flag(rule, "allow_keepout_overlap", False)),
+                    why=why)
             if placed is None:
                 outcome = self.search_log.get(actual_ref)
-                raise PlacementUnsatisfiable(self._format_search_failure(actual_ref, why, outcome, requested=(float(x), float(y)))
-                                      if outcome is not None else
-                                      f"{actual_ref!r} could not be placed by {why} without violating clearance or board bounds; requested x={_fmt_num(x)} y={_fmt_num(y)}")
+                detail = (self._format_search_failure(actual_ref, why, outcome, requested=(float(x), float(y)))
+                          if outcome is not None else
+                          f"{actual_ref!r} could not be placed by {why} without violating clearance or board bounds; "
+                          f"requested x={_fmt_num(x)} y={_fmt_num(y)}")
+                if not self.best_effort:
+                    raise PlacementError(detail)
+                # No-abort: park at the requested location with a degraded warning.
+                self._park(actual_ref, float(x), float(y), why, reason=detail, penalty=200.0)
+                placed = (float(x), float(y), "parked (best-effort; no legal location after reflow)")
             px, py, reason = placed
             if abs(px - x) > 1e-9 or abs(py - y) > 1e-9:
                 self.auto_adjustments.append(AutoAdjustment(actual_ref, float(x), float(y), px, py, reason))
@@ -2685,6 +2800,31 @@ class PlacementEngine:
         parts.append(f"fallback_used={outcome.fallback_used}")
         return "; ".join(parts)
 
+    def _resolve_unplaceable_search(self, actual_ref: str, why: str, outcome: SearchOutcome,
+                                    requested: Point, rot: Optional[float], *,
+                                    region: Optional[BBox], clearance_override: Optional[float],
+                                    allow_keepout_overlap: bool) -> Tuple[float, float]:
+        """No-abort handling when a single-part candidate search finds nothing.
+
+        Shared by NearPad / Satellite / Between (and their auto-side variants):
+        try a Level-2 reflow that frees movable support near the requested
+        point, otherwise park.  Only strict / fail-fast actually raise.
+        """
+
+        primary_x, primary_y = requested
+        eval_rot = rot if rot is not None else self.positions[actual_ref][2]
+        if self.best_effort:
+            placed = self._reflow_single(actual_ref, primary_x, primary_y, eval_rot,
+                                         clearance_override=clearance_override, region=region,
+                                         allow_keepout_overlap=allow_keepout_overlap, why=why)
+            if placed is not None:
+                return (placed[0], placed[1])
+        detail = self._format_search_failure(actual_ref, why, outcome, requested=requested)
+        if not self.best_effort:
+            raise PlacementError(detail)
+        self._park(actual_ref, primary_x, primary_y, why, reason=detail, penalty=200.0)
+        return (primary_x, primary_y)
+
     def _board_inward_sides(self, x: float, y: float) -> List[str]:
         """Order cardinal sides preferring the direction toward the board interior."""
 
@@ -2857,7 +2997,14 @@ class PlacementEngine:
                                               forbidden_bboxes=forbidden_bboxes)
                 chosen = outcome.chosen
         if chosen is None:
-            raise PlacementUnsatisfiable(self._format_search_failure(actual_ref, why, outcome, requested=(primary_x, primary_y)))
+            px, py = self._resolve_unplaceable_search(
+                actual_ref, why, outcome, (primary_x, primary_y), rot,
+                region=region, clearance_override=clearance_override,
+                allow_keepout_overlap=allow_keepout_overlap)
+            self.place(rule["ref"], px, py, rot, why, rule.get("note"),
+                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
+                       clearance_override=clearance_override, rule=rule)
+            return
 
         self.place(rule["ref"], chosen.x, chosen.y, rot, why, rule.get("note"),
                    allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
@@ -2910,7 +3057,14 @@ class PlacementEngine:
                                               forbidden_bboxes=forbidden_bboxes)
                 chosen = outcome.chosen
         if chosen is None:
-            raise PlacementUnsatisfiable(self._format_search_failure(actual_ref, "satellite", outcome, requested=(primary_x, primary_y)))
+            sx, sy = self._resolve_unplaceable_search(
+                actual_ref, "satellite", outcome, (primary_x, primary_y), rot,
+                region=region, clearance_override=clearance_override,
+                allow_keepout_overlap=allow_keepout_overlap)
+            self.place(rule["ref"], sx, sy, rot, "satellite", rule.get("note"),
+                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
+                       clearance_override=clearance_override, rule=rule)
+            return
 
         self.place(rule["ref"], chosen.x, chosen.y, rot, "satellite", rule.get("note"),
                    allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
@@ -2959,7 +3113,14 @@ class PlacementEngine:
                                               allow_keepout_overlap=allow_keepout_overlap)
                 chosen = outcome.chosen
         if chosen is None:
-            raise PlacementUnsatisfiable(self._format_search_failure(actual_ref, "between", outcome, requested=(primary_x, primary_y)))
+            bx2, by2 = self._resolve_unplaceable_search(
+                actual_ref, "between", outcome, (primary_x, primary_y), rot,
+                region=region, clearance_override=clearance_override,
+                allow_keepout_overlap=allow_keepout_overlap)
+            self.place(rule["ref"], bx2, by2, rot, "between", rule.get("note"),
+                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                       clearance_override=clearance_override, rule=rule)
+            return
 
         self.place(rule["ref"], chosen.x, chosen.y, rot, "between", rule.get("note"),
                    allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
@@ -3204,15 +3365,492 @@ class PlacementEngine:
         return SearchCandidate(anchor[0], anchor[1], label, legal, None if legal else str(result.get("reason")),
                                distance, margin, edge, score, 0.0, 0.0, shape_penalty, hs_penalty, metadata)
 
+    # ------------------------------------------------------------------
+    # Reflow + floorplanning
+    #
+    # A local placement failure is treated as evidence that the surrounding
+    # floorplan is suboptimal, not that the failing component is at fault.  The
+    # reflow ladder progressively relaxes the neighborhood -- relocating movable
+    # support passives, then nudging a movable parent -- before parking as a
+    # last resort.  Mechanical anchors, locked parts, and edge-required
+    # connectors are never moved.
+    # ------------------------------------------------------------------
+
+    def _role_index(self) -> Tuple[Dict[str, str], Set[str]]:
+        """Map each resolved ref to its declared role and collect edge-required refs."""
+
+        cached = getattr(self, "_role_index_cache", None)
+        if cached is not None:
+            return cached
+        roles: Dict[str, str] = {}
+        edge_required: Set[str] = set()
+        for rule in self.model.rules:
+            ref = rule.get("ref")
+            if rule.get("type") == "cluster":
+                ref = rule.get("anchor")
+                placement = rule.get("placement") or {}
+                if isinstance(placement, Mapping) and self._rule_flag(placement, "edge_required", False):
+                    anchor = self.resolve_ref(str(ref)) if ref else None
+                    if anchor is not None:
+                        edge_required.add(anchor)
+                role = rule.get("role")
+                actual = self.resolve_ref(str(ref)) if ref else None
+                if actual is not None and role:
+                    roles.setdefault(actual, str(role))
+                continue
+            if ref is None:
+                continue
+            actual = self.resolve_ref(str(ref))
+            if actual is None:
+                continue
+            role = rule.get("role")
+            if role:
+                roles[actual] = str(role)
+            if self._rule_flag(rule, "edge_required", False):
+                edge_required.add(actual)
+        self._role_index_cache = (roles, edge_required)
+        return self._role_index_cache
+
+    _IMMOVABLE_ROLES = {"mechanical", "connector", "high_speed_connector", "rf", "rf_module", "antenna"}
+
+    def _is_movable_support(self, ref: str) -> bool:
+        """True if ref is a support passive the reflow engine may relocate freely."""
+
+        if ref in self.locked or ref not in self.footprints:
+            return False
+        roles, edge_required = self._role_index()
+        if ref in edge_required:
+            return False
+        if roles.get(ref) in self._IMMOVABLE_ROLES:
+            return False
+        # Movable support: noncritical passives, testpoints, LEDs, pullups, straps.
+        return _part_class_for(self.model, ref) in {"passive", "testpoint"}
+
+    def _parent_movable(self, parent_ref: str) -> bool:
+        """True if a parent may be nudged during reflow (Level 5)."""
+
+        actual = self.resolve_ref(parent_ref) or parent_ref
+        if actual in self.locked or actual not in self.footprints:
+            return False
+        roles, edge_required = self._role_index()
+        if actual in edge_required or roles.get(actual) in {"mechanical", "connector", "high_speed_connector", "rf", "antenna"}:
+            return False
+        # Only move a parent when the floorplan policy explicitly allows anchor
+        # movement, or the parent was marked soft/movable.
+        return bool(self.model.policy.allow_anchor_move) or actual in self.model.soft_refs
+
+    def _snapshot_positions(self) -> Tuple[Dict[str, Tuple[float, float, float]], Dict[str, PlacementUpdate]]:
+        return (dict(self.positions), dict(self.updates))
+
+    def _restore_positions(self, snapshot: Tuple[Dict[str, Tuple[float, float, float]], Dict[str, PlacementUpdate]]) -> None:
+        self.positions = dict(snapshot[0])
+        self.updates = dict(snapshot[1])
+
+    def _cur_bbox(self, ref: str) -> BBox:
+        x, y, rot = self.positions[ref]
+        return footprint_bbox_at(self.footprints[ref], x, y, rot, self.model).bbox
+
+    def _apply_reflow_move(self, ref: str, x: float, y: float, why: str) -> None:
+        """Record a reflow relocation as a placement update (without overlap search)."""
+
+        fp = self.footprints[ref]
+        _, _, rot = self.positions.get(ref, (fp.x, fp.y, fp.rot))
+        self.positions[ref] = (float(x), float(y), float(rot))
+        outside = self.board_geometry is not None and not self.board_geometry.contains(x, y)
+        self.updates[ref] = PlacementUpdate(
+            ref=ref, x=float(x), y=float(y), final_rot=float(rot),
+            write_rot=None if abs(rot - fp.rot) < 1e-9 else float(rot),
+            why=why, note="reflow", original_x=fp.x, original_y=fp.y, original_rot=fp.rot,
+            rotation_changed=abs(fp.rot - rot) > 1e-9, outside_board=outside,
+            delta_x=float(x) - fp.x, delta_y=float(y) - fp.y)
+        self.messages.append(Message("note", f"reflow moved {ref} -> x={_fmt_num(x)} y={_fmt_num(y)}  {why}"))
+
+    def _relocate_out_of(self, ref: str, area: BBox, rot: float) -> Optional[Point]:
+        """Find a legal location for ref whose body no longer overlaps `area`."""
+
+        x, y, _ = self.positions[ref]
+        acx = (area.min_x + area.max_x) / 2.0
+        acy = (area.min_y + area.max_y) / 2.0
+        away = (1.0 if x >= acx else -1.0, 1.0 if y >= acy else -1.0)
+        directions = sorted(
+            [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)],
+            key=lambda v: -(v[0] * away[0] + v[1] * away[1]))
+        step = max(self.model.policy.search_step, 0.25)
+        reach = max(area.width, area.height, 1.0) + self.model.policy.max_search_radius
+        k = 1
+        while k * step <= reach:
+            d = k * step
+            for vx, vy in directions:
+                tx, ty = x + vx * d, y + vy * d
+                fp = self.footprints[ref]
+                bbox = footprint_bbox_at(fp, tx, ty, rot, self.model).bbox
+                if bbox.overlaps(area):
+                    continue
+                if self._collides_at(ref, tx, ty, rot) is None:
+                    return (tx, ty)
+            k += 1
+        return None
+
+    def _free_area(self, area: BBox, exclude: Set[str]) -> List[str]:
+        """Relocate movable support passives whose body overlaps `area`."""
+
+        moved: List[str] = []
+        for ref in sorted(self.positions):
+            if ref in exclude or not self._is_movable_support(ref):
+                continue
+            if not self._cur_bbox(ref).overlaps(area):
+                continue
+            dest = self._relocate_out_of(ref, area, self.positions[ref][2])
+            if dest is not None:
+                self._apply_reflow_move(ref, dest[0], dest[1], "reflow: clear placement region")
+                moved.append(ref)
+        return moved
+
+    def _array_clear_area(self, search: ArraySearch) -> BBox:
+        """The region that must be freed for the array's best candidate to land.
+
+        Targets the footprint area of the best-scoring (but blocked) attempt so
+        reflow relocates exactly the obstructing support parts, rather than
+        clearing the whole neighborhood.
+        """
+
+        best: Optional[Dict[str, Any]] = None
+        for attempt in search.attempts:
+            if attempt.get("candidates") and (best is None or attempt["score"] < best["score"]):
+                best = attempt
+        if best is not None:
+            actual_refs = [self.resolve_ref(r) or r for r in search.refs]
+            boxes = self._array_item_bboxes(actual_refs, best["candidates"], search.rot)
+            union = _union_bbox([b for b in boxes if b is not None])
+            if union is not None:
+                return union.expanded(self.model.clearance.default + 0.5)
+        if search.parent_expanded is not None:
+            return search.parent_expanded
+        if search.region is not None:
+            return search.region
+        sx, sy = search.side_origin
+        reach = max(2.0, search.requested_spacing * max(1, len(search.refs)))
+        return BBox(sx - reach, sy - reach, sx + reach, sy + reach)
+
+    def _reflow_array(self, rule: Mapping[str, Any], origin: Point, search: ArraySearch) -> bool:
+        """Reflow the neighborhood so a failed array can place. Returns True on success."""
+
+        trigger = search.refs[0]
+        why = search.why
+        score_before = self.floorplan_score()["score"]
+        exclude = {self.resolve_ref(r) or r for r in search.refs}
+        if search.parent_ref is not None:
+            exclude.add(self.resolve_ref(search.parent_ref) or search.parent_ref)
+
+        # Levels 2-4: relocate movable support parts out of the placement region.
+        snapshot = self._snapshot_positions()
+        moved = self._free_area(self._array_clear_area(search), exclude)
+        if moved:
+            retry = self._attempt_array_placement(rule, search.refs, origin, why,
+                                                  parent_ref=search.parent_ref, pad_origin=search.pad_origin)
+            if retry.succeeded is not None:
+                self._commit_array(rule, retry)
+                self.reflow_attempts.append(ReflowAttempt(
+                    trigger, why, level=3,
+                    strategy="relocated movable support parts to free the placement region",
+                    moved_components=moved, score_before=score_before,
+                    score_after=self.floorplan_score()["score"], resolved=True))
+                return True
+            self._restore_positions(snapshot)
+
+        # Level 5: nudge a movable parent if policy allows.
+        if search.parent_ref is not None and self._parent_movable(search.parent_ref):
+            parent, retry = self._reflow_move_parent(rule, origin, search)
+            if retry is not None and retry.succeeded is not None:
+                self._commit_array(rule, retry)
+                self.reflow_attempts.append(ReflowAttempt(
+                    trigger, why, level=5, strategy=f"moved movable parent {parent}",
+                    moved_parents=[parent], score_before=score_before,
+                    score_after=self.floorplan_score()["score"], resolved=True))
+                return True
+            # Record that the floorplanner considered (but could not achieve) a
+            # parent move, so "considers moving the parent if allowed" is visible.
+            self.reflow_attempts.append(ReflowAttempt(
+                trigger, why, level=5,
+                strategy=f"considered moving movable parent {parent}; no legal layout found",
+                score_before=score_before, score_after=score_before, resolved=False))
+
+        self.reflow_attempts.append(ReflowAttempt(
+            trigger, why, level=7, strategy="reflow ladder exhausted; parking",
+            score_before=score_before, score_after=score_before, resolved=False))
+        return False
+
+    def _reflow_move_parent(self, rule: Mapping[str, Any], origin: Point,
+                            search: ArraySearch) -> Tuple[str, Optional[ArraySearch]]:
+        parent = self.resolve_ref(search.parent_ref) or str(search.parent_ref)
+        if parent not in self.positions:
+            return parent, None
+        px, py, prot = self.positions[parent]
+        snapshot = self._snapshot_positions()
+        # Bounded trial grid: re-running the full array search per parent
+        # position is expensive, so keep the candidate set small.
+        for vx, vy in [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)]:
+            for d in (2.0, 4.0, 6.0):
+                nx, ny = px + vx * d, py + vy * d
+                if self._collides_at(parent, nx, ny, prot) is not None:
+                    continue
+                self._apply_reflow_move(parent, nx, ny, f"reflow: move parent for {search.why}")
+                new_origin = (origin[0] + (nx - px), origin[1] + (ny - py))
+                new_pad = None if search.pad_origin is None else (search.pad_origin[0] + (nx - px), search.pad_origin[1] + (ny - py))
+                retry = self._attempt_array_placement(rule, search.refs, new_origin, search.why,
+                                                      parent_ref=search.parent_ref, pad_origin=new_pad, quick=True)
+                if retry.succeeded is not None:
+                    return parent, retry
+                self._restore_positions(snapshot)
+        return parent, None
+
+    def _park_array(self, rule: Mapping[str, Any], search: ArraySearch) -> None:
+        """Last-resort parking for an unplaceable array (no-abort behavior)."""
+
+        self._emit_array_side_notes(search)
+        refs = search.refs
+        coords: Optional[List[Tuple[float, float]]] = None
+        failed = [a for a in search.attempts if not a.get("ok") and a.get("candidates")]
+        if failed:
+            best = min(failed, key=lambda a: math.hypot(a["anchor"][0] - search.side_origin[0],
+                                                         a["anchor"][1] - search.side_origin[1]))
+            coords = list(best.get("candidates") or [])
+        if not coords:
+            sx, sy = search.side_origin
+            coords = [(sx + i * max(search.requested_spacing, 1.0), sy) for i in range(len(refs))]
+        for ref, (x, y) in zip(refs, coords):
+            actual = self.resolve_ref(ref) or ref
+            self.place(ref, x, y, search.rot, search.why + " (parked)", rule.get("note"),
+                       allow_arbitrary_rotation=search.allow_arbitrary_rotation, rule=rule)
+            if actual in self.footprints:
+                self.parked[actual] = ParkedPlacement(
+                    ref=actual, why=search.why,
+                    reason="no legal grouped-array layout after reflow", x=float(x), y=float(y),
+                    penalty=250.0)
+        warn = (f"{refs[0]} could not be placed legally by {search.why} after reflow; "
+                f"parked {len(refs)} part(s) at best-effort locations (review required)")
+        self.degraded_warnings.append(warn)
+        self.messages.append(Message("warn", warn))
+
+    def _reflow_single(self, ref: str, x: float, y: float, rot: float, *,
+                       clearance_override: Optional[float], region: Optional[BBox],
+                       allow_keepout_overlap: bool, why: str) -> Optional[Tuple[float, float, str]]:
+        """Relocate movable support parts near (x, y) so a single part can place."""
+
+        fp = self.footprints[ref]
+        area = footprint_bbox_at(fp, x, y, rot, self.model).bbox.expanded(max(1.0, self.model.clearance.default))
+        score_before = self.floorplan_score()["score"]
+        snapshot = self._snapshot_positions()
+        moved = self._free_area(area, exclude={ref})
+        if not moved:
+            return None
+        placed = self._find_non_overlapping_position(ref, x, y, rot, clearance_override=clearance_override,
+                                                     candidate_sides=None, region=region,
+                                                     allow_keepout_overlap=allow_keepout_overlap)
+        if placed is not None:
+            self.reflow_attempts.append(ReflowAttempt(
+                ref, why, level=2, strategy="relocated movable support parts near requested location",
+                moved_components=moved, score_before=score_before,
+                score_after=self.floorplan_score()["score"], resolved=True))
+            return placed
+        self._restore_positions(snapshot)
+        return None
+
+    def _park(self, ref: str, x: float, y: float, why: str, *, reason: str, penalty: float) -> None:
+        self.parked[ref] = ParkedPlacement(ref=ref, why=why, reason=reason, x=float(x), y=float(y), penalty=penalty)
+        warn = (f"{ref} could not be placed legally by {why} after reflow; parked at best-effort "
+                f"location x={_fmt_num(x)} y={_fmt_num(y)} (review required)")
+        self.degraded_warnings.append(warn)
+        self.messages.append(Message("warn", warn))
+
+    # ------------------------------------------------------------------
+    # Global floorplan scoring + iterative optimization
+    # ------------------------------------------------------------------
+
+    def congestion_map(self, *, cells: int = 6) -> Dict[str, Any]:
+        """Coarse occupancy grid over the board used as a congestion proxy."""
+
+        geom = self.board_geometry
+        if geom is not None:
+            min_x, min_y, max_x, max_y = geom.min_x, geom.min_y, geom.max_x, geom.max_y
+        else:
+            b = footprint_bounds({ref: dataclasses.replace(self.footprints[ref], x=self.positions[ref][0], y=self.positions[ref][1])
+                                  for ref in self.updates}) if self.updates else None
+            if not b:
+                return {"cells": cells, "grid": [], "peak": 0, "peak_penalty": 0.0}
+            min_x, min_y, max_x, max_y = b["min_x"], b["min_y"], b["max_x"], b["max_y"]
+        if not all(math.isfinite(v) for v in (min_x, min_y, max_x, max_y)):
+            return {"cells": cells, "grid": [], "peak": 0, "peak_penalty": 0.0}
+        w = max(max_x - min_x, 1e-6)
+        h = max(max_y - min_y, 1e-6)
+        grid = [[0 for _ in range(cells)] for _ in range(cells)]
+        for ref in self.updates:
+            if ref not in self.footprints:
+                continue
+            x, y, _ = self.positions[ref]
+            if not (math.isfinite(x) and math.isfinite(y)):
+                continue
+            cx = min(cells - 1, max(0, int((x - min_x) / w * cells)))
+            cy = min(cells - 1, max(0, int((y - min_y) / h * cells)))
+            grid[cy][cx] += 1
+        counts = [grid[r][c] for r in range(cells) for c in range(cells)]
+        total = sum(counts)
+        cap = max(1, math.ceil(total / max(1, cells * cells)) + 1)
+        peak = max(counts) if counts else 0
+        peak_penalty = float(sum(max(0, c - cap) ** 2 for c in counts))
+        return {"cells": cells, "grid": grid, "capacity_per_cell": cap, "peak": peak,
+                "peak_penalty": round(peak_penalty, 4)}
+
+    def floorplan_score(self) -> Dict[str, Any]:
+        """Aggregate global placement-quality score (lower is better)."""
+
+        collisions, spacing_violations, _ = spacing_analysis(self, refs=list(self.updates))
+        out_of_bounds = sum(1 for ref in self.updates if self.updates[ref].outside_board)
+        parked_penalty = float(sum(p.penalty for p in self.parked.values()))
+        congestion = self.congestion_map()
+        quality = (1000.0 * len(collisions)
+                   + 1000.0 * out_of_bounds
+                   + parked_penalty
+                   + 50.0 * len(spacing_violations)
+                   + congestion["peak_penalty"])
+        return {
+            "score": round(quality, 4),
+            "collisions": len(collisions),
+            "spacing_violations": len(spacing_violations),
+            "out_of_bounds": out_of_bounds,
+            "parked": len(self.parked),
+            "parked_penalty": round(parked_penalty, 4),
+            "congestion_peak": congestion["peak"],
+            "congestion_penalty": congestion["peak_penalty"],
+        }
+
+    def _separate_overlaps(self) -> bool:
+        """Push movable support passives apart to relieve overlaps/congestion."""
+
+        refs = [r for r in sorted(self.updates) if r in self.footprints]
+        moved = False
+        for i, a in enumerate(refs):
+            for b in refs[i + 1:]:
+                if not _same_physical_side(self.footprints[a], self.footprints[b]):
+                    continue
+                ba, bb = self._cur_bbox(a), self._cur_bbox(b)
+                required = self.model.clearance.required_for(_part_class_for(self.model, a), _part_class_for(self.model, b))
+                if not ba.expanded(required).overlaps(bb):
+                    continue
+                target = b if self._is_movable_support(b) else (a if self._is_movable_support(a) else None)
+                if target is None:
+                    continue
+                keep_area = (ba if target == b else bb).expanded(required)
+                dest = self._relocate_out_of(target, keep_area, self.positions[target][2])
+                if dest is not None:
+                    self._apply_reflow_move(target, dest[0], dest[1], "reflow: separate overlap")
+                    moved = True
+        return moved
+
+    def run_floorplan(self) -> None:
+        """Iterative floorplanner: place, score, reflow, re-score until convergence.
+
+        The first pass already performs inline reflow/parking, so subsequent
+        iterations focus on relieving residual overlaps and congestion.  Strict /
+        fail-fast mode runs a single deterministic pass.
+        """
+
+        self.apply()
+        self.iteration_scores.append({"iteration": 0, **self.floorplan_score()})
+        if not self.best_effort:
+            return
+        for iteration in range(1, self.max_floorplan_iterations):
+            prev = self.iteration_scores[-1]
+            if prev["collisions"] == 0 and prev["congestion_penalty"] == 0.0:
+                break
+            improved = self._separate_overlaps()
+            score = self.floorplan_score()
+            self.iteration_scores.append({"iteration": iteration, **score})
+            if not improved or (prev["score"] - score["score"]) < 1e-6:
+                break
+
+    def reflow_report(self) -> Dict[str, Any]:
+        """Structured floorplanner diagnostics for the placement report."""
+
+        return {
+            "best_effort": self.best_effort,
+            "max_iterations": self.max_floorplan_iterations,
+            "iterations": list(self.iteration_scores),
+            "reflow_attempts": [a.as_report() for a in self.reflow_attempts],
+            "moved_components": sorted({m for a in self.reflow_attempts for m in a.moved_components}),
+            "moved_parents": sorted({m for a in self.reflow_attempts for m in a.moved_parents}),
+            "parked": [p.as_report() for p in self.parked.values()],
+            "parking_fallback_used": len(self.parked),
+            "degraded_warnings": list(self.degraded_warnings),
+            "congestion_map": self.congestion_map(),
+            "placement_quality_score": self.floorplan_score(),
+        }
+
     def place_array_near_target(self, rule: Mapping[str, Any], refs: Sequence[str], origin: Point,
                                 why: str, *, parent_ref: Optional[str] = None,
                                 pad_origin: Optional[Point] = None) -> None:
-        """Place an array as a group, using the parent bbox/perimeter for legal anchors."""
+        """Place an array as a group, reflowing the floorplan before giving up.
+
+        A grouped-array placement failure is not treated as a component problem;
+        it is evidence the surrounding floorplan is too tight.  When the local
+        search cannot find a legal layout we (1) reflow nearby movable support
+        parts and a movable parent, then (2) park as a last resort.  Only strict
+        / fail-fast mode aborts.
+        """
+
+        refs = list(refs)
+        if not refs:
+            return
+        search = self._attempt_array_placement(rule, refs, origin, why,
+                                               parent_ref=parent_ref, pad_origin=pad_origin)
+        if search.succeeded is not None:
+            self._commit_array(rule, search)
+            return
+        if not self.best_effort:
+            raise PlacementError(search.detail)
+        if self._reflow_array(rule, origin, search):
+            return
+        self._park_array(rule, search)
+
+    def _commit_array(self, rule: Mapping[str, Any], search: ArraySearch) -> None:
+        """Place every member of a resolved array layout."""
+
+        self._emit_array_side_notes(search)
+        chosen = search.chosen_attempt or {}
+        chosen_spacing = float(chosen.get("spacing", search.requested_spacing))
+        if abs(chosen_spacing - search.requested_spacing) > 1e-9:
+            self.messages.append(Message("note",
+                f"{search.why}: array spacing increased from {_fmt_num(search.requested_spacing)} to "
+                f"{_fmt_num(chosen_spacing)} mm to satisfy clearance rules"))
+        for ref, (x, y) in zip(search.refs, search.succeeded or []):
+            self.place(ref, x, y, search.rot, search.why, rule.get("note"),
+                       allow_arbitrary_rotation=search.allow_arbitrary_rotation,
+                       clearance_override=search.clearance_override, rule=rule)
+
+    def _emit_array_side_notes(self, search: ArraySearch) -> None:
+        rejected_by_side: Set[str] = set()
+        for attempt in search.attempts:
+            if attempt.get("ok") or attempt["side"] in rejected_by_side:
+                continue
+            rejected_by_side.add(attempt["side"])
+            anchor = attempt["anchor"]
+            self.messages.append(Message("note",
+                f"{search.why}: side {attempt['side']!r} (anchor ~ x={_fmt_num(anchor[0])} y={_fmt_num(anchor[1])}, "
+                f"distance={_fmt_num(attempt['distance'])}, shift={_fmt_num(attempt['shift'])}, "
+                f"stagger={attempt['staggered']}) rejected: {attempt.get('failed_ref')!r} {attempt.get('reason')}"))
+
+    def _attempt_array_placement(self, rule: Mapping[str, Any], refs: Sequence[str], origin: Point,
+                                 why: str, *, parent_ref: Optional[str] = None,
+                                 pad_origin: Optional[Point] = None, quick: bool = False) -> ArraySearch:
+        """Search for a legal grouped-array layout without committing or aborting.
+
+        ``quick`` runs a coarse search (single spacing, fewer distances/shifts)
+        used by the reflow loop, where re-running the full ladder per trial would
+        be prohibitively expensive.
+        """
 
         refs = list(refs)
         n = len(refs)
-        if n == 0:
-            return
 
         parent_bbox: Optional[BBox] = None
         parent_expanded: Optional[BBox] = None
@@ -3255,16 +3893,19 @@ class PlacementEngine:
         attempts: List[Dict[str, Any]] = []
         scored_attempts: List[SearchCandidate] = []
         chosen_attempt: Optional[Dict[str, Any]] = None
-        distances = [distance + delta for delta in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0)]
+        distances = ([distance + delta for delta in (0.0, 1.0, 2.0, 3.0)] if quick
+                     else [distance + delta for delta in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0)])
         stagger_options = [False, True] if stagger_requested else [False]
         # If the requested spacing cannot satisfy clearance between array members,
         # escalate spacing rather than failing or placing touching parts.
         requested_spacing = spacing
-        spacing_ladder = [requested_spacing] + [requested_spacing * mult for mult in (1.25, 1.5, 2.0)]
+        spacing_ladder = ([requested_spacing] if quick
+                          else [requested_spacing] + [requested_spacing * mult for mult in (1.25, 1.5, 2.0)])
         for spacing in spacing_ladder:
           if chosen_attempt is not None:
             break
-          shifts = [0.0, spacing / 2.0, -spacing / 2.0, spacing, -spacing, 1.5 * spacing, -1.5 * spacing, 2.0 * spacing, -2.0 * spacing]
+          shifts = ([0.0, spacing, -spacing] if quick else
+                    [0.0, spacing / 2.0, -spacing / 2.0, spacing, -spacing, 1.5 * spacing, -1.5 * spacing, 2.0 * spacing, -2.0 * spacing])
           for dist in distances:
             for side_name in sides:
                 for staggered in stagger_options:
@@ -3323,29 +3964,6 @@ class PlacementEngine:
                 self.search_log[actual] = outcome
         succeeded: Optional[List[Tuple[float, float]]] = None if chosen_attempt is None else list(chosen_attempt["candidates"])
 
-        rejected_by_side: Set[str] = set()
-        for attempt in attempts:
-            if attempt.get("ok") or attempt["side"] in rejected_by_side:
-                continue
-            rejected_by_side.add(attempt["side"])
-            anchor = attempt["anchor"]
-            self.messages.append(Message("note",
-                f"{why}: side {attempt['side']!r} (anchor ~ x={_fmt_num(anchor[0])} y={_fmt_num(anchor[1])}, "
-                f"distance={_fmt_num(attempt['distance'])}, shift={_fmt_num(attempt['shift'])}, "
-                f"stagger={attempt['staggered']}) rejected: {attempt.get('failed_ref')!r} {attempt.get('reason')}"))
-
-        if succeeded is not None:
-            chosen_spacing = float(chosen_attempt.get("spacing", requested_spacing))
-            if abs(chosen_spacing - requested_spacing) > 1e-9:
-                self.messages.append(Message("note",
-                    f"{why}: array spacing increased from {_fmt_num(requested_spacing)} to "
-                    f"{_fmt_num(chosen_spacing)} mm to satisfy clearance rules"))
-            for ref, (x, y) in zip(refs, succeeded):
-                self.place(ref, x, y, rot, why, rule.get("note"),
-                           allow_arbitrary_rotation=allow_arbitrary_rotation,
-                           clearance_override=clearance_override, rule=rule)
-            return
-
         failed = [a for a in attempts if not a.get("ok")]
         best = min(failed, key=lambda a: math.hypot(a["anchor"][0] - side_origin[0], a["anchor"][1] - side_origin[1])) if failed else None
         detail = [f"{refs[0]} could not be placed by {why}"]
@@ -3380,7 +3998,14 @@ class PlacementEngine:
                 b = slide["slid_array_bbox"]
                 detail.append(f"slid_array_bbox: min=({_fmt_num(b['min_x'])}, {_fmt_num(b['min_y'])}) max=({_fmt_num(b['max_x'])}, {_fmt_num(b['max_y'])})")
             detail.append(f"best candidate after slide: side={best['side']} x={_fmt_num(bx)} y={_fmt_num(by)}; rejected: {best.get('failed_ref')!r} {best.get('reason')}")
-        raise PlacementUnsatisfiable("; ".join(detail))
+
+        return ArraySearch(
+            refs=refs, why=why, rot=rot, requested_spacing=requested_spacing,
+            clearance_override=clearance_override, allow_arbitrary_rotation=allow_arbitrary_rotation,
+            succeeded=succeeded, chosen_attempt=chosen_attempt, attempts=attempts,
+            side_origin=side_origin, sides=sides, region=region, parent_ref=parent_ref,
+            parent_bbox=parent_bbox, parent_expanded=parent_expanded, inferred_side=inferred_side,
+            pad_origin=pad_origin, detail="; ".join(detail))
 
     def _place_array_rule(self, rule: Mapping[str, Any], why: str) -> None:
         refs = rule.get("refs") or []
@@ -3485,626 +4110,181 @@ class PlacementEngine:
                        avoid_overlap=True, clearance_override=self._clearance_override(rule), rule=rule)
 
     def apply(self) -> None:
-        """Apply rules in placement-file order, then iterate the floorplan.
-
-        Each rule is dispatched through the reflow ladder: when a primitive
-        cannot satisfy its constraints locally, the floorplanner reflows nearby
-        objects (and, if allowed, the movable parent) before considering
-        parking the component. After the first pass the global floorplan
-        optimizer re-attempts parked / worst constraints across iterations.
-        """
+        """Apply rules in placement-file order."""
 
         for rule_index, rule in enumerate(self.model.rules):
             rule["_index"] = rule_index
             typ = rule["type"]
-            self._guarded_dispatch(rule, typ)
-        self._floorplan_optimize()
-
-    def _dispatch_rule(self, rule: Dict[str, Any], typ: str) -> None:
-        """Apply a single rule (no reflow, no parking — may raise)."""
-
-        if typ in {"anchor", "fixed", "corner", "edge"}:
-            x, y = self._placement_target(rule)
-            rot_spec = rule.get("rot")
-            if typ == "edge" and isinstance(rot_spec, str) and rot_spec.lower() == "auto":
-                rot = access_side_rotation(rule.get("access_side") or rule.get("edge"))
-                if rot is not None:
-                    self.messages.append(Message("note",
-                        f"{rule['ref']} edge rotation auto: access_side={rule.get('access_side') or rule.get('edge')!r} -> rot={_fmt_num(rot)}"))
-            else:
-                rot = self.resolve_rot(rot_spec)
-            self.place(rule["ref"], x, y, rot, typ, rule.get("note"),
-                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule), rule=rule)
-
-        elif typ == "cluster":
-            self.place_cluster(rule)
-
-        elif typ == "lock":
-            self.lock(rule["ref"], rule.get("note") or "Lock rule")
-
-        elif typ == "priority":
-            actual = self.resolve_ref(rule["ref"])
-            if actual is not None:
-                self.model.priority_refs[actual] = float(rule["value"])
-            self.messages.append(Message("note", f"priority {rule['ref']!r}={_fmt_num(rule['value'])}"))
-
-        elif typ == "soft":
-            actual = self.resolve_ref(rule["ref"])
-            if actual is not None:
-                self.model.soft_refs.add(actual)
-            self.messages.append(Message("note", f"soft placement enabled for {rule['ref']!r}"))
-
-        elif typ in {"array", "row", "column"}:
-            self._apply_linear_collection(rule, typ)
-
-        elif typ == "grid":
-            sx, sy = rule["start"]
-            px, py = rule["pitch"]
-            cols = int(rule["columns"])
-            for i, ref in enumerate(rule["refs"]):
-                col = i % cols
-                row = i // cols
-                x, y = _board_to_abs(self.model, sx + col * px, sy + row * py)
-                self.place(ref, x, y,
-                           self.resolve_rot(rule.get("rot")), "grid", rule.get("note"),
-                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
-                           avoid_overlap=True, clearance_override=self._clearance_override(rule), rule=rule)
-
-        elif typ in {"between", "inline"}:
-            a = self.get_pos(rule["a"])
-            b = self.get_pos(rule["b"])
-            if typ == "between":
-                self._place_between(rule, a, b)
-                return
-            x, y = self._placement_target(rule)
-            self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot"), a, b), typ, rule.get("note"),
-                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
-                       avoid_overlap=True, clearance_override=self._clearance_override(rule), rule=rule)
-
-        elif typ == "satellite":
-            px, py = self.get_pos(rule["parent"])
-            side = str(rule.get("side", "right")).lower()
-            if side in ("auto", "inward"):
-                self._place_near_point(rule, (px, py), typ)
-                return
-            if side not in self._SIDE_VECTORS:
-                raise PlacementError(f"Unknown satellite side {side!r}")
-            dist = float(rule.get("distance", 2.0))
-            idx = int(rule.get("index", 0))
-            pitch = float(rule.get("pitch", 1.5))
-            dx = float(rule.get("dx", 0.0))
-            dy = float(rule.get("dy", 0.0))
-            self._place_satellite(rule, px, py, side, dist, idx, pitch, dx, dy)
-
-        elif typ == "near_pad":
-            origin = self._pad_centroid(str(rule["parent"]), rule["pad"])
-            self._place_near_point(rule, origin, "near_pad")
-
-        elif typ in {"decoupling_array", "pullup_array"}:
-            self._place_array_rule(rule, typ)
-
-        elif typ == "orbit":
-            cx, cy = self.get_pos(rule["parent"])
-            radius = float(rule["radius"])
-            start = float(rule["start_angle"])
-            step = float(rule["step_angle"])
-            for i, ref in enumerate(rule["refs"]):
-                theta = math.radians(start + step * i)
-                x = cx + radius * math.cos(theta)
-                y = cy + radius * math.sin(theta)
-                self.place(ref, x, y, self.resolve_rot(rule.get("rot")), "orbit", rule.get("note"),
-                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
-                           avoid_overlap=True, clearance_override=self._clearance_override(rule), rule=rule)
-
-        elif typ == "mirror":
-            sx, sy = self.get_pos(rule["source"])
-            source_rot = self.get_rot(rule["source"])
-            axis = str(rule.get("axis", "vertical")).lower()
-            w, h, ox, oy = _require_board_size(self.model, "Mirror")
-            if rule.get("about") is not None:
-                about = float(rule["about"])
-            elif axis in ("vertical", "x"):
-                about = ox + w / 2.0
-            elif axis in ("horizontal", "y"):
-                about = oy + h / 2.0
-            else:
-                raise PlacementError(f"Unknown mirror axis {axis!r}")
-            if axis in ("vertical", "x"):
-                x, y = about + (about - sx), sy
-            else:
-                x, y = sx, about + (about - sy)
-            self.place(rule["ref"], x, y,
-                       self.resolve_rot(rule.get("rot"), source_rot=source_rot, mirror_axis=axis),
-                       "mirror", rule.get("note"),
-                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule), rule=rule)
-
-        elif typ == "copy_placement":
-            source_prefix = rule["source_prefix"]
-            target_prefix = rule["target_prefix"]
-            dx = float(rule.get("dx", 0.0))
-            dy = float(rule.get("dy", 0.0))
-            selected = rule.get("refs")
-            if selected is None:
-                candidates = list(self.alias_map())
-                suffixes = [alias[len(source_prefix):] for alias in candidates if alias.startswith(source_prefix)]
-            else:
-                suffixes = list(selected)
-            if not suffixes:
-                self._warn_or_raise(f"CopyPlacement found no source refs under {source_prefix!r}")
-                return
-            for suffix in suffixes:
-                src = source_prefix + suffix
-                dst = target_prefix + suffix
-                actual_dst = self.resolve_ref(dst)
-                if actual_dst is None:
-                    self._warn_or_raise(f"missing CopyPlacement target {dst!r}")
-                    continue
-                x, y = self.get_pos(src)
-                source_rot = self.get_rot(src)
-                rot = self.resolve_rot(rule.get("rot"), source_rot=source_rot)
-                self.place(dst, x + dx, y + dy, rot, "copy_placement", rule.get("note"),
+            if typ in {"anchor", "fixed", "corner", "edge"}:
+                x, y = self._placement_target(rule)
+                rot_spec = rule.get("rot")
+                if typ == "edge" and isinstance(rot_spec, str) and rot_spec.lower() == "auto":
+                    rot = access_side_rotation(rule.get("access_side") or rule.get("edge"))
+                    if rot is not None:
+                        self.messages.append(Message("note",
+                            f"{rule['ref']} edge rotation auto: access_side={rule.get('access_side') or rule.get('edge')!r} -> rot={_fmt_num(rot)}"))
+                else:
+                    rot = self.resolve_rot(rot_spec)
+                self.place(rule["ref"], x, y, rot, typ, rule.get("note"),
                            allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule), rule=rule)
 
-        elif typ == "keepout":
-            self.messages.append(Message("note", f"keepout {rule['name']!r}: x={_fmt_num(rule['x'])} "
-                                               f"y={_fmt_num(rule['y'])} w={_fmt_num(rule['w'])} "
-                                               f"h={_fmt_num(rule['h'])} layers={rule['layers']!r} "
-                                               "parsed but not emitted yet"))
-            if rule.get("emit"):
-                self.messages.append(Message("warn", f"keepout {rule['name']!r} emit=True is not implemented yet"))
-        elif typ == "corridor":
-            self.messages.append(Message("note", f"corridor {rule['name']!r}: {rule['a']} -> {rule['b']} "
-                                               f"width={_fmt_num(rule['width'])} "
-                                               f"clearance={_fmt_num(rule['clearance'])} parsed but not emitted yet"))
+            elif typ == "cluster":
+                self.place_cluster(rule)
 
-        elif typ == "high_speed_path":
-            self.messages.append(Message("note", f"high-speed path {rule['name']!r}: "
-                                               f"{' -> '.join(rule['sequence'])} "
-                                               f"corridor_width={_fmt_num(rule['corridor_width'])} (scored in review)"))
+            elif typ == "lock":
+                self.lock(rule["ref"], rule.get("note") or "Lock rule")
 
-        elif typ == "power_island":
-            self.messages.append(Message("note", f"power island {rule['name']!r}: regulator {rule['regulator']} "
-                                               f"(scored in review)"))
+            elif typ == "priority":
+                actual = self.resolve_ref(rule["ref"])
+                if actual is not None:
+                    self.model.priority_refs[actual] = float(rule["value"])
+                self.messages.append(Message("note", f"priority {rule['ref']!r}={_fmt_num(rule['value'])}"))
 
-    # -----------------------------------------------------------------
-    # Reflow-based placement (no-abort floorplanning)
-    # -----------------------------------------------------------------
+            elif typ == "soft":
+                actual = self.resolve_ref(rule["ref"])
+                if actual is not None:
+                    self.model.soft_refs.add(actual)
+                self.messages.append(Message("note", f"soft placement enabled for {rule['ref']!r}"))
 
-    # Component reference prefixes that name low-priority support parts the
-    # floorplanner is allowed to nudge out of the way (Level 2-4 reflow):
-    # test points, LEDs, pull-ups / straps (resistors), and net ties.
-    _SUPPORT_PREFIXES = ("TP", "LED", "DZ", "NT")
-    _PARENT_NUDGES = ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
-                      (1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0))
+            elif typ in {"array", "row", "column"}:
+                self._apply_linear_collection(rule, typ)
 
-    def _guarded_dispatch(self, rule: Dict[str, Any], typ: str) -> None:
-        """Dispatch a rule, reflowing and (last resort) parking on failure.
+            elif typ == "grid":
+                sx, sy = rule["start"]
+                px, py = rule["pitch"]
+                cols = int(rule["columns"])
+                for i, ref in enumerate(rule["refs"]):
+                    col = i % cols
+                    row = i // cols
+                    x, y = _board_to_abs(self.model, sx + col * px, sy + row * py)
+                    self.place(ref, x, y,
+                               self.resolve_rot(rule.get("rot")), "grid", rule.get("note"),
+                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                               avoid_overlap=True, clearance_override=self._clearance_override(rule), rule=rule)
 
-        A PlacementUnsatisfiable means this primitive could not satisfy its
-        constraints against the current floorplan. In best-effort mode that is
-        treated as evidence the floorplan is suboptimal: the reflow ladder gets
-        a chance to move nearby objects before the component is parked. Only
-        fail-fast / strict mode lets the failure propagate (abort).
-        """
-
-        if self.fail_fast or not self.best_effort:
-            self._dispatch_rule(rule, typ)
-            return
-        snapshot = self._snapshot()
-        try:
-            self._dispatch_rule(rule, typ)
-            return
-        except PlacementUnsatisfiable as exc:
-            self._restore(snapshot)
-            if self._reflow_then_retry(rule, typ, str(exc)):
-                return
-            self._restore(snapshot)
-            self._park(rule, typ, str(exc))
-
-    def _snapshot(self) -> Dict[str, Any]:
-        """Capture mutable placement state so a failed reflow can roll back.
-
-        Audit logs (reflow_log, moved_parents, iteration_scores) are append-only
-        and deliberately not part of the snapshot: a rolled-back attempt still
-        leaves a trail of what was tried.
-        """
-
-        return {
-            "positions": dict(self.positions),
-            "updates": {k: dataclasses.replace(v) for k, v in self.updates.items()},
-            "messages": list(self.messages),
-            "applied_priority": dict(self.applied_priority),
-            "applied_rule_index": dict(self.applied_rule_index),
-            "last_cluster_by_ref": dict(self.last_cluster_by_ref),
-            "search_log": dict(self.search_log),
-            "placement_attempts": dict(self.placement_attempts),
-            "auto_adjustments": list(self.auto_adjustments),
-            "parked": list(self.parked),
-        }
-
-    def _restore(self, snapshot: Dict[str, Any]) -> None:
-        self.positions = dict(snapshot["positions"])
-        self.updates = {k: dataclasses.replace(v) for k, v in snapshot["updates"].items()}
-        self.messages = list(snapshot["messages"])
-        self.applied_priority = dict(snapshot["applied_priority"])
-        self.applied_rule_index = dict(snapshot["applied_rule_index"])
-        self.last_cluster_by_ref = dict(snapshot["last_cluster_by_ref"])
-        self.search_log = dict(snapshot["search_log"])
-        self.placement_attempts = dict(snapshot["placement_attempts"])
-        self.auto_adjustments = list(snapshot["auto_adjustments"])
-        self.parked = list(snapshot["parked"])
-
-    def _rule_target_refs(self, rule: Mapping[str, Any]) -> List[str]:
-        refs = rule.get("refs")
-        if refs:
-            return [str(r) for r in refs]
-        if rule.get("ref") is not None:
-            return [str(rule["ref"])]
-        if rule.get("anchor") is not None:
-            return [str(rule["anchor"])]
-        return []
-
-    def _rule_parent(self, rule: Mapping[str, Any], typ: str) -> Optional[str]:
-        if rule.get("parent") is not None:
-            return str(rule["parent"])
-        if typ == "cluster" and rule.get("anchor") is not None:
-            return str(rule["anchor"])
-        return None
-
-    def _failure_origin(self, rule: Mapping[str, Any], typ: str) -> Optional[Point]:
-        parent = self._rule_parent(rule, typ)
-        if parent is not None:
-            actual = self.resolve_ref(parent)
-            if actual is not None and actual in self.positions:
-                px, py, _ = self.positions[actual]
-                return (px, py)
-        for ref in self._rule_target_refs(rule):
-            actual = self.resolve_ref(ref)
-            if actual is not None and actual in self.positions:
-                px, py, _ = self.positions[actual]
-                return (px, py)
-        return None
-
-    def _is_movable(self, ref: str) -> bool:
-        """A ref the floorplanner may relocate during reflow.
-
-        Mechanical constraints are authoritative: locked parts, edge-required
-        connectors, and mechanical anchors (mounting holes) are never movable.
-        """
-
-        actual = self.resolve_ref(ref) or ref
-        if actual not in self.footprints:
-            return False
-        if actual in self.locked or actual in self.edge_required_refs:
-            return False
-        if _part_class_for(self.model, actual) == "mechanical":
-            return False
-        return True
-
-    def _is_support(self, ref: str) -> bool:
-        base = ref.rsplit(".", 1)[-1].rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-        prefix = re.match(r"^[A-Za-z]+", base)
-        if prefix is None:
-            return False
-        head = prefix.group(0).upper()
-        if head in self._SUPPORT_PREFIXES:
-            return True
-        # Resistors are typically pull-ups / straps / series support parts; treat
-        # low-priority resistors as movable support. Capacitors are decouplers we
-        # would rather not scatter, so they are not generic support here.
-        if head == "R" and self.applied_priority.get(ref, 0.0) < 70.0:
-            return True
-        return False
-
-    def _reflow_then_retry(self, rule: Dict[str, Any], typ: str, reason: str) -> bool:
-        """Run the reflow ladder, retrying the rule after each structural move.
-
-        Returns True if the rule placed legally after a reflow. The ladder
-        escalates: repack nearby movable support parts (Level 2-4), then move the
-        movable parent if one exists (Level 5). Level 1 (repack within the array)
-        already happens inside the array primitive itself.
-        """
-
-        refs = self._rule_target_refs(rule)
-        origin = self._failure_origin(rule, typ)
-        parent = self._rule_parent(rule, typ)
-
-        # Level 2-4: relocate nearby movable support parts outward at growing radius.
-        if origin is not None:
-            for radius in (6.0, 10.0, 16.0):
-                attempt = self._snapshot()
-                moved = self._repack_support_near(origin, radius, exclude=set(refs), parent=parent)
-                if not moved:
-                    self._restore(attempt)
+            elif typ in {"between", "inline"}:
+                a = self.get_pos(rule["a"])
+                b = self.get_pos(rule["b"])
+                if typ == "between":
+                    self._place_between(rule, a, b)
                     continue
-                if self._retry_rule(rule, typ):
-                    self.moved_supports.extend(moved)
-                    self.reflow_log.append({
-                        "ref": refs[0] if refs else None, "rule": typ, "level": "2-4",
-                        "action": "repack_support", "radius_mm": radius,
-                        "moved": [m["ref"] for m in moved], "success": True, "reason": reason})
-                    self.messages.append(Message("note",
-                        f"reflow: {typ} for {', '.join(refs)} repacked support parts "
-                        f"{', '.join(m['ref'] for m in moved)} (radius {_fmt_num(radius)} mm) [review-required]"))
-                    return True
-                self._restore(attempt)
+                x, y = self._placement_target(rule)
+                self.place(rule["ref"], x, y, self.resolve_rot(rule.get("rot"), a, b), typ, rule.get("note"),
+                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                           avoid_overlap=True, clearance_override=self._clearance_override(rule), rule=rule)
 
-        # Level 5: move the movable parent and retry (the "move U7" case).
-        if parent is not None and self._is_movable(parent):
-            if self._reflow_move_parent(rule, typ, parent, reason):
-                return True
-
-        return False
-
-    def _retry_rule(self, rule: Dict[str, Any], typ: str) -> bool:
-        try:
-            self._dispatch_rule(rule, typ)
-            return True
-        except PlacementUnsatisfiable:
-            return False
-
-    def _force_place(self, ref: str, x: float, y: float, rot: float, why: str, note: str) -> None:
-        """Move a part as a deliberate reflow decision, bypassing priority guards.
-
-        Used only on movable parts the floorplanner has chosen to relocate; it
-        records a normal PlacementUpdate so the move is written to the board, and
-        keeps the winning priority high so later rules do not silently undo it.
-        """
-
-        if ref not in self.footprints:
-            return
-        fp = self.footprints[ref]
-        outside = self.board_geometry is not None and not self.board_geometry.contains(x, y)
-        self.updates[ref] = PlacementUpdate(
-            ref=ref, x=float(x), y=float(y), final_rot=float(rot), write_rot=float(rot), why=why, note=note,
-            original_x=fp.x, original_y=fp.y, original_rot=fp.rot,
-            rotation_changed=abs(fp.rot - float(rot)) > 1e-9, outside_board=outside,
-            delta_x=float(x) - fp.x, delta_y=float(y) - fp.y,
-        )
-        self.applied_priority[ref] = max(self.applied_priority.get(ref, 0.0), 1000.0)
-        self.positions[ref] = (float(x), float(y), float(rot))
-
-    def _repack_support_near(self, origin: Point, radius: float, *, exclude: Set[str],
-                             parent: Optional[str]) -> List[Dict[str, Any]]:
-        """Push movable support parts away from origin to free local space.
-
-        Returns the list of moved support parts (ref + old/new position). Each
-        part is relocated to the nearest legal position further out along the
-        radial direction from origin, so it stays on the board and clear of the
-        congested neighbourhood.
-        """
-
-        parent_actual = self.resolve_ref(parent) if parent else None
-        exclude_actual = {self.resolve_ref(r) or r for r in exclude}
-        if parent_actual:
-            exclude_actual.add(parent_actual)
-        moved: List[Dict[str, Any]] = []
-        candidates: List[Tuple[float, str]] = []
-        for ref in sorted(self.positions):
-            if ref in exclude_actual or not self._is_movable(ref) or not self._is_support(ref):
-                continue
-            x, y, _ = self.positions[ref]
-            dist = math.hypot(x - origin[0], y - origin[1])
-            if dist <= radius:
-                candidates.append((dist, ref))
-        candidates.sort()
-        for _dist, ref in candidates[:6]:
-            x, y, rot = self.positions[ref]
-            vx, vy = x - origin[0], y - origin[1]
-            norm = math.hypot(vx, vy) or 1.0
-            ux, uy = vx / norm, vy / norm
-            target = (x + ux * 4.0, y + uy * 4.0)
-            spot = self._find_non_overlapping_position(ref, target[0], target[1], rot,
-                                                       clearance_override=None, candidate_sides=None)
-            if spot is None:
-                continue
-            nx, ny, _why = spot
-            if math.hypot(nx - x, ny - y) < 0.05:
-                continue
-            self._force_place(ref, nx, ny, rot, "reflow_support", "moved to free congested region")
-            moved.append({"ref": ref, "from": [round(x, 3), round(y, 3)],
-                          "to": [round(nx, 3), round(ny, 3)]})
-        return moved
-
-    def _reflow_move_parent(self, rule: Dict[str, Any], typ: str, parent: str, reason: str) -> bool:
-        actual = self.resolve_ref(parent) or parent
-        if actual not in self.positions:
-            return False
-        ox, oy, orot = self.positions[actual]
-        # Direction-outer, magnitude-inner: commit to a promising direction and
-        # push the parent further along it before trying the next direction, so a
-        # workable direction succeeds in a couple of retries instead of replaying
-        # every direction at each magnitude (each retry is a full array search).
-        for dx, dy in self._PARENT_NUDGES:
-            for mag in (2.5, 4.0, 5.5):
-                attempt = self._snapshot()
-                nx, ny = ox + dx * mag, oy + dy * mag
-                if self._collides_at(actual, nx, ny, orot) is not None:
-                    self._restore(attempt)
+            elif typ == "satellite":
+                px, py = self.get_pos(rule["parent"])
+                side = str(rule.get("side", "right")).lower()
+                if side in ("auto", "inward"):
+                    self._place_near_point(rule, (px, py), typ)
                     continue
-                self._force_place(actual, nx, ny, orot, "reflow_parent",
-                                  f"moved to satisfy {typ} for {', '.join(self._rule_target_refs(rule))}")
-                if self._retry_rule(rule, typ):
-                    self.moved_parents.append({
-                        "ref": actual, "from": [round(ox, 3), round(oy, 3)],
-                        "to": [round(nx, 3), round(ny, 3)],
-                        "delta": [round(nx - ox, 3), round(ny - oy, 3)],
-                        "for_rule": typ, "reason": reason})
-                    self.reflow_log.append({
-                        "ref": self._rule_target_refs(rule)[0] if self._rule_target_refs(rule) else None,
-                        "rule": typ, "level": "5", "action": "move_parent", "parent": actual,
-                        "delta": [round(nx - ox, 3), round(ny - oy, 3)], "success": True, "reason": reason})
-                    self.messages.append(Message("note",
-                        f"reflow: moved movable parent {actual} by "
-                        f"({_fmt_num(nx - ox)}, {_fmt_num(ny - oy)}) mm to satisfy {typ} "
-                        f"for {', '.join(self._rule_target_refs(rule))} [review-required]"))
-                    return True
-                self._restore(attempt)
-        return False
+                if side not in self._SIDE_VECTORS:
+                    raise PlacementError(f"Unknown satellite side {side!r}")
+                dist = float(rule.get("distance", 2.0))
+                idx = int(rule.get("index", 0))
+                pitch = float(rule.get("pitch", 1.5))
+                dx = float(rule.get("dx", 0.0))
+                dy = float(rule.get("dy", 0.0))
+                self._place_satellite(rule, px, py, side, dist, idx, pitch, dx, dy)
 
-    def _park(self, rule: Dict[str, Any], typ: str, reason: str) -> None:
-        """Park (leave at current position) components that could not place.
+            elif typ == "near_pad":
+                origin = self._pad_centroid(str(rule["parent"]), rule["pad"])
+                self._place_near_point(rule, origin, "near_pad")
 
-        Parking is the last resort. It never aborts: it records a degraded
-        placement warning, a quality penalty, and a review marker so the
-        floorplan can be revisited.
-        """
+            elif typ in {"decoupling_array", "pullup_array"}:
+                self._place_array_rule(rule, typ)
 
-        refs = self._rule_target_refs(rule)
-        for ref in refs:
-            actual = self.resolve_ref(ref) or ref
-            self.parked.append({"ref": actual, "rule": typ, "reason": reason, "_rule": rule, "_typ": typ})
-            self.reflow_log.append({"ref": actual, "rule": typ, "level": "7",
-                                    "action": "park", "success": False, "reason": reason})
-            self.messages.append(Message("warn",
-                f"DEGRADED PLACEMENT: {actual} could not be placed by {typ} after reflow; "
-                f"parked at its current position [review-required]: {reason}"))
+            elif typ == "orbit":
+                cx, cy = self.get_pos(rule["parent"])
+                radius = float(rule["radius"])
+                start = float(rule["start_angle"])
+                step = float(rule["step_angle"])
+                for i, ref in enumerate(rule["refs"]):
+                    theta = math.radians(start + step * i)
+                    x = cx + radius * math.cos(theta)
+                    y = cy + radius * math.sin(theta)
+                    self.place(ref, x, y, self.resolve_rot(rule.get("rot")), "orbit", rule.get("note"),
+                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                               avoid_overlap=True, clearance_override=self._clearance_override(rule), rule=rule)
 
-    # -----------------------------------------------------------------
-    # Global floorplan optimization
-    # -----------------------------------------------------------------
+            elif typ == "mirror":
+                sx, sy = self.get_pos(rule["source"])
+                source_rot = self.get_rot(rule["source"])
+                axis = str(rule.get("axis", "vertical")).lower()
+                w, h, ox, oy = _require_board_size(self.model, "Mirror")
+                if rule.get("about") is not None:
+                    about = float(rule["about"])
+                elif axis in ("vertical", "x"):
+                    about = ox + w / 2.0
+                elif axis in ("horizontal", "y"):
+                    about = oy + h / 2.0
+                else:
+                    raise PlacementError(f"Unknown mirror axis {axis!r}")
+                if axis in ("vertical", "x"):
+                    x, y = about + (about - sx), sy
+                else:
+                    x, y = sx, about + (about - sy)
+                self.place(rule["ref"], x, y,
+                           self.resolve_rot(rule.get("rot"), source_rot=source_rot, mirror_axis=axis),
+                           "mirror", rule.get("note"),
+                           allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule), rule=rule)
 
-    def _floorplan_optimize(self) -> None:
-        """Iterate place -> score -> reflow worst -> place until convergence.
+            elif typ == "copy_placement":
+                source_prefix = rule["source_prefix"]
+                target_prefix = rule["target_prefix"]
+                dx = float(rule.get("dx", 0.0))
+                dy = float(rule.get("dy", 0.0))
+                selected = rule.get("refs")
+                if selected is None:
+                    candidates = list(self.alias_map())
+                    suffixes = [alias[len(source_prefix):] for alias in candidates if alias.startswith(source_prefix)]
+                else:
+                    suffixes = list(selected)
+                if not suffixes:
+                    self._warn_or_raise(f"CopyPlacement found no source refs under {source_prefix!r}")
+                    continue
+                for suffix in suffixes:
+                    src = source_prefix + suffix
+                    dst = target_prefix + suffix
+                    actual_dst = self.resolve_ref(dst)
+                    if actual_dst is None:
+                        self._warn_or_raise(f"missing CopyPlacement target {dst!r}")
+                        continue
+                    x, y = self.get_pos(src)
+                    source_rot = self.get_rot(src)
+                    rot = self.resolve_rot(rule.get("rot"), source_rot=source_rot)
+                    self.place(dst, x + dx, y + dy, rot, "copy_placement", rule.get("note"),
+                               allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule), rule=rule)
 
-        Records a per-iteration quality score so the report can show the score
-        delta trajectory. Stops when no parked components / collisions remain,
-        when an iteration yields no improvement, or at the iteration limit.
-        """
+            elif typ == "keepout":
+                self.messages.append(Message("note", f"keepout {rule['name']!r}: x={_fmt_num(rule['x'])} "
+                                                   f"y={_fmt_num(rule['y'])} w={_fmt_num(rule['w'])} "
+                                                   f"h={_fmt_num(rule['h'])} layers={rule['layers']!r} "
+                                                   "parsed but not emitted yet"))
+                if rule.get("emit"):
+                    self.messages.append(Message("warn", f"keepout {rule['name']!r} emit=True is not implemented yet"))
+            elif typ == "corridor":
+                self.messages.append(Message("note", f"corridor {rule['name']!r}: {rule['a']} -> {rule['b']} "
+                                                   f"width={_fmt_num(rule['width'])} "
+                                                   f"clearance={_fmt_num(rule['clearance'])} parsed but not emitted yet"))
 
-        self.iteration_scores = []
-        if self.fail_fast or not self.best_effort:
-            score = self.placement_quality_score()
-            self.iteration_scores.append({"iteration": 0, **score})
-            return
+            elif typ == "high_speed_path":
+                self.messages.append(Message("note", f"high-speed path {rule['name']!r}: "
+                                                   f"{' -> '.join(rule['sequence'])} "
+                                                   f"corridor_width={_fmt_num(rule['corridor_width'])} (scored in review)"))
 
-        best_snapshot = self._snapshot()
-        best_score = None
-        for iteration in range(self.max_floorplan_iterations):
-            score = self.placement_quality_score()
-            self.iteration_scores.append({"iteration": iteration, **score})
-            if best_score is None or score["total"] < best_score:
-                best_score = score["total"]
-                best_snapshot = self._snapshot()
-            if not self.parked and score["collision_count"] == 0:
-                break
-            if iteration == self.max_floorplan_iterations - 1:
-                break
-            if not self._reflow_worst():
-                break
-        # Adopt the best floorplan seen across iterations.
-        if best_score is not None:
-            self._restore(best_snapshot)
-
-    def _reflow_worst(self) -> bool:
-        """Re-attempt the worst outstanding constraint with full-board context.
-
-        The worst constraints are parked components: with the whole board placed
-        there may now be room (or a movable parent worth nudging) that was not
-        available when the rule first ran. Returns True if anything improved.
-        """
-
-        if not self.parked:
-            return False
-        improved = False
-        for entry in list(self.parked):
-            rule = entry.get("_rule")
-            typ = entry.get("_typ")
-            if rule is None or typ is None:
-                continue
-            snapshot = self._snapshot()
-            # Drop this park record before retrying so a success clears it.
-            self.parked = [p for p in self.parked if p is not entry]
-            if self._retry_rule(rule, typ) or self._reflow_then_retry(rule, typ, entry["reason"]):
-                improved = True
-                self.reflow_log.append({"ref": entry["ref"], "rule": typ, "level": "global",
-                                        "action": "unpark", "success": True, "reason": entry["reason"]})
-                self.messages.append(Message("note",
-                    f"floorplan iteration recovered {entry['ref']} (previously parked) [review-required]"))
-            else:
-                self._restore(snapshot)
-        return improved
-
-    def placement_quality_score(self) -> Dict[str, Any]:
-        """Aggregate hard/soft constraint penalties into one quality score.
-
-        Lower is better. Parking dominates (a parked part is a real placement
-        gap); collisions and spacing violations follow; then the soft best
-        practice penalties (high-speed, power, congestion). The breakdown is
-        returned so reports can show where score is being lost.
-        """
-
-        collisions, spacing_violations, _bbox = spacing_analysis(self, refs=self.updates)
-        hs_reviews = high_speed_path_review(self)
-        power_reviews = power_island_review(self)
-        congestion = self._congestion_metric()
-
-        hs_penalty = 0.0
-        for review in hs_reviews:
-            hs_penalty += 20.0 * len(review.get("warnings", []))
-            hs_penalty += 15.0 * len(review.get("corridor_intruders", []))
-            hs_penalty += 10.0 * max(0.0, 1.0 - float(review.get("straightness", 1.0)))
-        power_penalty = 0.0
-        for review in power_reviews:
-            power_penalty += 15.0 * len(review.get("warnings", []))
-            sep = review.get("high_speed_separation_mm")
-            if sep is not None and sep < 5.0:
-                power_penalty += (5.0 - float(sep)) * 4.0
-
-        parked_penalty = 1000.0 * len(self.parked)
-        collision_penalty = 50.0 * len(collisions)
-        spacing_penalty = 10.0 * len(spacing_violations)
-        congestion_penalty = congestion["penalty"]
-        total = (parked_penalty + collision_penalty + spacing_penalty +
-                 hs_penalty + power_penalty + congestion_penalty)
-        return {
-            "total": round(total, 3),
-            "parked_count": len(self.parked),
-            "parked_penalty": round(parked_penalty, 3),
-            "collision_count": len(collisions),
-            "collision_penalty": round(collision_penalty, 3),
-            "spacing_violation_count": len(spacing_violations),
-            "spacing_penalty": round(spacing_penalty, 3),
-            "high_speed_penalty": round(hs_penalty, 3),
-            "power_penalty": round(power_penalty, 3),
-            "congestion_penalty": round(congestion_penalty, 3),
-            "utilization": congestion["utilization"],
-        }
-
-    def _congestion_metric(self) -> Dict[str, Any]:
-        """Coarse board-area utilization plus an 8x8 occupancy map."""
-
-        geometry = self.board_geometry
-        placed_refs = [ref for ref in self.positions if ref in self.footprints]
-        total_area = 0.0
-        for ref in placed_refs:
-            x, y, rot = self.positions[ref]
-            if not (math.isfinite(x) and math.isfinite(y)):
-                continue
-            bbox = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model).bbox
-            total_area += bbox.width * bbox.height
-        if geometry is None or geometry.width <= 0 or geometry.height <= 0:
-            return {"utilization": None, "penalty": 0.0, "map": []}
-        board_area = max(geometry.width * geometry.height, 1e-6)
-        utilization = total_area / board_area
-        cols = rows = 8
-        grid = [[0 for _ in range(cols)] for _ in range(rows)]
-        for ref in placed_refs:
-            x, y, _ = self.positions[ref]
-            if not (math.isfinite(x) and math.isfinite(y)):
-                continue
-            cx = min(cols - 1, max(0, int((x - geometry.min_x) / geometry.width * cols)))
-            cy = min(rows - 1, max(0, int((y - geometry.min_y) / geometry.height * rows)))
-            grid[cy][cx] += 1
-        penalty = max(0.0, utilization - 0.6) * 100.0
-        return {"utilization": round(utilization, 4), "penalty": round(penalty, 3), "map": grid}
+            elif typ == "power_island":
+                self.messages.append(Message("note", f"power island {rule['name']!r}: regulator {rule['regulator']} "
+                                                   f"(scored in review)"))
 
 
 def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
                         allow_overlap: bool = False, warn_overlap: bool = False,
                         allow_outside_board: bool = False,
                         allow_keepout_overlap: bool = False,
-                        allow_outside_region: bool = False) -> List[Message]:
+                        allow_outside_region: bool = False,
+                        degraded_refs: Optional[Set[str]] = None) -> List[Message]:
     """Run lightweight, CI-friendly placement validation.
 
     KiCad footprints can have complex outlines.  This first validator uses
@@ -4115,14 +4295,25 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
     """
 
     messages: List[Message] = []
+    # Parked (degraded) footprints are already reported as no-abort warnings; do
+    # not let them re-trip fatal validation in best-effort mode.
+    degraded = degraded_refs or set()
+
+    def _level(*refs: str, base: str = "error") -> str:
+        return "warn" if any(r in degraded for r in refs) else base
+
     geometry = engine.board_geometry
-    if geometry is not None and geometry.source != "inferred_from_footprints":
+    if geometry is not None:
         if geometry.width <= 0 or geometry.height <= 0:
-            messages.append(Message("error", "Board geometry dimensions must be positive"))
-        for ref in sorted(engine.updates):
-            x, y, _rot = engine.positions[ref]
-            if not geometry.contains(x, y) and not allow_outside_board:
-                messages.append(Message("error", f"{ref!r} is outside Board geometry ({geometry.source}): x={_fmt_num(x)} y={_fmt_num(y)}"))
+            # Non-positive dimensions are always invalid, even for the low-confidence
+            # footprint_extents fallback (e.g. a board with no parseable footprints).
+            messages.append(Message("error", f"invalid board geometry: width={_fmt_num(geometry.width)} "
+                                              f"height={_fmt_num(geometry.height)} source={geometry.source}"))
+        elif geometry.source != "footprint_extents":
+            for ref in sorted(engine.updates):
+                x, y, _rot = engine.positions[ref]
+                if not geometry.contains(x, y) and not allow_outside_board:
+                    messages.append(Message(_level(ref), f"{ref!r} is outside Board geometry ({geometry.source}): x={_fmt_num(x)} y={_fmt_num(y)}"))
 
     # Near-coincident origins are usually accidental overlaps in generated placements.
     # Limit this initial check to footprints touched by this run; otherwise an
@@ -4134,26 +4325,26 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
         for b in refs[i + 1:]:
             bx, by, _ = engine.positions[b]
             if math.hypot(ax - bx, ay - by) < min_spacing:
-                messages.append(Message("warn" if (allow_overlap or warn_overlap) else "error",
+                messages.append(Message("warn" if (allow_overlap or warn_overlap) else _level(a, b),
                                         f"{a!r} and {b!r} have overlapping/near-coincident origins"))
 
     for item in keepout_violations(engine, refs=engine.updates, allow_keepout_overlap=allow_keepout_overlap):
-        messages.append(Message("error", f"{item['ref']!r} bbox overlaps keepout {item['keepout']!r}"))
+        messages.append(Message(_level(item['ref']), f"{item['ref']!r} bbox overlaps keepout {item['keepout']!r}"))
     for item in region_violations(engine, refs=engine.updates, allow_outside_region=allow_outside_region):
-        messages.append(Message("error", f"{item['ref']!r} bbox is outside region {item['region']!r}"))
+        messages.append(Message(_level(item['ref']), f"{item['ref']!r} bbox is outside region {item['region']!r}"))
 
     collisions, violations, bbox_warnings = spacing_analysis(engine, refs=engine.updates)
     for warning in bbox_warnings:
         messages.append(Message("warn", warning["message"]))
-    overlap_level = "warn" if (allow_overlap or warn_overlap) else "error"
     for item in collisions:
+        overlap_level = "warn" if (allow_overlap or warn_overlap) else _level(item['ref_a'], item['ref_b'])
         messages.append(Message(overlap_level,
             f"ERROR: {item['ref_a']} overlaps {item['ref_b']}\n"
             f"  {item['ref_a']} bbox: {item['bbox_a']}\n"
             f"  {item['ref_b']} bbox: {item['bbox_b']}\n"
             f"  required clearance: {_fmt_num(item['required_clearance'])} mm"))
     for item in violations:
-        level = "warn" if (allow_overlap or warn_overlap) else "error"
+        level = "warn" if (allow_overlap or warn_overlap) else _level(item['ref_a'], item['ref_b'])
         messages.append(Message(level,
             f"{item['ref_a']} and {item['ref_b']} spacing {_fmt_num(item['actual_clearance'])} mm is below "
             f"required {_fmt_num(item['required_clearance'])} mm ({item['class_a']} to {item['class_b']})"))
@@ -4162,8 +4353,11 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
 
 
 def validate_safe_placements(engine: PlacementEngine, *, allow_large_move: bool = False,
-                             allow_outside_board: bool = False) -> List[Message]:
+                             allow_outside_board: bool = False,
+                             degraded_refs: Optional[Set[str]] = None) -> List[Message]:
     """Pre-write safety checks intended to prevent dangerous KiCad output."""
+
+    degraded = degraded_refs or set()
 
     messages: List[Message] = []
     original_bounds = footprint_bounds(engine.footprints)
@@ -4184,14 +4378,18 @@ def validate_safe_placements(engine: PlacementEngine, *, allow_large_move: bool 
             messages.append(Message("error", message.text))
 
     for update in engine.updates.values():
+        # Non-finite coordinates are always fatal (they corrupt KiCad output),
+        # even for parked parts.  Geometric degradations for parked parts are
+        # demoted to warnings so the no-abort default does not abort on write.
+        degraded_level = "warn" if update.ref in degraded else "error"
         if not all(math.isfinite(v) for v in (update.x, update.y, update.final_rot)):
             messages.append(Message("error", f"{update.ref!r} has non-finite placement coordinate or rotation"))
         if update.outside_board and not allow_outside_board:
-            messages.append(Message("error", f"{update.ref!r} would be outside Board bounds at x={_fmt_num(update.x)} y={_fmt_num(update.y)}; use --allow-outside-board to override"))
+            messages.append(Message(degraded_level, f"{update.ref!r} would be outside Board bounds at x={_fmt_num(update.x)} y={_fmt_num(update.y)}; use --allow-outside-board to override"))
         far_x = update.x < safe_bounds["min_x"] - margin_x or update.x > safe_bounds["max_x"] + margin_x
         far_y = update.y < safe_bounds["min_y"] - margin_y or update.y > safe_bounds["max_y"] + margin_y
         if (far_x or far_y) and not allow_large_move:
-            messages.append(Message("error", f"{update.ref!r} would move far outside BoardGeometry bounds; use --allow-large-move to override"))
+            messages.append(Message(degraded_level, f"{update.ref!r} would move far outside BoardGeometry bounds; use --allow-large-move to override"))
     return messages
 
 
@@ -4572,35 +4770,6 @@ def ai_edit_hints_md(report: Mapping[str, Any]) -> str:
         lines.append("- no placements applied")
     lines.append("")
 
-    floorplan = report.get("floorplan", {})
-    lines.append("## Floorplan health")
-    lines.append("")
-    lines.append(f"- placement quality score: {floorplan.get('placement_quality_score', 0)} (lower is better)")
-    lines.append(f"- floorplan iterations run: {floorplan.get('iterations_run', 0)} of "
-                 f"{floorplan.get('max_iterations', 0)} max")
-    if floorplan.get("score_deltas"):
-        lines.append(f"- per-iteration score deltas: {floorplan['score_deltas']}")
-    lines.append(f"- reflow attempts: {floorplan.get('reflow_attempt_count', 0)}; "
-                 f"parents moved: {len(floorplan.get('moved_parents', []))}; "
-                 f"support parts repacked: {len(floorplan.get('moved_components', []))}")
-    for moved in floorplan.get("moved_parents", []):
-        lines.append(f"- [review-required] movable parent {moved['ref']} was reflowed by "
-                     f"{moved['delta']} mm to satisfy {moved['for_rule']}; confirm this is acceptable "
-                     "or Lock() it / pin it with an Anchor().")
-    parked = floorplan.get("parked", [])
-    if parked:
-        lines.append("")
-        lines.append("### Parked components (degraded placement — edit the floorplan, not just the rule)")
-        lines.append("")
-        lines.append("Prefer editing regions, power islands, path definitions, edge-required")
-        lines.append("constraints, stackup, and routing constraints before tweaking individual")
-        lines.append("placement rules. A parked part usually means the surrounding floorplan is")
-        lines.append("over-constrained:")
-        for entry in parked:
-            lines.append(f"- [review-required] {entry['ref']} parked by {entry['rule']}: enlarge its "
-                         "Region(), free space near its parent, or relax spacing for the neighbourhood.")
-    lines.append("")
-
     lines.append("## Uncertain or adjusted placements")
     lines.append("")
     flagged = False
@@ -4616,6 +4785,39 @@ def ai_edit_hints_md(report: Mapping[str, Any]) -> str:
                          "or relaxing spacing for this ref.")
     if not flagged:
         lines.append("- none")
+    lines.append("")
+
+    floorplan = report.get("floorplan", {})
+    quality = floorplan.get("placement_quality_score", {})
+    quality_total = quality.get("score") if isinstance(quality, Mapping) else quality
+    lines.append("## Floorplan health")
+    lines.append("")
+    if quality_total is not None:
+        lines.append(f"- placement quality score: {quality_total:g} (lower is better)")
+    iterations = floorplan.get("iterations", [])
+    lines.append(f"- floorplan iterations run: {len(iterations)} of {floorplan.get('max_iterations', 0)} max")
+    reflow_attempts = floorplan.get("reflow_attempts", [])
+    moved_parents = floorplan.get("moved_parents", [])
+    moved_components = floorplan.get("moved_components", [])
+    lines.append(f"- reflow attempts: {len(reflow_attempts)}; parents moved: {len(moved_parents)}; "
+                 f"support parts repacked: {len(moved_components)}")
+    for ref in moved_parents:
+        lines.append(f"- [review-required] movable parent {ref} was reflowed to satisfy a neighbour; "
+                     "confirm this is acceptable, or Lock() / Anchor() it to pin it down.")
+    parked = floorplan.get("parked", [])
+    if parked:
+        lines.append("")
+        lines.append("### Parked components (degraded placement — edit the floorplan, not just the rule)")
+        lines.append("")
+        lines.append("Prefer editing regions, power islands, path definitions, edge-required")
+        lines.append("constraints, stackup, and routing constraints before tweaking individual")
+        lines.append("placement rules. A parked part usually means the surrounding floorplan is")
+        lines.append("over-constrained:")
+        for entry in parked:
+            reason = entry.get("reason", "no legal location after reflow")
+            lines.append(f"- [review-required] {entry['ref']} parked by {entry.get('why', 'placement')}: "
+                         f"{reason}. Enlarge its Region(), free space near its parent, or relax spacing "
+                         "for the neighbourhood.")
     lines.append("")
 
     lines.append("## Suggested placement.ppl edits")
@@ -4675,14 +4877,19 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
                              allow_outside_region=allow_outside_region,
                              best_effort=best_effort, fail_fast=fail_fast,
                              max_floorplan_iterations=max_floorplan_iterations)
-    engine.apply()
+    engine.run_floorplan()
+    # In no-abort mode, parked footprints are intentionally degraded; their
+    # geometric violations are reported as warnings, not fatal errors.
+    degraded_refs = set(engine.parked)
     collision_messages = validate_placements(engine, allow_overlap=allow_overlap, warn_overlap=warn_overlap,
                                              allow_outside_board=allow_outside_board,
                                              allow_keepout_overlap=allow_keepout_overlap,
-                                             allow_outside_region=allow_outside_region)
+                                             allow_outside_region=allow_outside_region,
+                                             degraded_refs=degraded_refs)
     validation_messages = collision_messages if (validate or safe) else []
     safety_messages = validate_safe_placements(engine, allow_large_move=allow_large_move,
-                                               allow_outside_board=allow_outside_board) if safe else []
+                                               allow_outside_board=allow_outside_board,
+                                               degraded_refs=degraded_refs) if safe else []
     engine.messages.extend(validation_messages)
     if strict and any(m.level == "error" for m in engine.messages):
         raise PlacementError("validation failed: " + "; ".join(m.text for m in engine.messages if m.level == "error"))
@@ -4731,40 +4938,8 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
     hs_reviews = high_speed_path_review(engine)
     power_reviews = power_island_review(engine)
     mech_review = mechanical_review(engine)
-    quality = engine.placement_quality_score()
-    congestion = engine._congestion_metric()
-    hs_path_score = round(sum(20.0 * len(r.get("warnings", [])) +
-                              15.0 * len(r.get("corridor_intruders", [])) +
-                              10.0 * max(0.0, 1.0 - float(r.get("straightness", 1.0)))
-                              for r in hs_reviews), 3)
-    power_island_score = round(sum(15.0 * len(r.get("warnings", [])) for r in power_reviews), 3)
-    parked_public = [{k: v for k, v in p.items() if not k.startswith("_")} for p in engine.parked]
-    floorplan = {
-        "best_effort": engine.best_effort,
-        "fail_fast": engine.fail_fast,
-        "max_iterations": engine.max_floorplan_iterations,
-        "iterations_run": len(engine.iteration_scores),
-        "placement_quality_score": quality["total"],
-        "quality_breakdown": quality,
-        "iteration_scores": engine.iteration_scores,
-        "score_deltas": [round(b["total"] - a["total"], 3)
-                         for a, b in zip(engine.iteration_scores, engine.iteration_scores[1:])],
-        "reflow_attempts": engine.reflow_log,
-        "reflow_attempt_count": len(engine.reflow_log),
-        "moved_components": engine.moved_supports,
-        "moved_parents": engine.moved_parents,
-        "parked": parked_public,
-        "parked_count": len(parked_public),
-        "parking_fallback_used": bool(parked_public),
-        "high_speed_path_score": hs_path_score,
-        "power_island_score": power_island_score,
-        "congestion_map": congestion["map"],
-        "utilization": congestion["utilization"],
-    }
     report = {
         "version": __version__,
-        "floorplan": floorplan,
-        "placement_quality_score": quality["total"],
         "footprints_total": len(footprints),
         "rules_total": len(model.rules),
         "placements_applied": len(engine.updates),
@@ -4784,6 +4959,7 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "high_speed_paths": hs_reviews,
         "power_islands": power_reviews,
         "mechanical_review": mech_review,
+        "floorplan": engine.reflow_report(),
         "spacing_profile": dataclasses.asdict(model.clearance),
         "validation_errors": sum(1 for m in engine.messages if m.level == "error"),
         "board": dataclasses.asdict(model.board) | {"origin_x": model.board.origin_x, "origin_y": model.board.origin_y},
@@ -5024,10 +5200,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validate", action="store_true", help="Run placement validation without writing output")
     parser.add_argument("--check", action="store_true", help="Fail if applying placement would change the input file")
     parser.add_argument("--no-backup", action="store_true", help="Do not write .bak when editing in-place")
-    parser.add_argument("--strict", action="store_true", help="Treat missing/ambiguous refs as errors and abort on the first unsatisfiable placement")
-    parser.add_argument("--fail-fast", dest="fail_fast", action="store_true", help="Abort on the first placement that cannot be satisfied (disables reflow/parking)")
-    parser.add_argument("--no-best-effort", dest="best_effort", action="store_false", default=True, help="Disable no-abort best-effort floorplanning (parked components become errors)")
-    parser.add_argument("--max-floorplan-iterations", dest="max_floorplan_iterations", type=int, default=10, help="Maximum global floorplan optimization iterations (default 10)")
+    parser.add_argument("--strict", action="store_true", help="Treat missing/ambiguous refs and unplaceable parts as errors (disables no-abort)")
+    parser.add_argument("--fail-fast", action="store_true", help="Abort on the first unplaceable component instead of reflowing/parking")
+    parser.add_argument("--best-effort", dest="best_effort", action="store_true", default=True,
+                        help="No-abort floorplanning: reflow then park instead of failing (default)")
+    parser.add_argument("--no-best-effort", dest="best_effort", action="store_false",
+                        help="Disable no-abort floorplanning (equivalent to --fail-fast)")
+    parser.add_argument("--max-floorplan-iterations", type=int, default=10,
+                        help="Maximum iterative floorplan optimization passes (default 10)")
+    parser.add_argument("--floorplan-report", type=Path, metavar="JSON",
+                        help="Write the floorplanner/reflow report as standalone JSON")
     parser.add_argument("--safe", dest="safe", action="store_true", default=True, help="Run pre-write safety checks (default)")
     parser.add_argument("--no-safe", dest="safe", action="store_false", help="Disable pre-write safety checks")
     parser.add_argument("--allow-large-move", action="store_true", help="Allow placements far outside original footprint bounds")
@@ -5103,7 +5285,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise PlacementError("Could not infer origin: no Edge.Cuts, Board(...), or footprint bounds available")
         model.board.origin = (inferred_geometry.origin_x, inferred_geometry.origin_y)
         source_label = {"edge_cuts": "edge_cuts", "placement_file": "board_definition",
-                        "inferred_from_footprints": "footprint_bounds_fallback"}.get(inferred_geometry.source, inferred_geometry.source)
+                        "footprint_extents": "footprint_bounds_fallback"}.get(inferred_geometry.source, inferred_geometry.source)
         print(f"origin source: {source_label}")
         print(f"origin: inferred origin_x={_fmt_num(model.board.origin_x)} origin_y={_fmt_num(model.board.origin_y)}")
     run_validation = bool(args.validate or args.check)
@@ -5118,7 +5300,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                                   warn_overlap=bool(args.warn_overlap),
                                                   allow_keepout_overlap=bool(args.allow_keepout_overlap),
                                                   allow_outside_region=bool(args.allow_outside_region),
-                                                  best_effort=bool(args.best_effort),
+                                                  best_effort=bool(args.best_effort) and not bool(args.fail_fast),
                                                   fail_fast=bool(args.fail_fast),
                                                   max_floorplan_iterations=int(args.max_floorplan_iterations))
     for message in messages:
@@ -5128,6 +5310,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.report_json:
         args.report_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"report: {args.report_json}")
+    if args.floorplan_report:
+        args.floorplan_report.parent.mkdir(parents=True, exist_ok=True)
+        args.floorplan_report.write_text(json.dumps(report.get("floorplan", {}), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"floorplan-report: {args.floorplan_report}")
     for path, text_out in ((args.high_speed_review, lambda: high_speed_review_md(report["high_speed_paths"])),
                            (args.power_review, lambda: power_review_md(report["power_islands"])),
                            (args.mechanical_review, lambda: mechanical_review_md(report["mechanical_review"])),

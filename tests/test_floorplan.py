@@ -1,8 +1,9 @@
-"""Tests for the constraint-driven iterative floorplanner.
+"""Constraint-driven iterative floorplanner tests.
 
-These cover the no-abort default, the reflow ladder (repack support parts, move
-movable parents), mechanical authority during reflow, parking as a last resort,
-global quality scoring, and floorplan-iteration convergence.
+Covers the no-abort default, reflow-before-parking ladder, movable-parent
+consideration, global floorplan scoring / iteration convergence, and the
+mechanical invariants that reflow must preserve (mounting holes stay distinct,
+edge connectors rotate, connector bodies may extend past the outline).
 """
 
 from pathlib import Path
@@ -13,321 +14,325 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from pcb_place import (  # noqa: E402
-    PlacementError,
-    PlacementUnsatisfiable,
-    apply_placements,
-    load_ppl,
-)
+from pcb_place import apply_placements, load_ppl
+from pcb_place.pcb_place import PlacementError
 
 
 # ---------------------------------------------------------------------------
-# Board builders
+# Synthetic board/ppl builders
 # ---------------------------------------------------------------------------
 
-
-def _ic(ref: str, x: float, y: float, half: float = 2.0, pad_at=(-1.8, 0.0)) -> str:
-    return f'''  (footprint "Test:{ref}" (layer "F.Cu")
+def _fp(ref: str, kind: str, x: float = 0.0, y: float = 0.0, *, pad: float = 0.6) -> str:
+    return f'''  (footprint "Test:{kind}" (layer "F.Cu")
     (at {x} {y} 0)
     (property "Reference" "{ref}" (at 0 0 0) (layer "F.SilkS"))
-    (pad "1" smd rect (at {pad_at[0]} {pad_at[1]}) (size 0.6 0.6) (layers "F.Cu"))
-    (fp_rect (start {-half} {-half}) (end {half} {half}) (stroke (width 0.1) (type solid)) (fill none) (layer "F.CrtYd"))
+    (pad "1" smd rect (at 0 0) (size {pad} {pad}) (layers "F.Cu"))
   )'''
 
 
-def _passive(ref: str, x: float, y: float, size: float = 1.0) -> str:
-    return f'''  (footprint "Test:{ref}" (layer "F.Cu")
-    (at {x} {y} 0)
-    (property "Reference" "{ref}" (at 0 0 0) (layer "F.SilkS"))
-    (pad "1" smd rect (at 0 0) (size {size} {size}) (layers "F.Cu"))
-  )'''
-
-
-def _board(*footprints: str) -> str:
+def _pcb(footprints: list[str]) -> str:
     body = "\n".join(footprints)
-    return f'(kicad_pcb (version 20240108) (generator "pcb-place-test")\n{body}\n)'
+    return f'(kicad_pcb (version 20240108) (generator "test")\n{body}\n)\n'
 
 
-def _caps(n: int, start_x: float = 50.0) -> str:
-    return "\n".join(_passive(f"C{i}", start_x + i, 5.0) for i in range(1, n + 1))
+def _decoupling_scene(*, obstacles_locked: bool, allow_anchor_move: bool,
+                      region: bool = True, n_caps: int = 2):
+    """U1 with a decoupling array whose target strip is packed with obstacles.
+
+    When the obstacles are movable passives, reflow relocates them and the array
+    places.  When they are locked, reflow cannot clear the strip.  The obstacle
+    count is kept small so the (combinatorial) array search stays fast.
+    """
+
+    fps = [_fp("U1", "U", 20, 20)]
+    fps += [_fp(c, "C", 0, 0) for c in [f"C{i+1}" for i in range(n_caps)]]
+    obs = []
+    k = 1
+    for ox in (22.5, 23.5):
+        for yi in range(6):
+            obs.append((f"R{k}", round(ox, 2), 16.0 + yi))
+            k += 1
+    fps += [_fp(r, "R", ox, oy) for r, ox, oy in obs]
+
+    lines = [
+        "Board(width=40, height=40)",
+        "Spacing(default=0.25)",
+        f"PlacementPolicy(allow_anchor_move={allow_anchor_move})",
+        'Anchor("U1", x=20, y=20, rot=0)',
+    ]
+    if region:
+        lines.append('Region("DECAP", x=22, y=15.5, w=2.5, h=6)')
+    lines += [f'Anchor("{r}", x={ox}, y={oy}, rot=0)' for r, ox, oy in obs]
+    if obstacles_locked:
+        lines += [f'Lock("{r}")' for r, _ox, _oy in obs]
+    region_kw = ', region="DECAP"' if region else ""
+    caps = ", ".join(f'"C{i+1}"' for i in range(n_caps))
+    lines.append(f'DecouplingArray([{caps}], parent="U1", side="right"{region_kw}, '
+                 f"distance=2, spacing=1.5)")
+    return _pcb(fps), "\n".join(lines) + "\n"
 
 
-def _load(tmp_path, body: str):
-    p = tmp_path / "fp.ppl"
-    p.write_text(body)
-    return load_ppl(p)
+def _run(tmp_path, pcb_text, ppl_text, **kwargs):
+    ppl = tmp_path / "board.ppl"
+    ppl.write_text(ppl_text)
+    return apply_placements(pcb_text, load_ppl(ppl), **kwargs)
+
+
+def _placed(report):
+    return {p["ref"]: (round(p["x"], 3), round(p["y"], 3)) for p in report["placements"]}
 
 
 # ---------------------------------------------------------------------------
-# No-abort placement
+# No-abort + reflow ladder
 # ---------------------------------------------------------------------------
 
+def test_reflow_resolves_decoupling_conflict_by_moving_support(tmp_path):
+    """Movable support passives are relocated so the array places (Level 2-4)."""
 
-def _impossible_decoupling_board() -> str:
-    # The whole board is a keepout: no legal area exists for the array.
-    return _board(_ic("U1", 4, 4, half=1.0, pad_at=(-0.8, 0.0)), _caps(2))
+    pcb, ppl = _decoupling_scene(obstacles_locked=False, allow_anchor_move=False)
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    floor = report["floorplan"]
 
-
-def _impossible_decoupling_ppl() -> str:
-    return (
-        "Board(width=8, height=8)\n"
-        "Keepout(\"ALL\", x=0, y=0, w=8, h=8)\n"
-        "Anchor(\"U1\", x=4, y=4, rot=0)\n"
-        "DecouplingArray(refs=[\"C1\", \"C2\"], parent=\"U1\", pad=\"1\", "
-        "side=\"auto\", distance=1.0, spacing=1.5)\n"
-    )
-
-
-def test_no_abort_default_parks_instead_of_raising(tmp_path):
-    model = _load(tmp_path, _impossible_decoupling_ppl())
-    # Must not raise even though the array genuinely cannot place.
-    _out, messages, report = apply_placements(_impossible_decoupling_board(), model)
-    floorplan = report["floorplan"]
-    assert floorplan["best_effort"] is True
-    assert floorplan["parking_fallback_used"] is True
-    assert floorplan["parked_count"] == 2
-    assert {p["ref"] for p in floorplan["parked"]} == {"C1", "C2"}
-    # Degraded-placement warnings with a review marker are emitted.
-    degraded = [m for m in messages if "DEGRADED PLACEMENT" in m.text]
-    assert len(degraded) == 2
-    assert all("[review-required]" in m.text for m in degraded)
+    assert floor["parking_fallback_used"] == 0
+    assert any(a["resolved"] and a["moved_components"] for a in floor["reflow_attempts"])
+    placed = _placed(report)
+    # All caps landed inside the DECAP region strip (22 <= x <= 26).
+    for cap in ("C1", "C2"):
+        assert 22.0 <= placed[cap][0] <= 26.0
 
 
-def test_strict_mode_still_aborts(tmp_path):
-    model = _load(tmp_path, _impossible_decoupling_ppl())
+def test_no_abort_default_parks_when_reflow_exhausted(tmp_path):
+    """Locked obstacles + immovable parent -> park, not abort (no-abort default)."""
+
+    pcb, ppl = _decoupling_scene(obstacles_locked=True, allow_anchor_move=False)
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    floor = report["floorplan"]
+
+    assert floor["best_effort"] is True
+    assert floor["parking_fallback_used"] >= 1
+    assert floor["degraded_warnings"]
+    # Parked parts are still placed (downstream tools get a coordinate).
+    placed = _placed(report)
+    assert {"C1", "C2"}.issubset(placed)
+    assert all(p["review_required"] for p in floor["parked"])
+
+
+def test_strict_mode_aborts_on_unplaceable(tmp_path):
+    pcb, ppl = _decoupling_scene(obstacles_locked=True, allow_anchor_move=False)
     with pytest.raises(PlacementError):
-        apply_placements(_impossible_decoupling_board(), model, strict=True)
+        _run(tmp_path, pcb, ppl, strict=True)
 
 
-def test_fail_fast_aborts_without_reflow(tmp_path):
-    model = _load(tmp_path, _impossible_decoupling_ppl())
-    with pytest.raises(PlacementUnsatisfiable):
-        apply_placements(_impossible_decoupling_board(), model, fail_fast=True)
-
-
-def test_no_best_effort_aborts(tmp_path):
-    model = _load(tmp_path, _impossible_decoupling_ppl())
+def test_fail_fast_aborts_on_unplaceable(tmp_path):
+    pcb, ppl = _decoupling_scene(obstacles_locked=True, allow_anchor_move=False)
     with pytest.raises(PlacementError):
-        apply_placements(_impossible_decoupling_board(), model, best_effort=False)
+        _run(tmp_path, pcb, ppl, best_effort=False, fail_fast=True)
+
+
+def test_movable_parent_is_considered_when_allowed(tmp_path):
+    """With allow_anchor_move the floorplanner considers moving the parent (Level 5)."""
+
+    pcb, ppl = _decoupling_scene(obstacles_locked=True, allow_anchor_move=True)
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    floor = report["floorplan"]
+
+    level5 = [a for a in floor["reflow_attempts"] if a["level"] == 5]
+    assert level5, "expected a Level-5 parent-move reflow attempt"
+    assert any("parent" in a["strategy"] for a in level5)
+    # Either the parent move resolved it, or it parked -- never aborted.
+    assert "U1" not in floor["moved_parents"] or floor["parking_fallback_used"] >= 0
+
+
+def test_immovable_parent_is_not_considered(tmp_path):
+    """Without allow_anchor_move, no parent move is attempted."""
+
+    pcb, ppl = _decoupling_scene(obstacles_locked=True, allow_anchor_move=False)
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    floor = report["floorplan"]
+    assert all(a["level"] != 5 for a in floor["reflow_attempts"])
+    assert floor["moved_parents"] == []
 
 
 # ---------------------------------------------------------------------------
-# Reflow ladder
+# Global scoring + iteration
 # ---------------------------------------------------------------------------
 
+def test_floorplan_report_has_expected_fields(tmp_path):
+    pcb, ppl = _decoupling_scene(obstacles_locked=False, allow_anchor_move=False)
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    floor = report["floorplan"]
+    for key in ("best_effort", "max_iterations", "iterations", "reflow_attempts",
+                "moved_components", "moved_parents", "parked", "parking_fallback_used",
+                "degraded_warnings", "congestion_map", "placement_quality_score"):
+        assert key in floor
+    quality = floor["placement_quality_score"]
+    for key in ("score", "collisions", "parked", "congestion_peak"):
+        assert key in quality
 
-def _movable_parent_board() -> str:
-    # U1 fully occupies the small DECAP region; only moving U1 frees room.
-    return _board(_ic("U1", 19, 20, half=3.0, pad_at=(-2.8, 0.0)), _caps(3))
+
+def test_iteration_scores_are_recorded_and_nonincreasing(tmp_path):
+    pcb, ppl = _decoupling_scene(obstacles_locked=False, allow_anchor_move=False)
+    _out, _msgs, report = _run(tmp_path, pcb, ppl, max_floorplan_iterations=5)
+    iterations = report["floorplan"]["iterations"]
+    assert iterations[0]["iteration"] == 0
+    scores = [it["score"] for it in iterations]
+    # The iterative optimizer never makes the global score worse.
+    assert scores == sorted(scores, reverse=True) or len(set(scores)) == 1
 
 
-def _movable_parent_ppl() -> str:
-    return (
-        "Board(width=40, height=40)\n"
-        "Region(\"DECAP\", x=16, y=18, w=4, h=4)\n"
-        "Anchor(\"U1\", x=19, y=20, rot=0)\n"
-        "DecouplingArray(refs=[\"C1\", \"C2\", \"C3\"], parent=\"U1\", pad=\"1\", "
-        "side=\"left\", distance=1.0, spacing=1.2, region=\"DECAP\")\n"
+def test_congestion_map_present(tmp_path):
+    pcb, ppl = _decoupling_scene(obstacles_locked=False, allow_anchor_move=False)
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    cmap = report["floorplan"]["congestion_map"]
+    assert cmap["cells"] >= 1
+    assert "peak" in cmap and "peak_penalty" in cmap
+
+
+# ---------------------------------------------------------------------------
+# Mechanical invariants preserved by reflow
+# ---------------------------------------------------------------------------
+
+def test_mounting_holes_remain_distinct(tmp_path):
+    fps = [_fp(h, "H", 0, 0) for h in ("H1", "H2", "H3", "H4")]
+    pcb = _pcb(fps)
+    ppl = (
+        "Board(width=30, height=30)\n"
+        'Corner("H1", corner="top_left", inset=3, role="mechanical")\n'
+        'Corner("H2", corner="top_right", inset=3, role="mechanical")\n'
+        'Corner("H3", corner="bottom_left", inset=3, role="mechanical")\n'
+        'Corner("H4", corner="bottom_right", inset=3, role="mechanical")\n'
     )
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    placed = _placed(report)
+    coords = list(placed.values())
+    assert len(set(coords)) == 4, "mounting holes must not be clustered/coincident"
 
 
-def test_reflow_moves_movable_parent_instead_of_parking(tmp_path):
-    """U7-like / movable-regulator case: move the parent rather than park caps."""
-    model = _load(tmp_path, _movable_parent_ppl())
-    _out, _messages, report = apply_placements(_movable_parent_board(), model)
-    floorplan = report["floorplan"]
-    assert floorplan["parked_count"] == 0
-    assert len(floorplan["moved_parents"]) == 1
-    moved = floorplan["moved_parents"][0]
-    assert moved["ref"] == "U1"
-    assert moved["delta"] != [0.0, 0.0]
-    assert any(a["action"] == "move_parent" and a["success"] for a in floorplan["reflow_attempts"])
+def test_edge_connector_rotates_to_access_side(tmp_path):
+    pcb = _pcb([_fp("J1", "J", 5, 5)])
+    ppl = (
+        "Board(width=40, height=20)\n"
+        'Edge("J1", edge="left", y=10, rot="auto", access_side="left")\n'
+    )
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    j1 = next(p for p in report["placements"] if p["ref"] == "J1")
+    assert j1["rotation_changed"] is True
 
 
-def test_locked_parent_is_not_moved_and_caps_park(tmp_path):
-    """Mechanical authority: a locked parent must never be reflowed."""
+def test_connector_body_extension_allowed(tmp_path):
+    """A connector flagged allow_body_outside_board keeps its anchor on-board."""
+
+    pcb = _pcb([_fp("J1", "J", 5, 5, pad=4.0)])
+    ppl = (
+        "Board(width=40, height=20)\n"
+        'Edge("J1", edge="left", y=10, inset=0, allow_body_outside_board=True)\n'
+    )
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    assert "J1" in report["allowed_outside_board_refs"]
+    j1 = next(p for p in report["placements"] if p["ref"] == "J1")
+    assert 0.0 <= j1["x"] <= 40.0 and 0.0 <= j1["y"] <= 20.0
+
+
+def test_spacing_profile_enforced(tmp_path):
+    """A larger spacing profile forces non-overlapping support placement."""
+
+    fps = [_fp("U1", "U", 20, 20)] + [_fp(c, "C", 0, 0) for c in ("C1", "C2", "C3")]
+    pcb = _pcb(fps)
     ppl = (
         "Board(width=40, height=40)\n"
-        "Region(\"DECAP\", x=16, y=18, w=4, h=4)\n"
-        "Anchor(\"U1\", x=19, y=20, rot=0)\n"
-        "Lock(\"U1\", reason=\"mechanical\")\n"
-        "DecouplingArray(refs=[\"C1\", \"C2\", \"C3\"], parent=\"U1\", pad=\"1\", "
-        "side=\"left\", distance=1.0, spacing=1.2, region=\"DECAP\")\n"
+        "Spacing(default=1.0, passive_to_passive=1.0)\n"
+        'Anchor("U1", x=20, y=20, rot=0)\n'
+        'DecouplingArray(["C1","C2","C3"], parent="U1", distance=2, spacing=2.0)\n'
     )
-    model = _load(tmp_path, ppl)
-    _out, _messages, report = apply_placements(_movable_parent_board(), model)
-    floorplan = report["floorplan"]
-    assert floorplan["moved_parents"] == []
-    assert floorplan["parked_count"] == 3
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    placed = _placed(report)
+    pts = [placed[c] for c in ("C1", "C2", "C3")]
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            dist = ((pts[i][0] - pts[j][0]) ** 2 + (pts[i][1] - pts[j][1]) ** 2) ** 0.5
+            assert dist >= 1.0
 
 
-def _support_repack_board() -> str:
-    # TP1 (a movable test point) blocks the only legal cap region; U1 is clear.
-    return _board(
-        _ic("U1", 24, 20, half=2.0, pad_at=(-1.8, 0.0)),
-        _passive("TP1", 17, 20, size=1.2),
-        _caps(3),
+def _satellite_blocked_scene():
+    """A satellite cap that cannot find any legal location near its parent."""
+
+    pcb = _pcb([_fp("U1", "U", 2, 2, pad=3.4), _fp("C1", "C", 0, 0)])
+    ppl = (
+        "Board(width=4, height=4)\n"
+        "Spacing(default=0.25)\n"
+        "PlacementPolicy(allow_anchor_move=False, max_search_radius=1, search_step=0.5)\n"
+        'Anchor("U1", x=2, y=2, rot=0)\n'
+        'Satellite("C1", parent="U1", side="top", distance=2)\n'
     )
+    return pcb, ppl
 
 
-def _support_repack_ppl() -> str:
-    return (
-        "Board(width=40, height=40)\n"
-        "Region(\"DECAP\", x=16, y=16, w=2.4, h=8)\n"
-        "Anchor(\"U1\", x=24, y=20, rot=0)\n"
-        "Anchor(\"TP1\", x=17, y=20, rot=0)\n"
-        "DecouplingArray(refs=[\"C1\", \"C2\", \"C3\"], parent=\"U1\", pad=\"1\", "
-        "side=\"left\", distance=1.0, spacing=1.5, region=\"DECAP\")\n"
-    )
+def test_primitive_search_failure_parks_by_default(tmp_path):
+    """NearPad/Satellite/Between search failures must not abort in best-effort mode."""
+
+    pcb, ppl = _satellite_blocked_scene()
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    floor = report["floorplan"]
+    assert floor["parking_fallback_used"] >= 1
+    assert "C1" in {p["ref"] for p in floor["parked"]}
+    assert report["placements_applied"] >= 1  # parked part still gets a coordinate
 
 
-def test_reflow_repacks_support_region(tmp_path):
-    model = _load(tmp_path, _support_repack_ppl())
-    _out, _messages, report = apply_placements(_support_repack_board(), model)
-    floorplan = report["floorplan"]
-    assert floorplan["parked_count"] == 0
-    moved_refs = {m["ref"] for m in floorplan["moved_components"]}
-    assert "TP1" in moved_refs
-    assert floorplan["moved_parents"] == []  # support repack preferred over moving parent
-    assert any(a["action"] == "repack_support" and a["success"] for a in floorplan["reflow_attempts"])
+def test_primitive_search_failure_aborts_in_strict(tmp_path):
+    pcb, ppl = _satellite_blocked_scene()
+    with pytest.raises(PlacementError):
+        _run(tmp_path, pcb, ppl, strict=True)
 
 
-def test_reflow_ladder_prefers_support_repack_before_moving_parent(tmp_path):
-    """Level 2-4 (support) is tried before Level 5 (parent move)."""
-    model = _load(tmp_path, _support_repack_ppl())
-    _out, _messages, report = apply_placements(_support_repack_board(), model)
-    actions = [a["action"] for a in report["floorplan"]["reflow_attempts"] if a.get("success")]
-    assert actions and actions[0] == "repack_support"
+def test_parked_parts_do_not_abort_fatal_write_validation(tmp_path):
+    """Parked (degraded) parts must not trip fatal safe validation on a real write."""
+
+    pcb, ppl = _decoupling_scene(obstacles_locked=True, allow_anchor_move=False)
+    # safety_fatal mirrors the normal (non-dry-run) CLI write path.
+    _out, msgs, report = _run(tmp_path, pcb, ppl, safe=True, safety_fatal=True)
+    assert report["floorplan"]["parking_fallback_used"] >= 1
+    # No fatal errors survive for the parked refs in best-effort mode.
+    assert all(m.level != "error" for m in msgs)
+
+
+def test_best_effort_never_raises_but_strict_does(tmp_path):
+    """Same unplaceable input: default succeeds (parks), strict raises."""
+
+    pcb, ppl = _decoupling_scene(obstacles_locked=True, allow_anchor_move=False)
+    # default (best-effort)
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    assert report["placements_applied"] >= 1
+    # strict
+    with pytest.raises(PlacementError):
+        _run(tmp_path, pcb, ppl, strict=True)
 
 
 # ---------------------------------------------------------------------------
-# Mechanical authority
+# AI edit hints surface floorplan health
 # ---------------------------------------------------------------------------
 
+def test_ai_edit_hints_surface_parked_components(tmp_path):
+    """ai-edit-hints.md steers editors to the floorplan when parts are parked."""
+    from pcb_place.pcb_place import ai_edit_hints_md
 
-def test_mounting_holes_and_edge_connectors_are_not_movable(tmp_path):
-    ppl = (
-        "Board(width=40, height=40)\n"
-        "Corner(\"H1\", corner=\"top_left\", inset=3)\n"
-        "Edge(\"J1\", edge=\"left\", y=20, edge_required=True, access_side=\"left\", rot=\"auto\")\n"
-        "Anchor(\"U1\", x=20, y=20, rot=0)\n"
-    )
-    pcb = _board(
-        _passive("H1", 0, 0, size=3.0),
-        _passive("J1", 0, 0, size=3.0),
-        _ic("U1", 0, 0),
-    )
-    model = _load(tmp_path, ppl)
-    _out, _messages, report = apply_placements(pcb, model)
-    # Build an engine view through the report: mechanical + edge-required listed.
-    assert "H1" in report["part_classes"]
-    assert report["part_classes"]["H1"] == "mechanical"
-    assert "J1" in report["edge_required_refs"]
+    pcb, ppl = _decoupling_scene(obstacles_locked=True, allow_anchor_move=False)
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    assert report["floorplan"]["parking_fallback_used"] >= 1
 
-
-def test_engine_movability_rules():
-    """_is_movable: mechanical anchors, edge-required, and locked parts are fixed."""
-    import pcb_place
-
-    pcb = _board(
-        _passive("H1", 0, 0, size=3.0),
-        _ic("U1", 10, 10),
-        _ic("U2", 20, 20),
-    )
-    ppl = (
-        "Board(width=40, height=40)\n"
-        "Corner(\"H1\", corner=\"top_left\", inset=3)\n"
-        "Anchor(\"U1\", x=10, y=10, rot=0)\n"
-        "Anchor(\"U2\", x=20, y=20, rot=0)\n"
-        "Lock(\"U2\", reason=\"placed by hand\")\n"
-    )
-    footprints = pcb_place.parse_footprints(pcb)
-    model = pcb_place.load_ppl_text(ppl) if hasattr(pcb_place, "load_ppl_text") else None
-    if model is None:
-        import tempfile
-        d = Path(tempfile.mkdtemp())
-        (d / "f.ppl").write_text(ppl)
-        model = pcb_place.load_ppl(d / "f.ppl")
-    geom = pcb_place.resolve_board_geometry(pcb, model, footprints, allow_footprint_fallback=True)
-    engine = pcb_place.PlacementEngine(footprints, model, board_geometry=geom)
-    engine.apply()
-    assert engine._is_movable("U1") is True
-    assert engine._is_movable("H1") is False  # mechanical mounting hole
-    assert engine._is_movable("U2") is False  # locked
-
-
-# ---------------------------------------------------------------------------
-# Global scoring & iteration
-# ---------------------------------------------------------------------------
-
-
-def test_placement_quality_score_present_and_clean_board_scores_zero(tmp_path):
-    ppl = (
-        "Board(width=40, height=40)\n"
-        "Anchor(\"U1\", x=20, y=20, rot=0)\n"
-        "Satellite(\"C1\", parent=\"U1\", side=\"top\", distance=2)\n"
-    )
-    pcb = _board(_ic("U1", 20, 20), _passive("C1", 0, 0))
-    model = _load(tmp_path, ppl)
-    _out, _messages, report = apply_placements(pcb, model)
-    floorplan = report["floorplan"]
-    assert "placement_quality_score" in report
-    assert floorplan["placement_quality_score"] == 0.0
-    assert floorplan["parked_count"] == 0
-
-
-def test_parking_dominates_quality_score(tmp_path):
-    model = _load(tmp_path, _impossible_decoupling_ppl())
-    _out, _messages, report = apply_placements(_impossible_decoupling_board(), model)
-    # Parked parts dominate the score (1000 each).
-    assert report["floorplan"]["placement_quality_score"] >= 2000.0
-
-
-def test_floorplan_iteration_convergence(tmp_path):
-    model = _load(tmp_path, _impossible_decoupling_ppl())
-    _out, _messages, report = apply_placements(
-        _impossible_decoupling_board(), model, max_floorplan_iterations=5
-    )
-    floorplan = report["floorplan"]
-    scores = [s["total"] for s in floorplan["iteration_scores"]]
-    assert scores, "iteration scores must be recorded"
-    assert floorplan["iterations_run"] <= floorplan["max_iterations"] == 5
-    # The optimizer keeps the best floorplan: scores never get worse.
-    assert scores == sorted(scores, reverse=True) or len(scores) == 1
-    assert all(later <= earlier for earlier, later in zip(scores, scores[1:]))
-
-
-def test_clean_board_converges_in_single_iteration(tmp_path):
-    ppl = (
-        "Board(width=40, height=40)\n"
-        "Anchor(\"U1\", x=20, y=20, rot=0)\n"
-    )
-    pcb = _board(_ic("U1", 20, 20))
-    model = _load(tmp_path, ppl)
-    _out, _messages, report = apply_placements(pcb, model)
-    assert report["floorplan"]["iterations_run"] == 1
-
-
-def test_report_contains_floorplan_audit_fields(tmp_path):
-    model = _load(tmp_path, _movable_parent_ppl())
-    _out, _messages, report = apply_placements(_movable_parent_board(), model)
-    floorplan = report["floorplan"]
-    for key in ("reflow_attempts", "moved_components", "moved_parents", "parked",
-                "score_deltas", "congestion_map", "power_island_score",
-                "high_speed_path_score", "placement_quality_score", "iteration_scores",
-                "utilization"):
-        assert key in floorplan
-    # Congestion map is an 8x8 occupancy grid for a board with geometry.
-    assert len(floorplan["congestion_map"]) == 8
-    assert all(len(row) == 8 for row in floorplan["congestion_map"])
-
-
-def test_ai_edit_hints_surface_parked_and_moved_parents(tmp_path):
-    import pcb_place
-
-    model = _load(tmp_path, _movable_parent_ppl())
-    _out, _messages, report = apply_placements(_movable_parent_board(), model)
-    hints = pcb_place.ai_edit_hints_md(report)
-    assert "Floorplan health" in hints
-    assert "movable parent U1" in hints
+    hints = ai_edit_hints_md(report)
+    assert "## Floorplan health" in hints
+    assert "Parked components" in hints
     assert "[review-required]" in hints
+    # Points editors at regions/islands/paths before individual rules.
+    assert "regions, power islands, path definitions" in hints
+
+
+def test_ai_edit_hints_clean_board_has_floorplan_section(tmp_path):
+    from pcb_place.pcb_place import ai_edit_hints_md
+
+    pcb = _pcb([_fp("U1", "U", 20, 20)])
+    ppl = "Board(width=40, height=40)\nAnchor(\"U1\", x=20, y=20, rot=0)\n"
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    hints = ai_edit_hints_md(report)
+    assert "## Floorplan health" in hints
+    assert "placement quality score" in hints

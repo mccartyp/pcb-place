@@ -157,10 +157,10 @@ as a hard failure.
   worst constraints, keeping the best-scoring floorplan.
 - **Quality scoring.** The report's `floorplan` section carries
   `placement_quality_score` (lower is better; parking dominates, then
-  collisions/spacing, then high-speed/power/congestion soft penalties),
-  `iteration_scores`, `score_deltas`, `reflow_attempts`, `moved_parents`,
-  `moved_components`, `parked`, `congestion_map`, `high_speed_path_score`, and
-  `power_island_score`.
+  collisions/out-of-bounds/spacing, then congestion), `iterations` (the
+  per-iteration score trajectory), `reflow_attempts` (with per-attempt
+  `score_delta`), `moved_parents`, `moved_components`, `parked`,
+  `parking_fallback_used`, `degraded_warnings`, and `congestion_map`.
 
 Flags:
 
