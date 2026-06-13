@@ -4409,16 +4409,17 @@ class PlacementEngine:
                             if scored.score <= excellent:
                                 self.profiler.incr("candidates_early_accepted")
                                 search_done = True
-                        # Bounding only kicks in once a legal layout exists, so the
-                        # spacing-escalation ladder is never cut short before a legal
-                        # placement is found.  After a legal layout, only a small
-                        # post-legal budget of better-score probing is allowed.
-                        if chosen_attempt is not None:
+                        # Honour the wall-clock budget even before a legal layout
+                        # exists; strict mode must fail promptly and best-effort mode
+                        # keeps the best attempt seen so far.  Candidate-count bounding
+                        # still kicks in only once a legal layout exists, so the spacing
+                        # ladder is not capped prematurely when time remains.
+                        if len(attempts) % 32 == 0 and self.runtime.expired():
+                            self._raise_strict_timeout()
+                            search_done = True
+                        elif chosen_attempt is not None:
                             since_legal = len(attempts) - (attempts_at_first_legal or 0)
                             if len(attempts) >= attempt_cap or since_legal >= post_legal_budget:
-                                search_done = True
-                            elif len(attempts) % 32 == 0 and self.runtime.expired():
-                                self._raise_strict_timeout()
                                 search_done = True
                         if search_done:
                             break

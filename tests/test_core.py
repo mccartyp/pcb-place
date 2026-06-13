@@ -1740,7 +1740,8 @@ Satellite("C1", parent="U1", side="right", distance=0.1, rot=0)
     assert any("parent bbox" in str(reason) or "collision with U1" in str(reason) for reason in rejected_reasons)
 
 
-def test_strict_grouped_array_timeout_raises_mid_search(monkeypatch, tmp_path):
+@pytest.mark.parametrize("candidate_legal", [True, False])
+def test_strict_grouped_array_timeout_raises_mid_search(monkeypatch, tmp_path, candidate_legal):
     ppl = tmp_path / "board.ppl"
     ppl.write_text("Board(width=50, height=30)\n")
     model = load_ppl(ppl)
@@ -1762,7 +1763,7 @@ def test_strict_grouped_array_timeout_raises_mid_search(monkeypatch, tmp_path):
         engine,
         "_score_grouped_array_attempt",
         lambda *args, **kwargs: pcb_place.SearchCandidate(
-            1.0, 1.0, "candidate", True, None, 0.0, None, None, 10.0, 0.0, 0.0, 0.0, 0.0, {}
+            1.0, 1.0, "candidate", candidate_legal, None, 0.0, None, None, 10.0, 0.0, 0.0, 0.0, 0.0, {}
         ),
     )
 
