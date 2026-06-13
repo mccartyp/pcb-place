@@ -1523,6 +1523,17 @@ Cluster("grp", anchor="U1", members=["U1", "C1"], placement=Anchor(x=30, y=10))
     assert report["collisions"] == []
     assert report["auto_adjustments"]
 
+def test_cluster_members_avoid_overlap_by_default(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+PlacementPolicy(avoid_overlap=True, max_search_radius=8, search_step=0.5)
+Cluster("COINCIDENT", anchor="U1", members=["U1", "C1"], placement=Anchor(x=20, y=20))
+''')
+    _out, _messages, report = apply_placements(_coincident_cluster_pcb(), model, strict=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    assert (placements["C1"]["x"], placements["C1"]["y"]) != (placements["U1"]["x"], placements["U1"]["y"])
+    assert report["collisions"] == []
+    assert report["auto_adjustments"]
 
 def test_cluster_places_anchor_before_overlap_search_when_listed_later(tmp_path):
     model = _load_inline(tmp_path, '''

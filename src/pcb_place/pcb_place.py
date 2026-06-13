@@ -2409,6 +2409,7 @@ class PlacementEngine:
                  cardinal_rotations: bool = False, board_geometry: Optional[BoardGeometry] = None,
                  allow_outside_board: bool = False,
                  allow_keepout_overlap: bool = False, allow_outside_region: bool = False,
+                 permissive_overlap: bool = False,
                  best_effort: bool = True, fail_fast: bool = False,
                  max_floorplan_iterations: int = 10,
                  runtime: Optional[RuntimeBudget] = None,
@@ -2436,6 +2437,7 @@ class PlacementEngine:
         self.allow_outside_board = allow_outside_board
         self.allow_keepout_overlap = allow_keepout_overlap
         self.allow_outside_region = allow_outside_region
+        self.permissive_overlap = permissive_overlap
         self.messages: List[Message] = []
         self.positions: Dict[str, Tuple[float, float, float]] = {
             ref: (fp.x, fp.y, fp.rot) for ref, fp in self.footprints.items()
@@ -2876,7 +2878,8 @@ class PlacementEngine:
             new_rot = None if abs(rot_delta) <= 1e-9 else _normalize_rotation(rot + rot_delta)
             avoid_overlap = (
                 actual != anchor_ref and
-                (self._rule_flag(rule.get("placement", {}), "edge_required", False) or
+                ((self.model.policy.avoid_overlap and not self.permissive_overlap) or
+                 self._rule_flag(rule.get("placement", {}), "edge_required", False) or
                  self._rule_flag(rule.get("placement", {}), "locked", False) or
                  self._rule_soft(rule, actual))
             )
@@ -5412,6 +5415,7 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
                              allow_outside_board=allow_outside_board,
                              allow_keepout_overlap=allow_keepout_overlap,
                              allow_outside_region=allow_outside_region,
+                             permissive_overlap=allow_overlap,
                              best_effort=best_effort, fail_fast=fail_fast,
                              max_floorplan_iterations=max_floorplan_iterations or runtime.max_floorplan_iterations,
                              runtime=runtime, progress=progress)
