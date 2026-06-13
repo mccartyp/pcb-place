@@ -199,7 +199,32 @@ If the whole group does not fit together on any side, `pcb-place` emits `note` d
 
 `Keepout(name, x, y, w, h, layers="all", role=None, emit=False)` declares a board-local rectangular exclusion area. Placement validation rejects footprint bounding boxes that overlap keepouts unless `allow_keepout_overlap=True` is supplied globally (`--allow-keepout-overlap`) or on the rule. Collision avoidance also treats keepouts as obstacles. `emit=True` is accepted but currently reports a clear warning rather than writing KiCad keepout graphics.
 
-`Region(name, x, y, w, h, priority=None)` declares a board-local rectangle that a rule can target with `region="NAME"`. A region-constrained placement must keep the footprint bounding box inside that region unless `allow_outside_region=True` is supplied globally (`--allow-outside-region`) or via API. Collision search for that rule is constrained to the region. Use `--print-regions` or `--report-json` to inspect declared regions.
+`Region(name, x, y, w, h, priority=None, kind=None, movable=True)` declares a board-local rectangle that a rule can target with `region="NAME"`. A region-constrained placement must keep the footprint bounding box inside that region unless `allow_outside_region=True` is supplied globally (`--allow-outside-region`) or via API. Collision search for that rule is constrained to the region. `kind` records the region type (`decoupling`, `support`, `power_island`, `high_speed_corridor`, `rf_keepout`, ...) and `movable` records whether the floorplanner may reflow inside it. Use `--print-regions` or `--report-json` to inspect declared regions.
+
+## Iterative floorplanner: reflow and no-abort placement
+
+`pcb-place` runs a constraint-driven iterative floorplanner rather than a single-pass placement engine. A component that cannot be placed locally is treated as evidence that the surrounding floorplan is too tight — not as a component failure. When a primitive (for example a `DecouplingArray`) cannot find a legal layout, the engine climbs a **reflow ladder** before giving up:
+
+1. Repack within the array (spacing, stagger, rows/columns, side change — already part of the grouped-array search).
+2. Relocate movable support passives (caps, pullups, straps, testpoints, LEDs) out of the placement region.
+3. Move a movable parent (only when `PlacementPolicy(allow_anchor_move=True)` or the parent is `soft`).
+4. **Park** as a last resort: the part is still placed at its best-effort location and flagged degraded with a `review_required` marker and a quality penalty.
+
+Mechanical anchors, locked parts, and edge-required connectors are never moved during reflow.
+
+**No-abort is the default.** Placement continues even when an ideal layout is not achievable, producing degraded-placement warnings instead of an error. Pass `--strict` or `--fail-fast` to turn the first unplaceable component into a hard error.
+
+The optimizer places, scores the global floorplan, reflows the worst constraints, and re-scores up to `--max-floorplan-iterations` passes (default 10), stopping early on convergence.
+
+| Flag | Effect |
+| --- | --- |
+| `--best-effort` / `--no-best-effort` | Enable (default) or disable no-abort floorplanning |
+| `--fail-fast` | Abort on the first unplaceable component |
+| `--strict` | Treat ambiguous refs *and* unplaceable parts as errors |
+| `--max-floorplan-iterations N` | Cap iterative optimization passes (default 10) |
+| `--floorplan-report JSON` | Write the standalone floorplanner/reflow report |
+
+The placement report's `floorplan` block records `reflow_attempts` (level, strategy, moved components/parents, score deltas), `parked`/`parking_fallback_used`, `degraded_warnings`, the per-iteration `iterations` score trajectory, a `congestion_map`, and the aggregate `placement_quality_score`.
 
 ### Priority and Soft Placement
 

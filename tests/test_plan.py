@@ -132,7 +132,7 @@ keepouts:
     parsed = pcb_plan.load_intent(intent)
     plan = pcb_plan.generate_plan(board, components, nets, {}, pcb_plan.AliasDiagnostics(), parsed, warnings)
     texts = "\n".join(rule.text for rule in plan.rules)
-    assert 'Region("HIGH_SPEED", x=0, y=0, w=74, h=20)' in texts
+    assert 'Region("HIGH_SPEED", x=0, y=0, w=74, h=20, movable=True)' in texts
     assert 'Keepout("WIFI_ANTENNA"' in texts
     assert plan.roles["U10"] == "hdmi_retimer"
 
