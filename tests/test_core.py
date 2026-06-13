@@ -1495,6 +1495,21 @@ def _cluster_soft_pcb() -> str:
 )'''
 
 
+def _coincident_cluster_pcb() -> str:
+    return '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 20 20 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C" (layer "F.Cu")
+    (at 20 20 0)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+)'''
+
+
 def test_cluster_soft_member_searches_within_cluster_region(tmp_path):
     model = _load_inline(tmp_path, '''
 Board(width=40, height=40)
@@ -1505,6 +1520,21 @@ Cluster("grp", anchor="U1", members=["U1", "C1"], placement=Anchor(x=30, y=10))
     placements = {p["ref"]: p for p in report["placements"]}
     # C1 would land on top of OBS1 at (32, 10); the cluster-local search must move it.
     assert (placements["C1"]["x"], placements["C1"]["y"]) != (32.0, 10.0)
+    assert report["collisions"] == []
+    assert report["auto_adjustments"]
+
+
+def test_cluster_places_anchor_before_overlap_search_when_listed_later(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+PlacementPolicy(avoid_overlap=True, max_search_radius=8, search_step=0.5)
+Cluster("EDGE", anchor="U1", members=["C1", "U1"], placement=Edge(edge="left", y=20, edge_required=True, locked=True))
+''')
+    _out, _messages, report = apply_placements(_coincident_cluster_pcb(), model, strict=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    assert placements["U1"]["why"] == "cluster EDGE"
+    assert placements["C1"]["why"] == "cluster EDGE"
+    assert (placements["C1"]["x"], placements["C1"]["y"]) != (placements["U1"]["x"], placements["U1"]["y"])
     assert report["collisions"] == []
     assert report["auto_adjustments"]
 

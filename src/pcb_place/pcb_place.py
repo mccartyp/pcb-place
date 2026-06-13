@@ -2829,7 +2829,9 @@ class PlacementEngine:
                 continue
             seen_members.add(actual)
             members.append(actual)
-        if anchor_ref not in seen_members:
+        if anchor_ref in seen_members:
+            members = [anchor_ref] + [member for member in members if member != anchor_ref]
+        else:
             members.insert(0, anchor_ref)
         old_anchor = self.get_pos(anchor_ref)
         new_anchor = self._placement_target(rule["placement"])
