@@ -1892,15 +1892,28 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     elif pairs or any(c.role in {"power_regulator", "rf_module"} for c in components.values()):
         h = board.height / 3.0
         regions = {
-            "HIGH_SPEED": {"x": 0, "y": 0, "w": board.width, "h": h},
-            "CONTROL": {"x": 0, "y": h, "w": board.width, "h": h},
-            "POWER": {"x": 0, "y": 2*h, "w": board.width, "h": board.height - 2*h},
+            "HIGH_SPEED": {"x": 0, "y": 0, "w": board.width, "h": h, "kind": "high_speed_corridor"},
+            "CONTROL": {"x": 0, "y": h, "w": board.width, "h": h, "kind": "support"},
+            "POWER": {"x": 0, "y": 2*h, "w": board.width, "h": board.height - 2*h, "kind": "power_island"},
         }
         warnings.append("Generated default HIGH_SPEED/CONTROL/POWER regions from board thirds; review before fabrication.")
     keepouts = list(intent.get("keepouts") or []) if isinstance(intent.get("keepouts"), list) else []
 
+    # Region kinds that the floorplanner must treat as hard corridors/keepouts
+    # (never reflowed); everything else defaults to a movable support region.
+    _hard_region_kinds = {"high_speed_corridor", "rf_keepout", "mechanical", "antenna", "service"}
     for name, r in regions.items():
-        rules.append(PlanRule("region", f'Region({_q(name)}, x={r.get("x",0)}, y={r.get("y",0)}, w={r.get("w",0)}, h={r.get("h",0)})', [], f"Region {name} from intent/default floorplan."))
+        kind = r.get("kind") or r.get("role")
+        movable = r.get("movable")
+        if movable is None:
+            movable = (kind not in _hard_region_kinds) if kind is not None else True
+        extra = ""
+        if kind:
+            extra += f', kind={_q(str(kind))}'
+        extra += f', movable={bool(movable)}'
+        rules.append(PlanRule("region",
+            f'Region({_q(name)}, x={r.get("x",0)}, y={r.get("y",0)}, w={r.get("w",0)}, h={r.get("h",0)}{extra})',
+            [], f"Region {name} ({kind or 'support'}, movable={bool(movable)}) from intent/default floorplan."))
     for k in keepouts:
         if isinstance(k, dict):
             rules.append(PlanRule("keepout", f'Keepout({_q(k.get("name", "KEEPOUT"))}, x={k.get("x",0)}, y={k.get("y",0)}, w={k.get("w",0)}, h={k.get("h",0)}, role={_q(k.get("role", "keepout"))})', [], f"Keepout {k.get('name')} from board intent."))
