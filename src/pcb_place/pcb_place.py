@@ -2842,6 +2842,20 @@ class PlacementEngine:
             mx, my, _ = self.positions[actual]
             ox, oy = _rot_point(mx - old_anchor[0], my - old_anchor[1], rot_delta)
             targets.append((new_anchor[0] + ox, new_anchor[1] + oy))
+        if self.board_geometry is not None:
+            clamped_targets = []
+            for tx, ty in targets:
+                cx = min(max(tx, self.board_geometry.min_x), self.board_geometry.max_x)
+                cy = min(max(ty, self.board_geometry.min_y), self.board_geometry.max_y)
+                clamped_targets.append((cx, cy))
+            if clamped_targets != targets:
+                outside_count = sum(1 for (tx, ty), (cx, cy) in zip(targets, clamped_targets)
+                                    if abs(tx - cx) > 1e-9 or abs(ty - cy) > 1e-9)
+                self.messages.append(Message(
+                    "warn",
+                    f"cluster {name} had {outside_count} member target(s) outside board bounds; "
+                    "clamped those anchors inside the board for best-effort placement"))
+                targets = clamped_targets
         margin = self.model.policy.max_search_radius + 5.0
         cluster_region = BBox(
             min(t[0] for t in targets) - margin, min(t[1] for t in targets) - margin,
@@ -5761,7 +5775,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if args.list_aliases:
@@ -5912,9 +5926,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
-if __name__ == "__main__":
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point that reports placement failures without a Python traceback."""
+
     try:
-        raise SystemExit(main())
+        return _main(argv)
     except PlacementError as exc:
         print(f"pcb-place error: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
