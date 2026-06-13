@@ -1738,3 +1738,39 @@ Satellite("C1", parent="U1", side="right", distance=0.1, rot=0)
     assert abs(c["x"] - u["x"]) > 1.0
     rejected_reasons = [item["reason"] for item in report["placement_search"]["C1"]["rejected_candidates"]]
     assert any("parent bbox" in str(reason) or "collision with U1" in str(reason) for reason in rejected_reasons)
+
+
+def test_strict_grouped_array_timeout_raises_mid_search(monkeypatch, tmp_path):
+    ppl = tmp_path / "board.ppl"
+    ppl.write_text("Board(width=50, height=30)\n")
+    model = load_ppl(ppl)
+    runtime = pcb_place.RuntimeBudget(strict=True, time_budget_seconds=60.0, max_candidates_per_rule=100)
+    runtime.excellent_threshold = -1.0
+    engine = pcb_place.PlacementEngine({}, model, strict=True, runtime=runtime)
+
+    monkeypatch.setattr(engine, "resolve_ref", lambda ref: ref)
+    monkeypatch.setattr(engine, "_ordered_array_sides", lambda *args, **kwargs: ["top", "right", "bottom", "left"])
+    monkeypatch.setattr(engine, "_array_layout_candidates", lambda *args, **kwargs: [(1.0, 1.0)])
+    monkeypatch.setattr(engine, "_placement_region_for_side", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine, "_array_item_bboxes", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        engine,
+        "_try_grouped_spread",
+        lambda *args, **kwargs: {"ok": True, "reason": None, "collisions": [], "outside": []},
+    )
+    monkeypatch.setattr(
+        engine,
+        "_score_grouped_array_attempt",
+        lambda *args, **kwargs: pcb_place.SearchCandidate(
+            1.0, 1.0, "candidate", True, None, 0.0, None, None, 10.0, 0.0, 0.0, 0.0, 0.0, {}
+        ),
+    )
+
+    def expired_after_probe() -> bool:
+        runtime.timed_out = True
+        return True
+
+    monkeypatch.setattr(runtime, "expired", expired_after_probe)
+
+    with pytest.raises(PlacementError, match="strict mode"):
+        engine._attempt_array_placement({}, ["C1"], (0.0, 0.0), "decoupling_array")
