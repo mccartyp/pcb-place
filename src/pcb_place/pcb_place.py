@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import math
 import os
@@ -47,12 +48,13 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 Number = float | int
 Point = Tuple[float, float]
@@ -1819,6 +1821,7 @@ def _fp_kind_name(fp: Footprint) -> str:
     return match.group(1) if match else "unknown"
 
 
+@functools.lru_cache(maxsize=None)
 def infer_part_class(ref: str) -> str:
     upper = ref.upper()
     for prefix, cls in (("MH", "mechanical"), ("TP", "testpoint"), ("SW", "switch"),
@@ -1940,15 +1943,247 @@ def _fallback_local_bbox(fp: Footprint, cls: str) -> Tuple[BBox, str]:
     return BBox(-w / 2, -h / 2, w / 2, h / 2), warning
 
 
-def footprint_bbox_at(fp: Footprint, x: float, y: float, rot: float, model: PlacementModel) -> BBoxInfo:
-    cls = _part_class_for(model, fp.ref)
+# Footprint-local geometry (pad/graphic extents and pad centers) is independent
+# of where the part is placed, so it is parsed once and cached.  The cache is
+# keyed by object identity and validated against the footprint text so it is
+# safe to reuse across multiple apply_placements() runs in the same process.
+_LOCAL_BBOX_CACHE: Dict[int, Tuple[str, BBox, bool, Optional[str]]] = {}
+_PAD_CENTER_CACHE: Dict[int, Tuple[str, Dict[str, Point]]] = {}
+# Process-wide geometry cache hit/miss counters surfaced in the runtime report.
+_GEOMETRY_CACHE_STATS = {"hits": 0, "misses": 0}
+
+
+def _cached_local_bbox(fp: Footprint, cls: str) -> Tuple[BBox, bool, Optional[str]]:
+    """Return the cached footprint-local bbox plus fallback flag/warning."""
+
+    hit = _LOCAL_BBOX_CACHE.get(id(fp))
+    if hit is not None and hit[0] is fp.text:
+        _GEOMETRY_CACHE_STATS["hits"] += 1
+        return hit[1], hit[2], hit[3]
+    _GEOMETRY_CACHE_STATS["misses"] += 1
     local = _parse_fp_local_bbox(fp)
     fallback = False
     warning = None
     if local is None:
         local, warning = _fallback_local_bbox(fp, cls)
         fallback = True
+    _LOCAL_BBOX_CACHE[id(fp)] = (fp.text, local, fallback, warning)
+    return local, fallback, warning
+
+
+def _cached_pad_centers(fp: Footprint) -> Dict[str, Point]:
+    """Return cached footprint-local pad centers."""
+
+    hit = _PAD_CENTER_CACHE.get(id(fp))
+    if hit is not None and hit[0] is fp.text:
+        return hit[1]
+    centers = _parse_pad_local_centers(fp)
+    _PAD_CENTER_CACHE[id(fp)] = (fp.text, centers)
+    return centers
+
+
+def footprint_bbox_at(fp: Footprint, x: float, y: float, rot: float, model: PlacementModel) -> BBoxInfo:
+    cls = _part_class_for(model, fp.ref)
+    local, fallback, warning = _cached_local_bbox(fp, cls)
     return BBoxInfo(fp.ref, _transform_local_bbox(local, x, y, rot), fallback, warning)
+
+
+class SpatialIndex:
+    """Uniform-grid spatial index over placed footprint bounding boxes.
+
+    Collision checks only need to consider footprints whose bbox is near the
+    candidate.  Rather than scanning every footprint for every candidate, parts
+    are bucketed into fixed-size grid cells and ``query(bbox)`` returns just the
+    refs occupying the overlapping cells.  Stdlib only; no R-tree dependency.
+    """
+
+    def __init__(self, cell_size: float = 5.0) -> None:
+        self.cell_size = max(0.5, float(cell_size))
+        self._cells: Dict[Tuple[int, int], Set[str]] = {}
+        self._ref_cells: Dict[str, Tuple[Tuple[int, int], ...]] = {}
+        # Absolute bbox of each indexed footprint at its current position, so
+        # collision/clearance queries reuse it instead of recomputing transforms.
+        self._bboxes: Dict[str, BBox] = {}
+        # Diagnostics for the spatial_index report block.
+        self.queries = 0
+        self.candidates_checked = 0
+        self.rebuilds = 0
+
+    def _cell_range(self, bbox: BBox) -> Tuple[int, int, int, int]:
+        cs = self.cell_size
+        return (int(math.floor(bbox.min_x / cs)), int(math.floor(bbox.min_y / cs)),
+                int(math.floor(bbox.max_x / cs)), int(math.floor(bbox.max_y / cs)))
+
+    def _cells_for(self, bbox: BBox) -> Tuple[Tuple[int, int], ...]:
+        x0, y0, x1, y1 = self._cell_range(bbox)
+        return tuple((cx, cy) for cx in range(x0, x1 + 1) for cy in range(y0, y1 + 1))
+
+    def insert(self, ref: str, bbox: BBox) -> None:
+        """Insert/replace ``ref`` at the cells covered by ``bbox``."""
+
+        self.remove(ref)
+        cells = self._cells_for(bbox)
+        for cell in cells:
+            self._cells.setdefault(cell, set()).add(ref)
+        self._ref_cells[ref] = cells
+        self._bboxes[ref] = bbox
+
+    def remove(self, ref: str) -> None:
+        self._bboxes.pop(ref, None)
+        for cell in self._ref_cells.pop(ref, ()):  # type: ignore[arg-type]
+            bucket = self._cells.get(cell)
+            if bucket is not None:
+                bucket.discard(ref)
+                if not bucket:
+                    del self._cells[cell]
+
+    def bbox_of(self, ref: str) -> Optional[BBox]:
+        return self._bboxes.get(ref)
+
+    def query(self, bbox: BBox) -> Set[str]:
+        """Return refs whose cells overlap ``bbox`` (a superset of true overlaps)."""
+
+        self.queries += 1
+        found: Set[str] = set()
+        x0, y0, x1, y1 = self._cell_range(bbox)
+        cells = self._cells
+        for cx in range(x0, x1 + 1):
+            for cy in range(y0, y1 + 1):
+                bucket = cells.get((cx, cy))
+                if bucket:
+                    found |= bucket
+        self.candidates_checked += len(found)
+        return found
+
+    @property
+    def cell_count(self) -> int:
+        return len(self._cells)
+
+    def average_candidates_checked(self) -> float:
+        return (self.candidates_checked / self.queries) if self.queries else 0.0
+
+    def report(self) -> Dict[str, Any]:
+        return {
+            "enabled": True,
+            "cell_size_mm": round(self.cell_size, 3),
+            "cells": self.cell_count,
+            "indexed_refs": len(self._ref_cells),
+            "queries": self.queries,
+            "candidates_checked": self.candidates_checked,
+            "average_candidates_checked": round(self.average_candidates_checked(), 3),
+            "rebuilds": self.rebuilds,
+        }
+
+
+class PlacementProfiler:
+    """Lightweight counters and per-rule timing for placement profiling."""
+
+    def __init__(self) -> None:
+        self.counters: Dict[str, int] = {
+            "candidates_generated": 0,
+            "candidates_evaluated": 0,
+            "candidates_pruned": 0,
+            "candidates_early_accepted": 0,
+            "collision_checks": 0,
+            "spatial_index_queries": 0,
+            "geometry_cache_hits": 0,
+            "geometry_cache_misses": 0,
+            "reflow_attempts": 0,
+        }
+        self.rule_runtime: Dict[str, float] = {}
+        self.rule_counts: Dict[str, int] = {}
+
+    def incr(self, key: str, amount: int = 1) -> None:
+        self.counters[key] = self.counters.get(key, 0) + amount
+
+    def record_rule(self, label: str, seconds: float) -> None:
+        self.rule_runtime[label] = self.rule_runtime.get(label, 0.0) + seconds
+        self.rule_counts[label] = self.rule_counts.get(label, 0) + 1
+
+    def slowest_rules(self, n: int = 10) -> List[Dict[str, Any]]:
+        items = sorted(self.rule_runtime.items(), key=lambda kv: kv[1], reverse=True)[:n]
+        return [{"rule": label, "seconds": round(secs, 4), "invocations": self.rule_counts.get(label, 0)}
+                for label, secs in items]
+
+    def report(self, *, total_runtime: float) -> Dict[str, Any]:
+        return {
+            "total_runtime_seconds": round(total_runtime, 4),
+            "counters": dict(self.counters),
+            "per_rule_runtime": {k: round(v, 4) for k, v in sorted(self.rule_runtime.items())},
+            "slowest_rules": self.slowest_rules(),
+        }
+
+
+# Optimization-level presets controlling search breadth, reflow depth, and the
+# early-success threshold.  fast trades quality for speed; deep does the reverse.
+# ``post_legal_candidates`` bounds how many more layouts an array/group search
+# explores after a legal one is found, looking for a marginally better score.
+# fast accepts the first legal layout; deep keeps searching up to the full cap.
+OPTIMIZATION_LEVELS: Dict[str, Dict[str, Any]] = {
+    "fast": {"max_candidates_per_rule": 150, "excellent_threshold": 3.0,
+             "max_floorplan_iterations": 2, "reflow_max_level": 2, "parent_reflow": False,
+             "post_legal_candidates": 0},
+    "normal": {"max_candidates_per_rule": 500, "excellent_threshold": 1.0,
+               "max_floorplan_iterations": 5, "reflow_max_level": 3, "parent_reflow": "if_needed",
+               "post_legal_candidates": 48},
+    "deep": {"max_candidates_per_rule": 2000, "excellent_threshold": 0.25,
+             "max_floorplan_iterations": 12, "reflow_max_level": 5, "parent_reflow": True,
+             "post_legal_candidates": 2000},
+}
+
+
+class RuntimeBudget:
+    """Wall-clock budget and optimization-level knobs for a placement run.
+
+    When the budget expires the floorplanner stops generating new search work
+    and falls back to best-known placements (marked degraded/requires_review)
+    instead of aborting -- unless ``strict`` forces a hard failure.
+    """
+
+    def __init__(self, *, level: str = "normal", time_budget_seconds: float = 60.0,
+                 max_candidates_per_rule: Optional[int] = None,
+                 max_floorplan_iterations: Optional[int] = None,
+                 strict: bool = False) -> None:
+        self.level = level if level in OPTIMIZATION_LEVELS else "normal"
+        preset = OPTIMIZATION_LEVELS[self.level]
+        self.time_budget_seconds = float(time_budget_seconds)
+        self.max_candidates_per_rule = int(max_candidates_per_rule
+                                            if max_candidates_per_rule is not None
+                                            else preset["max_candidates_per_rule"])
+        self.excellent_threshold = float(preset["excellent_threshold"])
+        self.reflow_max_level = int(preset["reflow_max_level"])
+        self.parent_reflow = preset["parent_reflow"]
+        self.post_legal_candidates = int(preset["post_legal_candidates"])
+        self.max_floorplan_iterations = int(max_floorplan_iterations
+                                            if max_floorplan_iterations is not None
+                                            else preset["max_floorplan_iterations"])
+        self.strict = strict
+        self.start_time = time.perf_counter()
+        self.timed_out = False
+        self.degraded_refs: Set[str] = set()
+
+    def elapsed(self) -> float:
+        return time.perf_counter() - self.start_time
+
+    def expired(self) -> bool:
+        if self.time_budget_seconds <= 0:
+            return False
+        if self.elapsed() >= self.time_budget_seconds:
+            self.timed_out = True
+            return True
+        return False
+
+    def report(self, *, candidates_evaluated: int, cache_hits: int) -> Dict[str, Any]:
+        return {
+            "optimization_level": self.level,
+            "elapsed_seconds": round(self.elapsed(), 4),
+            "budget_seconds": self.time_budget_seconds,
+            "timed_out": self.timed_out,
+            "candidates_evaluated": candidates_evaluated,
+            "cache_hits": cache_hits,
+            "max_candidates_per_rule": self.max_candidates_per_rule,
+            "degraded_refs": sorted(self.degraded_refs),
+        }
 
 
 def all_bbox_infos(engine: "PlacementEngine", *, refs: Optional[Iterable[str]] = None) -> Dict[str, BBoxInfo]:
@@ -2174,10 +2409,20 @@ class PlacementEngine:
                  cardinal_rotations: bool = False, board_geometry: Optional[BoardGeometry] = None,
                  allow_keepout_overlap: bool = False, allow_outside_region: bool = False,
                  best_effort: bool = True, fail_fast: bool = False,
-                 max_floorplan_iterations: int = 10) -> None:
+                 max_floorplan_iterations: int = 10,
+                 runtime: Optional[RuntimeBudget] = None,
+                 progress: bool = False) -> None:
         self.footprints = dict(footprints)
         self.model = model
         self.strict = strict
+        self.runtime = runtime if runtime is not None else RuntimeBudget(strict=strict)
+        self.profiler = PlacementProfiler()
+        self.progress = progress
+        self._cache_stats_baseline = dict(_GEOMETRY_CACHE_STATS)
+        # max_floorplan_iterations from the runtime budget/optimization level
+        # takes precedence over the legacy default when one was not explicitly set.
+        if runtime is not None:
+            max_floorplan_iterations = runtime.max_floorplan_iterations
         # No-abort placement: by default the floorplanner never aborts.  A local
         # placement failure triggers reflow and, as a last resort, parking.
         # Only --strict or --fail-fast turn unplaceable components into errors.
@@ -2212,6 +2457,16 @@ class PlacementEngine:
         self.parked: Dict[str, ParkedPlacement] = {}
         self.degraded_warnings: List[str] = []
         self.iteration_scores: List[Dict[str, Any]] = []
+        self.requires_review: Set[str] = set()
+        self._degrade_announced = False
+        # Spatial index over placed footprints for fast collision queries.  It is
+        # rebuilt lazily whenever positions change (tracked by _index_version) so
+        # that the many collision checks within a single candidate search reuse it.
+        self._spatial_index: Optional[SpatialIndex] = None
+        self._index_version = 0
+        self._spatial_index_built_version = -1
+        self._index_cell_size = self._compute_index_cell_size()
+        self._max_clearance = self._compute_max_clearance()
         self.allow_body_outside_refs: Set[str] = self._collect_allow_body_outside_refs()
         for error in model.alias_diagnostics.errors:
             self.messages.append(Message("error", error))
@@ -2248,6 +2503,117 @@ class PlacementEngine:
                 if actual is not None:
                     allowed.add(actual)
         return allowed
+
+    def _compute_index_cell_size(self) -> float:
+        """Pick a grid cell size from typical footprint extents.
+
+        A cell roughly the size of the largest footprint keeps each part in a
+        handful of cells while bounding the number of refs returned per query.
+        """
+
+        extents: List[float] = []
+        for ref, fp in self.footprints.items():
+            cls = _part_class_for(self.model, ref)
+            local, _fb, _w = _cached_local_bbox(fp, cls)
+            extents.append(max(local.width, local.height))
+        if not extents:
+            return 5.0
+        extents.sort()
+        # Use a high-percentile extent (robust to a few huge parts) plus clearance.
+        idx = min(len(extents) - 1, int(len(extents) * 0.9))
+        return max(2.0, min(20.0, extents[idx] + 2.0))
+
+    def _compute_max_clearance(self) -> float:
+        """Largest clearance any part-class pair can require (query margin)."""
+
+        clearance = self.model.clearance
+        values = [clearance.default]
+        for attr in ("passive_to_passive", "passive_to_ic", "ic_to_ic", "connector", "mechanical"):
+            val = getattr(clearance, attr, None)
+            if isinstance(val, (int, float)):
+                values.append(float(val))
+        return max(values) if values else 0.25
+
+    def _touch_positions(self) -> None:
+        """Mark the spatial index stale after a position change."""
+
+        self._index_version += 1
+
+    def _set_position(self, ref: str, x: float, y: float, rot: float) -> None:
+        """Update a footprint position and invalidate the spatial index."""
+
+        self.positions[ref] = (float(x), float(y), float(rot))
+        self._touch_positions()
+
+    def _ensure_spatial_index(self) -> SpatialIndex:
+        """Return the spatial index, rebuilding it if positions changed."""
+
+        if self._spatial_index is None:
+            self._spatial_index = SpatialIndex(self._index_cell_size)
+        if self._spatial_index_built_version != self._index_version:
+            index = self._spatial_index
+            index._cells.clear()
+            index._ref_cells.clear()
+            index._bboxes.clear()
+            for ref, (x, y, rot) in self.positions.items():
+                if ref not in self.footprints:
+                    continue
+                bbox = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model).bbox
+                index.insert(ref, bbox)
+            index.rebuilds += 1
+            self._spatial_index_built_version = self._index_version
+        return self._spatial_index
+
+    def _raise_strict_timeout(self) -> None:
+        """Raise the strict-mode timeout error after the budget has expired."""
+
+        if self.runtime.strict:
+            raise PlacementError(
+                f"placement time budget of {self.runtime.time_budget_seconds:g}s exceeded "
+                f"after {self.runtime.elapsed():.1f}s (strict mode)")
+
+    def _maybe_degrade_on_timeout(self) -> None:
+        """If the wall-clock budget is spent, enter best-effort degrade mode.
+
+        Degrade mode keeps placing remaining components with the best known
+        candidate but flags them requires_review instead of aborting.  --strict
+        turns the timeout into a hard error.
+        """
+
+        if not self.runtime.expired():
+            return
+        # expired() set timed_out=True.  Check strict before the once-only guard
+        # so a timeout first observed on a non-strict search path still aborts.
+        self._raise_strict_timeout()
+        if self._degrade_announced:
+            return
+        self._degrade_announced = True
+        # Shrink the per-rule search to a minimal bounded pass so the run drains
+        # quickly while still placing every remaining component.
+        self.runtime.max_candidates_per_rule = min(self.runtime.max_candidates_per_rule, 24)
+        self.degraded_warnings.append(
+            f"time budget {self.runtime.time_budget_seconds:g}s exceeded at "
+            f"{self.runtime.elapsed():.1f}s; remaining placements are best-effort and require review")
+        self.messages.append(Message("warn", self.degraded_warnings[-1]))
+
+    def _maybe_progress(self, rule_index: int, total: int, rule: Mapping[str, Any], typ: str) -> None:
+        """Emit concise, throttled progress for long runs (>=0.5s between lines)."""
+
+        if not self.progress:
+            return
+        now = time.perf_counter()
+        last = getattr(self, "_last_progress_time", 0.0)
+        if rule_index != 0 and now - last < 0.5:
+            return
+        self._last_progress_time = now
+        ref = rule.get("ref")
+        if ref is None:
+            refs = rule.get("refs") or []
+            ref = (refs[0] if refs else rule.get("anchor") or rule.get("name") or "")
+        count = len(rule.get("refs") or []) or 1
+        label = "".join(part.capitalize() for part in str(typ).split("_"))
+        print(f"placing {rule_index + 1}/{total} {ref} {label} candidates={count} "
+              f"elapsed={self.runtime.elapsed():.1f}s", file=sys.stderr)
 
     def alias_map(self) -> Dict[str, str]:
         """Return the effective alias map used by the resolver."""
@@ -2400,7 +2766,10 @@ class PlacementEngine:
         self.updates[actual_ref] = update
         self.applied_priority[actual_ref] = priority
         self.applied_rule_index[actual_ref] = index
-        self.positions[actual_ref] = (float(x), float(y), float(new_rot))
+        self._set_position(actual_ref, float(x), float(y), float(new_rot))
+        if self.runtime.timed_out:
+            self.requires_review.add(actual_ref)
+            self.runtime.degraded_refs.add(actual_ref)
         suffix = f"  # {note}" if note else ""
         rot_label = _fmt_num(new_rot) if explicit_rot else "preserve"
         self.messages.append(
@@ -2620,15 +2989,24 @@ class PlacementEngine:
         edge = self._edge_distance(info.bbox)
         if edge is not None:
             margins.append(edge)
-        for other in self.positions:
-            if other == ref or other not in self.footprints or not _same_physical_side(self.footprints[ref], self.footprints[other]):
+        # The clearance margin only feeds a score reward clamped to +/-5 mm, so
+        # only footprints within that window (plus the largest clearance) can
+        # affect the result.  Query the spatial index for those neighbours.
+        index = self._ensure_spatial_index()
+        window = self._max_clearance + 6.0
+        ref_fp = self.footprints[ref]
+        ref_class = _part_class_for(self.model, ref)
+        for other in index.query(info.bbox.expanded(window)):
+            if other == ref or other not in self.footprints or not _same_physical_side(ref_fp, self.footprints[other]):
                 continue
-            ox, oy, orot = self.positions[other]
-            other_info = footprint_bbox_at(self.footprints[other], ox, oy, orot, self.model)
+            other_bbox = index.bbox_of(other)
+            if other_bbox is None:
+                ox, oy, orot = self.positions[other]
+                other_bbox = footprint_bbox_at(self.footprints[other], ox, oy, orot, self.model).bbox
             required = clearance_override
             if required is None:
-                required = self.model.clearance.required_for(_part_class_for(self.model, ref), _part_class_for(self.model, other))
-            margins.append(info.bbox.clearance_to(other_info.bbox) - required)
+                required = self.model.clearance.required_for(ref_class, _part_class_for(self.model, other))
+            margins.append(info.bbox.clearance_to(other_bbox) - required)
         if forbidden_bboxes:
             for _name, bbox in forbidden_bboxes:
                 margins.append(info.bbox.clearance_to(bbox))
@@ -2748,17 +3126,40 @@ class PlacementEngine:
 
         attempted: List[SearchCandidate] = []
         seen: Set[Tuple[int, int]] = set()
+        budget = self.runtime
+        max_candidates = max(1, budget.max_candidates_per_rule)
+        excellent = budget.excellent_threshold
+        best_legal: Optional[SearchCandidate] = None
+        self.profiler.incr("candidates_generated", len(points))
+        evaluated = 0
         for x, y, label in points:
             key = (round(x / 1e-6), round(y / 1e-6))
             if key in seen:
                 continue
             seen.add(key)
-            attempted.append(self._evaluate_candidate(ref, x, y, rot, target, label,
-                                                       clearance_override=clearance_override, region=region,
-                                                       allow_keepout_overlap=allow_keepout_overlap,
-                                                       forbidden_bboxes=forbidden_bboxes))
-        legal = [c for c in attempted if c.legal]
-        chosen = min(legal, key=lambda c: c.score) if legal else None
+            # Bound the search: cap evaluations per rule so a single primitive
+            # cannot explode into thousands of expensive collision checks.
+            if evaluated >= max_candidates:
+                break
+            candidate = self._evaluate_candidate(ref, x, y, rot, target, label,
+                                                 clearance_override=clearance_override, region=region,
+                                                 allow_keepout_overlap=allow_keepout_overlap,
+                                                 forbidden_bboxes=forbidden_bboxes)
+            attempted.append(candidate)
+            evaluated += 1
+            self.profiler.incr("candidates_evaluated")
+            if candidate.legal and (best_legal is None or candidate.score < best_legal.score):
+                best_legal = candidate
+                # Early success: once an excellent legal candidate is found, stop
+                # searching for a marginally better one.
+                if candidate.score <= excellent:
+                    self.profiler.incr("candidates_early_accepted")
+                    break
+            # Honour the wall-clock budget mid-search; keep the best so far.
+            if evaluated % 64 == 0 and budget.expired():
+                self._raise_strict_timeout()
+                break
+        chosen = best_legal
         outcome = SearchOutcome(ref, target, attempted, chosen, search_radius_used, fallback_used)
         self.search_log[ref] = outcome
         return outcome
@@ -2924,7 +3325,7 @@ class PlacementEngine:
         names = [str(pads)] if isinstance(pads, str) else [str(p) for p in pads]
         if not names:
             raise PlacementError("NearPad(pad=...) requires at least one pad")
-        centers = _parse_pad_local_centers(self.footprints[actual_parent])
+        centers = _cached_pad_centers(self.footprints[actual_parent])
         missing = [name for name in names if name not in centers]
         if missing:
             available = ", ".join(sorted(centers)) or "none"
@@ -3319,11 +3720,11 @@ class PlacementEngine:
                 if reason is not None:
                     return {"ok": False, "failed_ref": ref, "reason": reason}
                 saved[actual] = self.positions[actual]
-                self.positions[actual] = (x, y, eval_rot)
+                self._set_position(actual, x, y, eval_rot)
             return {"ok": True}
         finally:
             for actual, pos in saved.items():
-                self.positions[actual] = pos
+                self._set_position(actual, *pos)
 
 
     def _score_grouped_array_attempt(self, refs: Sequence[str], actual_refs: Sequence[Optional[str]],
@@ -3445,6 +3846,7 @@ class PlacementEngine:
     def _restore_positions(self, snapshot: Tuple[Dict[str, Tuple[float, float, float]], Dict[str, PlacementUpdate]]) -> None:
         self.positions = dict(snapshot[0])
         self.updates = dict(snapshot[1])
+        self._touch_positions()
 
     def _cur_bbox(self, ref: str) -> BBox:
         x, y, rot = self.positions[ref]
@@ -3455,7 +3857,7 @@ class PlacementEngine:
 
         fp = self.footprints[ref]
         _, _, rot = self.positions.get(ref, (fp.x, fp.y, fp.rot))
-        self.positions[ref] = (float(x), float(y), float(rot))
+        self._set_position(ref, float(x), float(y), float(rot))
         outside = self.board_geometry is not None and not self.board_geometry.contains(x, y)
         self.updates[ref] = PlacementUpdate(
             ref=ref, x=float(x), y=float(y), final_rot=float(rot),
@@ -3763,6 +4165,13 @@ class PlacementEngine:
             prev = self.iteration_scores[-1]
             if prev["collisions"] == 0 and prev["congestion_penalty"] == 0.0:
                 break
+            # Stop optimizing once the wall-clock budget is spent; the current
+            # best-known floorplan is kept rather than aborting.
+            if self.runtime.expired():
+                self.messages.append(Message("warn",
+                    f"time budget {self.runtime.time_budget_seconds:g}s exceeded during optimization "
+                    f"(iteration {iteration}); keeping best-known floorplan"))
+                break
             improved = self._separate_overlaps()
             score = self.floorplan_score()
             self.iteration_scores.append({"iteration": iteration, **score})
@@ -3785,6 +4194,32 @@ class PlacementEngine:
             "congestion_map": self.congestion_map(),
             "placement_quality_score": self.floorplan_score(),
         }
+
+    def _cache_hits(self) -> int:
+        return _GEOMETRY_CACHE_STATS["hits"] - self._cache_stats_baseline["hits"]
+
+    def runtime_report(self) -> Dict[str, Any]:
+        """Best-effort/timeout diagnostics required by the runtime spec."""
+
+        return self.runtime.report(
+            candidates_evaluated=self.profiler.counters.get("candidates_evaluated", 0),
+            cache_hits=self._cache_hits())
+
+    def spatial_index_report(self) -> Dict[str, Any]:
+        index = self._ensure_spatial_index()
+        return index.report()
+
+    def profile_report(self) -> Dict[str, Any]:
+        report = self.profiler.report(total_runtime=self.runtime.elapsed())
+        report["counters"]["geometry_cache_hits"] = self._cache_hits()
+        report["counters"]["geometry_cache_misses"] = (
+            _GEOMETRY_CACHE_STATS["misses"] - self._cache_stats_baseline["misses"])
+        report["counters"]["reflow_attempts"] = len(self.reflow_attempts)
+        report["candidates_evaluated"] = self.profiler.counters.get("candidates_evaluated", 0)
+        report["candidates_generated"] = self.profiler.counters.get("candidates_generated", 0)
+        report["candidates_pruned"] = self.profiler.counters.get("candidates_pruned", 0)
+        report["spatial_index"] = self.spatial_index_report()
+        return report
 
     def place_array_near_target(self, rule: Mapping[str, Any], refs: Sequence[str], origin: Point,
                                 why: str, *, parent_ref: Optional[str] = None,
@@ -3851,6 +4286,9 @@ class PlacementEngine:
 
         refs = list(refs)
         n = len(refs)
+        # fast optimization level uses the coarse (quick) ladder everywhere.
+        if self.runtime.level == "fast":
+            quick = True
 
         parent_bbox: Optional[BBox] = None
         parent_expanded: Optional[BBox] = None
@@ -3893,6 +4331,12 @@ class PlacementEngine:
         attempts: List[Dict[str, Any]] = []
         scored_attempts: List[SearchCandidate] = []
         chosen_attempt: Optional[Dict[str, Any]] = None
+        # Bound the array search: an excellent layout ends the search early, and
+        # no more than max_candidates_per_rule layouts are evaluated overall.
+        attempt_cap = max(1, self.runtime.max_candidates_per_rule)
+        excellent = self.runtime.excellent_threshold
+        post_legal_budget = self.runtime.post_legal_candidates
+        attempts_at_first_legal: Optional[int] = None
         distances = ([distance + delta for delta in (0.0, 1.0, 2.0, 3.0)] if quick
                      else [distance + delta for delta in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0)])
         stagger_options = [False, True] if stagger_requested else [False]
@@ -3901,8 +4345,9 @@ class PlacementEngine:
         requested_spacing = spacing
         spacing_ladder = ([requested_spacing] if quick
                           else [requested_spacing] + [requested_spacing * mult for mult in (1.25, 1.5, 2.0)])
+        search_done = False
         for spacing in spacing_ladder:
-          if chosen_attempt is not None:
+          if chosen_attempt is not None or search_done:
             break
           shifts = ([0.0, spacing, -spacing] if quick else
                     [0.0, spacing / 2.0, -spacing / 2.0, spacing, -spacing, 1.5 * spacing, -1.5 * spacing, 2.0 * spacing, -2.0 * spacing])
@@ -3953,8 +4398,37 @@ class PlacementEngine:
                                    "score": scored.score, **result}
                         attempts.append(attempt)
                         scored_attempts.append(scored)
-                        if scored.legal and (chosen_attempt is None or scored.score < float(chosen_attempt["score"])):
-                            chosen_attempt = attempt
+                        self.profiler.incr("candidates_generated")
+                        self.profiler.incr("candidates_evaluated")
+                        if scored.legal:
+                            if attempts_at_first_legal is None:
+                                attempts_at_first_legal = len(attempts)
+                            if chosen_attempt is None or scored.score < float(chosen_attempt["score"]):
+                                chosen_attempt = attempt
+                            # Early success: an excellent legal layout stops the search.
+                            if scored.score <= excellent:
+                                self.profiler.incr("candidates_early_accepted")
+                                search_done = True
+                        # Honour the wall-clock budget even before a legal layout
+                        # exists; strict mode must fail promptly and best-effort mode
+                        # keeps the best attempt seen so far.  Candidate-count bounding
+                        # still kicks in only once a legal layout exists, so the spacing
+                        # ladder is not capped prematurely when time remains.
+                        if len(attempts) % 32 == 0 and self.runtime.expired():
+                            self._raise_strict_timeout()
+                            search_done = True
+                        elif chosen_attempt is not None:
+                            since_legal = len(attempts) - (attempts_at_first_legal or 0)
+                            if len(attempts) >= attempt_cap or since_legal >= post_legal_budget:
+                                search_done = True
+                        if search_done:
+                            break
+                    if search_done:
+                        break
+                if search_done:
+                    break
+            if search_done:
+                break
 
         chosen_score = min((c for c in scored_attempts if c.legal), key=lambda c: c.score, default=None)
         if scored_attempts:
@@ -4043,16 +4517,27 @@ class PlacementEngine:
                     continue
                 if test_info.bbox.overlaps(_rect_to_abs_bbox(self.model, keepout)):
                     return f"avoided keepout {keepout['name']!r}"
-        obstacle_refs = set(self.positions)
-        for other in sorted(obstacle_refs):
-            if other == ref or other not in self.footprints or not _same_physical_side(self.footprints[ref], self.footprints[other]):
+        self.profiler.incr("collision_checks")
+        # Query the spatial index for nearby footprints only.  The query margin
+        # is the largest clearance any pair can require so no real overlap is
+        # missed; precise per-pair clearance is still checked below.
+        index = self._ensure_spatial_index()
+        margin = clearance_override if clearance_override is not None else self._max_clearance
+        nearby = index.query(test_info.bbox.expanded(margin))
+        self.profiler.incr("spatial_index_queries")
+        ref_fp = self.footprints[ref]
+        ref_class = _part_class_for(self.model, ref)
+        for other in sorted(nearby):
+            if other == ref or other not in self.footprints or not _same_physical_side(ref_fp, self.footprints[other]):
                 continue
-            ox, oy, orot = self.positions[other]
-            other_info = footprint_bbox_at(self.footprints[other], ox, oy, orot, self.model)
+            other_bbox = index.bbox_of(other)
+            if other_bbox is None:
+                ox, oy, orot = self.positions[other]
+                other_bbox = footprint_bbox_at(self.footprints[other], ox, oy, orot, self.model).bbox
             required = clearance_override
             if required is None:
-                required = self.model.clearance.required_for(_part_class_for(self.model, ref), _part_class_for(self.model, other))
-            if test_info.bbox.expanded(required).overlaps(other_info.bbox):
+                required = self.model.clearance.required_for(ref_class, _part_class_for(self.model, other))
+            if test_info.bbox.expanded(required).overlaps(other_bbox):
                 return f"avoided collision with {other}"
         return None
 
@@ -4112,9 +4597,21 @@ class PlacementEngine:
     def apply(self) -> None:
         """Apply rules in placement-file order."""
 
+        total = len(self.model.rules)
+        prev_label: Optional[str] = None
+        prev_start = 0.0
         for rule_index, rule in enumerate(self.model.rules):
             rule["_index"] = rule_index
             typ = rule["type"]
+            now = time.perf_counter()
+            # Attribute the previous rule's wall time now that it has finished
+            # (rule bodies use `continue`, so timing is closed at the loop top).
+            if prev_label is not None:
+                self.profiler.record_rule(prev_label, now - prev_start)
+            prev_label = typ
+            prev_start = now
+            self._maybe_degrade_on_timeout()
+            self._maybe_progress(rule_index, total, rule, typ)
             if typ in {"anchor", "fixed", "corner", "edge"}:
                 x, y = self._placement_target(rule)
                 rot_spec = rule.get("rot")
@@ -4277,6 +4774,8 @@ class PlacementEngine:
             elif typ == "power_island":
                 self.messages.append(Message("note", f"power island {rule['name']!r}: regulator {rule['regulator']} "
                                                    f"(scored in review)"))
+        if prev_label is not None:
+            self.profiler.record_rule(prev_label, time.perf_counter() - prev_start)
 
 
 def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
@@ -4857,7 +5356,11 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
                      allow_keepout_overlap: bool = False,
                      allow_outside_region: bool = False,
                      best_effort: bool = True, fail_fast: bool = False,
-                     max_floorplan_iterations: int = 10) -> Tuple[str, List[Message], Dict[str, Any]]:
+                     max_floorplan_iterations: Optional[int] = None,
+                     optimization_level: str = "normal",
+                     time_budget_seconds: float = 60.0,
+                     max_candidates_per_rule: Optional[int] = None,
+                     progress: bool = False) -> Tuple[str, List[Message], Dict[str, Any]]:
     """Apply placement rules and return rewritten KiCad text plus diagnostics."""
 
     footprints = parse_footprints(text)
@@ -4871,12 +5374,16 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         existing_geometry = BoardGeometry.from_edge_cuts(text)
         if existing_geometry is not None and not existing_geometry.nearly_equals(defined_geometry):
             raise PlacementError("Board emit_outline=True conflicts with existing Edge.Cuts geometry")
+    runtime = RuntimeBudget(level=optimization_level, time_budget_seconds=time_budget_seconds,
+                            max_candidates_per_rule=max_candidates_per_rule,
+                            max_floorplan_iterations=max_floorplan_iterations, strict=strict)
     engine = PlacementEngine(footprints, model, strict=strict, allow_suffix_match=allow_suffix_match,
                              cardinal_rotations=cardinal_rotations, board_geometry=board_geometry,
                              allow_keepout_overlap=allow_keepout_overlap,
                              allow_outside_region=allow_outside_region,
                              best_effort=best_effort, fail_fast=fail_fast,
-                             max_floorplan_iterations=max_floorplan_iterations)
+                             max_floorplan_iterations=max_floorplan_iterations or runtime.max_floorplan_iterations,
+                             runtime=runtime, progress=progress)
     engine.run_floorplan()
     # In no-abort mode, parked footprints are intentionally degraded; their
     # geometric violations are reported as warnings, not fatal errors.
@@ -4960,6 +5467,10 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
         "power_islands": power_reviews,
         "mechanical_review": mech_review,
         "floorplan": engine.reflow_report(),
+        "runtime": engine.runtime_report(),
+        "spatial_index": engine.spatial_index_report(),
+        "profile": engine.profile_report(),
+        "requires_review": sorted(engine.requires_review),
         "spacing_profile": dataclasses.asdict(model.clearance),
         "validation_errors": sum(1 for m in engine.messages if m.level == "error"),
         "board": dataclasses.asdict(model.board) | {"origin_x": model.board.origin_x, "origin_y": model.board.origin_y},
@@ -5206,8 +5717,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="No-abort floorplanning: reflow then park instead of failing (default)")
     parser.add_argument("--no-best-effort", dest="best_effort", action="store_false",
                         help="Disable no-abort floorplanning (equivalent to --fail-fast)")
-    parser.add_argument("--max-floorplan-iterations", type=int, default=10,
-                        help="Maximum iterative floorplan optimization passes (default 10)")
+    parser.add_argument("--max-floorplan-iterations", type=int, default=None,
+                        help="Maximum iterative floorplan optimization passes (default from --optimization-level)")
+    parser.add_argument("--optimization-level", choices=["fast", "normal", "deep"], default="normal",
+                        help="Search breadth/quality trade-off: fast (fewer candidates, no parent reflow), "
+                             "normal (balanced, default), deep (larger search, more reflow)")
+    parser.add_argument("--time-budget-seconds", type=float, default=60.0,
+                        help="Wall-clock placement budget in seconds (default 60). 0 disables. When it expires "
+                             "the best-known placement is kept and marked requires_review unless --strict")
+    parser.add_argument("--max-candidates-per-rule", type=int, default=None,
+                        help="Cap candidate evaluations per placement primitive (default from --optimization-level)")
+    parser.add_argument("--profile-placement", type=Path, metavar="JSON",
+                        help="Write a placement profiling report (per-rule runtime, candidate/collision counts) to JSON")
+    parser.add_argument("--progress", action="store_true",
+                        help="Print concise per-rule progress to stderr for long runs")
     parser.add_argument("--floorplan-report", type=Path, metavar="JSON",
                         help="Write the floorplanner/reflow report as standalone JSON")
     parser.add_argument("--safe", dest="safe", action="store_true", default=True, help="Run pre-write safety checks (default)")
@@ -5302,7 +5825,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                                                   allow_outside_region=bool(args.allow_outside_region),
                                                   best_effort=bool(args.best_effort) and not bool(args.fail_fast),
                                                   fail_fast=bool(args.fail_fast),
-                                                  max_floorplan_iterations=int(args.max_floorplan_iterations))
+                                                  max_floorplan_iterations=(None if args.max_floorplan_iterations is None
+                                                                            else int(args.max_floorplan_iterations)),
+                                                  optimization_level=args.optimization_level,
+                                                  time_budget_seconds=float(args.time_budget_seconds),
+                                                  max_candidates_per_rule=(None if args.max_candidates_per_rule is None
+                                                                           else int(args.max_candidates_per_rule)),
+                                                  progress=bool(args.progress))
     for message in messages:
         print(message)
     if args.debug_write:
@@ -5314,6 +5843,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.floorplan_report.parent.mkdir(parents=True, exist_ok=True)
         args.floorplan_report.write_text(json.dumps(report.get("floorplan", {}), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"floorplan-report: {args.floorplan_report}")
+    if args.profile_placement:
+        args.profile_placement.parent.mkdir(parents=True, exist_ok=True)
+        profile_payload = {
+            "runtime": report.get("runtime", {}),
+            "spatial_index": report.get("spatial_index", {}),
+            "profile": report.get("profile", {}),
+        }
+        args.profile_placement.write_text(json.dumps(profile_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"profile: {args.profile_placement}")
     for path, text_out in ((args.high_speed_review, lambda: high_speed_review_md(report["high_speed_paths"])),
                            (args.power_review, lambda: power_review_md(report["power_islands"])),
                            (args.mechanical_review, lambda: mechanical_review_md(report["mechanical_review"])),

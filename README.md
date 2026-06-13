@@ -332,6 +332,125 @@ reference-plane continuity, plane splits, thermal behavior, RF detuning, or
 EMI compliance. The review reports exist to focus engineering attention, not to
 replace it.
 
+## Performance and runtime budgets
+
+`pcb-place` uses bounded, staged search so placement stays fast even on dense
+boards. A ~100-component board completes in a few seconds in the default
+`normal` mode; it never runs unbounded.
+
+### Optimization levels
+
+Choose the search breadth/quality trade-off with `--optimization-level`:
+
+| Level    | Candidates/rule | Reflow depth        | Post-legal probing | Use when |
+|----------|-----------------|---------------------|--------------------|----------|
+| `fast`   | 150             | local + group only  | accept first legal | quick iteration, CI smoke runs |
+| `normal` | 500 (default)   | up to support region| small extra probe  | default placement |
+| `deep`   | 2000            | up to parent move   | full search        | debug / exhaustive optimization |
+
+`fast` does no parent reflow and accepts the first legal layout; `normal` is
+balanced; `deep` searches harder and reflows more (and is slower by design).
+
+### Time budget and best-effort timeout
+
+`--time-budget-seconds N` (default `60`, `0` disables) bounds wall-clock time.
+When the budget expires the placer does **not** abort: it keeps placing the
+remaining components with the best known candidate, marks them
+`requires_review`, records `timed_out: true`, and continues. Only `--strict`
+turns a timeout into a hard error.
+
+```bash
+pcb-place board.kicad_pcb placement.ppl \
+  --optimization-level normal \
+  --time-budget-seconds 60 \
+  --max-candidates-per-rule 500 \
+  --max-floorplan-iterations 5
+```
+
+The placement report includes a `runtime` block:
+
+```json
+"runtime": {
+  "optimization_level": "normal",
+  "elapsed_seconds": 2.17,
+  "budget_seconds": 60.0,
+  "timed_out": false,
+  "candidates_evaluated": 196,
+  "cache_hits": 201176,
+  "max_candidates_per_rule": 500,
+  "degraded_refs": []
+}
+```
+
+### Spatial index
+
+Collision and clearance checks query a uniform-grid spatial index (stdlib only)
+so each candidate is compared against only the handful of footprints near it
+instead of every part on the board. The index updates as parts move and is
+reported under `spatial_index`:
+
+```json
+"spatial_index": {
+  "enabled": true,
+  "cells": 93,
+  "queries": 6382,
+  "average_candidates_checked": 0.85
+}
+```
+
+`average_candidates_checked` stays well below the part count — that is the
+difference between local queries and a naive all-pairs scan.
+
+### Bounded, staged search
+
+For each placement primitive the search is bounded and staged:
+
+- **Coarse → fine.** A limited set of high-quality candidates is generated and
+  ranked; expensive checks run only on finalists.
+- **Pruning.** Candidates that obviously cannot place (outside board/region,
+  overlapping the expanded parent bbox, violating a hard keepout) are rejected
+  before collision scoring.
+- **Early success.** Once an *excellent* legal candidate is found (score under
+  the level's threshold), the search stops instead of chasing a marginally
+  better one.
+- **Caps.** `--max-candidates-per-rule` caps evaluations per primitive so a
+  single rule can never explode into thousands of checks. Legality always wins
+  over the cap: the spacing-escalation ladder is never cut short before a legal
+  placement is found.
+
+### Reflow levels
+
+Reflow is local by default, escalating only as needed (low-priority blockers —
+testpoints, LEDs, straps, pullups, passives — move before critical parts; edge-
+required and mechanically locked parts never move):
+
+```text
+level 0  local primitive only
+level 1  same array/group
+level 2  same parent support region
+level 3  same functional island/path
+level 4  adjacent regions
+level 5  parent IC movement
+```
+
+`fast` uses levels 0–2, `normal` 0–3 (parent movement only when local placement
+is impossible and the parent is movable), `deep` 0–5.
+
+### Profiling
+
+`--profile-placement profile.json` writes per-rule runtime, candidate counts,
+collision-check counts, spatial-index stats, cache hit/miss, reflow attempts,
+and the slowest rules — the data needed to tune a slow board:
+
+```bash
+pcb-place board.kicad_pcb placement.ppl --profile-placement profile.json
+```
+
+### Progress output
+
+`--progress` prints concise, throttled per-rule progress to stderr for long
+runs, e.g. `placing 34/102 C19 DecouplingArray candidates=120 elapsed=8.2s`.
+
 ## Installation
 
 From the repository root:

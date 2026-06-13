@@ -214,17 +214,33 @@ Mechanical anchors, locked parts, and edge-required connectors are never moved d
 
 **No-abort is the default.** Placement continues even when an ideal layout is not achievable, producing degraded-placement warnings instead of an error. Pass `--strict` or `--fail-fast` to turn the first unplaceable component into a hard error.
 
-The optimizer places, scores the global floorplan, reflows the worst constraints, and re-scores up to `--max-floorplan-iterations` passes (default 10), stopping early on convergence.
+The optimizer places, scores the global floorplan, reflows the worst constraints, and re-scores up to `--max-floorplan-iterations` passes (default comes from `--optimization-level`), stopping early on convergence.
 
 | Flag | Effect |
 | --- | --- |
 | `--best-effort` / `--no-best-effort` | Enable (default) or disable no-abort floorplanning |
 | `--fail-fast` | Abort on the first unplaceable component |
 | `--strict` | Treat ambiguous refs *and* unplaceable parts as errors |
-| `--max-floorplan-iterations N` | Cap iterative optimization passes (default 10) |
+| `--max-floorplan-iterations N` | Cap iterative optimization passes (default from level) |
 | `--floorplan-report JSON` | Write the standalone floorplanner/reflow report |
 
 The placement report's `floorplan` block records `reflow_attempts` (level, strategy, moved components/parents, score deltas), `parked`/`parking_fallback_used`, `degraded_warnings`, the per-iteration `iterations` score trajectory, a `congestion_map`, and the aggregate `placement_quality_score`.
+
+### Runtime budgets, optimization levels, and profiling
+
+Placement search is bounded so runtime stays predictable. See the repository
+[`README.md`](../../README.md#performance-and-runtime-budgets) for the full
+discussion; the controlling flags are:
+
+| Flag | Effect |
+| --- | --- |
+| `--optimization-level fast\|normal\|deep` | Search breadth/quality trade-off (default `normal`) |
+| `--time-budget-seconds N` | Wall-clock budget (default `60`, `0` disables). On expiry the best-known placement is kept and marked `requires_review` unless `--strict` |
+| `--max-candidates-per-rule N` | Cap candidate evaluations per primitive (default from level) |
+| `--profile-placement JSON` | Write per-rule runtime, candidate/collision counts, spatial-index and cache stats |
+| `--progress` | Print concise per-rule progress to stderr for long runs |
+
+The report adds `runtime` (elapsed/budget/`timed_out`/`candidates_evaluated`/`cache_hits`), `spatial_index` (cells/queries/`average_candidates_checked`), `profile` (per-rule runtime, counters, slowest rules), and `requires_review` (refs degraded by a timeout). When the budget expires, placement is best-effort: every component is still placed, flagged for review rather than aborting.
 
 ### Priority and Soft Placement
 

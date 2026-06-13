@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pcb-place"
-version = "0.13.0"
+version = "0.14.0"
 description = "Deterministic footprint placement and heuristic planning sidecars for KiCad PCB files"
 readme = "README.md"
 requires-python = ">=3.10"
