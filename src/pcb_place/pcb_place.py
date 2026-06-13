@@ -2407,6 +2407,7 @@ class PlacementEngine:
     def __init__(self, footprints: Mapping[str, Footprint], model: PlacementModel,
                  *, strict: bool = False, allow_suffix_match: bool = True,
                  cardinal_rotations: bool = False, board_geometry: Optional[BoardGeometry] = None,
+                 allow_outside_board: bool = False,
                  allow_keepout_overlap: bool = False, allow_outside_region: bool = False,
                  best_effort: bool = True, fail_fast: bool = False,
                  max_floorplan_iterations: int = 10,
@@ -2432,6 +2433,7 @@ class PlacementEngine:
         self.allow_suffix_match = allow_suffix_match
         self.cardinal_rotations = cardinal_rotations
         self.board_geometry = board_geometry
+        self.allow_outside_board = allow_outside_board
         self.allow_keepout_overlap = allow_keepout_overlap
         self.allow_outside_region = allow_outside_region
         self.messages: List[Message] = []
@@ -2842,7 +2844,7 @@ class PlacementEngine:
             mx, my, _ = self.positions[actual]
             ox, oy = _rot_point(mx - old_anchor[0], my - old_anchor[1], rot_delta)
             targets.append((new_anchor[0] + ox, new_anchor[1] + oy))
-        if self.board_geometry is not None:
+        if self.board_geometry is not None and not self.allow_outside_board:
             clamped_targets = []
             for tx, ty in targets:
                 cx = min(max(tx, self.board_geometry.min_x), self.board_geometry.max_x)
@@ -5393,6 +5395,7 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
                             max_floorplan_iterations=max_floorplan_iterations, strict=strict)
     engine = PlacementEngine(footprints, model, strict=strict, allow_suffix_match=allow_suffix_match,
                              cardinal_rotations=cardinal_rotations, board_geometry=board_geometry,
+                             allow_outside_board=allow_outside_board,
                              allow_keepout_overlap=allow_keepout_overlap,
                              allow_outside_region=allow_outside_region,
                              best_effort=best_effort, fail_fast=fail_fast,

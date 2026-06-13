@@ -1703,6 +1703,27 @@ Cluster("EDGE_CLUSTER", anchor="U1", members=["U1", "C1"], placement=Edge(edge="
     assert any("clamped those anchors inside the board" in message.text for message in messages)
 
 
+def test_cluster_targets_honor_allow_outside_board(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=10, height=10)
+Cluster("EDGE_CLUSTER", anchor="U1", members=["U1", "C1"], placement=Edge(edge="right", y=5))
+''')
+    _out, messages, report = apply_placements(
+        _pcb_with_at("(at 0 5)"),
+        model,
+        strict=True,
+        safe=True,
+        allow_overlap=True,
+        allow_outside_board=True,
+        allow_large_move=True,
+    )
+
+    placements = {item["ref"]: item for item in report["placements"]}
+    assert placements["C1"]["outside_board"] is True
+    assert placements["C1"]["x"] > 10.0
+    assert not any("clamped those anchors inside the board" in message.text for message in messages)
+
+
 def test_decoupling_array_failure_diagnostics_include_parent_bbox_and_sides(tmp_path):
     model = _load_inline(tmp_path, '''
 Board(width=8, height=8)
