@@ -1509,6 +1509,36 @@ Cluster("grp", anchor="U1", members=["U1", "C1"], placement=Anchor(x=30, y=10))
     assert report["auto_adjustments"]
 
 
+def test_edge_required_cluster_spreads_support_members_away_from_anchor(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+PlacementPolicy(avoid_overlap=True, max_search_radius=8, search_step=0.5)
+Cluster("EDGE", anchor="U1", members=["U1", "C1", "C2"], placement=Edge(edge="left", y=20, edge_required=True, locked=True))
+''')
+    _out, _messages, report = apply_placements(
+        _decoupling_array_edge_pcb(2, u_at=(20, 20), u_size=(8, 8)),
+        model,
+        strict=True,
+    )
+    placements = {p["ref"]: p for p in report["placements"]}
+    assert (placements["C1"]["x"], placements["C1"]["y"]) != (placements["C2"]["x"], placements["C2"]["y"])
+    assert report["collisions"] == []
+    assert report["auto_adjustments"]
+
+
+def test_cluster_leaves_locked_non_anchor_member_in_place(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=40, height=40)
+Edge("C1", edge="right", y=10, locked=True)
+Cluster("OTHER", anchor="U1", members=["U1", "C1"], placement=Anchor(x=20, y=20))
+''')
+    _out, messages, report = apply_placements(_decoupling_array_edge_pcb(1), model, strict=True, allow_overlap=True)
+    placements = {p["ref"]: p for p in report["placements"]}
+    assert placements["C1"]["why"] == "edge"
+    assert any("left locked member 'C1' in place" in m.text for m in messages)
+    assert report["locked_move_attempts"] == [{"ref": "C1", "by": "cluster OTHER", "locked_by": "edge rule"}]
+
+
 def test_placement_search_failure_diagnostics(tmp_path):
     model = _load_inline(tmp_path, '''
 Board(width=40, height=40)

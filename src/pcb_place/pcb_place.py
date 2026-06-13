@@ -2864,10 +2864,22 @@ class PlacementEngine:
             max(t[0] for t in targets) + margin, max(t[1] for t in targets) + margin,
         )
         for actual, (tx, ty) in zip(members, targets):
+            if actual != anchor_ref and actual in self.locked:
+                self.locked_move_attempts.append({"ref": actual, "by": f"cluster {name}", "locked_by": self.locked[actual]})
+                self.messages.append(Message(
+                    "warn",
+                    f"cluster {name} left locked member {actual!r} in place; locked by {self.locked[actual]}"))
+                continue
             _x, _y, rot = self.positions[actual]
             new_rot = None if abs(rot_delta) <= 1e-9 else _normalize_rotation(rot + rot_delta)
+            avoid_overlap = (
+                actual != anchor_ref and
+                (self._rule_flag(rule.get("placement", {}), "edge_required", False) or
+                 self._rule_flag(rule.get("placement", {}), "locked", False) or
+                 self._rule_soft(rule, actual))
+            )
             self.place(actual, tx, ty, new_rot, f"cluster {name}", rule.get("note"),
-                       region_override=cluster_region)
+                       avoid_overlap=avoid_overlap, region_override=cluster_region)
             self.last_cluster_by_ref[actual] = name
         if self._rule_flag(rule.get("placement", {}), "edge_required", False):
             self.lock(anchor_ref, f"edge_required cluster {name}")
