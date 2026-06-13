@@ -49,6 +49,27 @@ def test_cli_check_fails_when_stale(tmp_path):
     result = subprocess.run([sys.executable, str(PLACE_CLI), str(pcb), str(ppl), "--check"], capture_output=True, text=True)
     assert result.returncode == 1
 
+
+def test_cli_reports_placement_errors_without_traceback(tmp_path):
+    pcb = tmp_path / "outside.kicad_pcb"
+    ppl = tmp_path / "outside.ppl"
+    pcb.write_text(_pcb_with_at("(at 0 0)"))
+    ppl.write_text('''
+Board(width=10, height=10)
+Anchor("U1", x=20, y=0)
+''')
+
+    result = subprocess.run(
+        [sys.executable, str(PLACE_CLI), str(pcb), str(ppl)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "pcb-place error: validation failed:" in result.stderr
+    assert "outside Board" in result.stderr
+    assert "Traceback" not in result.stderr
+
 from pcb_place import PlacementError
 
 
@@ -1660,6 +1681,47 @@ Anchor("U1", x=20, y=20, rot=0)
     with pytest.raises(PlacementError) as excinfo:
         apply_placements(_decoupling_array_edge_pcb(1, u_at=(2, 20), u_size=(4, 4)), model, strict=True, allow_overlap=True)
     assert "locked footprint 'U1'" in str(excinfo.value)
+
+
+def test_cluster_targets_are_clamped_inside_board(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=10, height=10)
+Cluster("EDGE_CLUSTER", anchor="U1", members=["U1", "C1"], placement=Edge(edge="right", y=5))
+''')
+    _out, messages, report = apply_placements(
+        _pcb_with_at("(at 0 5)"),
+        model,
+        strict=True,
+        safe=True,
+    )
+
+    placements = {item["ref"]: item for item in report["placements"]}
+    assert placements["U1"]["outside_board"] is False
+    assert placements["C1"]["outside_board"] is False
+    assert report["validation_errors"] == 0
+    assert placements["C1"]["x"] <= 10.0
+    assert any("clamped those anchors inside the board" in message.text for message in messages)
+
+
+def test_cluster_targets_honor_allow_outside_board(tmp_path):
+    model = _load_inline(tmp_path, '''
+Board(width=10, height=10)
+Cluster("EDGE_CLUSTER", anchor="U1", members=["U1", "C1"], placement=Edge(edge="right", y=5))
+''')
+    _out, messages, report = apply_placements(
+        _pcb_with_at("(at 0 5)"),
+        model,
+        strict=True,
+        safe=True,
+        allow_overlap=True,
+        allow_outside_board=True,
+        allow_large_move=True,
+    )
+
+    placements = {item["ref"]: item for item in report["placements"]}
+    assert placements["C1"]["outside_board"] is True
+    assert placements["C1"]["x"] > 10.0
+    assert not any("clamped those anchors inside the board" in message.text for message in messages)
 
 
 def test_decoupling_array_failure_diagnostics_include_parent_bbox_and_sides(tmp_path):

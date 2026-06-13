@@ -2407,6 +2407,7 @@ class PlacementEngine:
     def __init__(self, footprints: Mapping[str, Footprint], model: PlacementModel,
                  *, strict: bool = False, allow_suffix_match: bool = True,
                  cardinal_rotations: bool = False, board_geometry: Optional[BoardGeometry] = None,
+                 allow_outside_board: bool = False,
                  allow_keepout_overlap: bool = False, allow_outside_region: bool = False,
                  best_effort: bool = True, fail_fast: bool = False,
                  max_floorplan_iterations: int = 10,
@@ -2432,6 +2433,7 @@ class PlacementEngine:
         self.allow_suffix_match = allow_suffix_match
         self.cardinal_rotations = cardinal_rotations
         self.board_geometry = board_geometry
+        self.allow_outside_board = allow_outside_board
         self.allow_keepout_overlap = allow_keepout_overlap
         self.allow_outside_region = allow_outside_region
         self.messages: List[Message] = []
@@ -2842,6 +2844,39 @@ class PlacementEngine:
             mx, my, _ = self.positions[actual]
             ox, oy = _rot_point(mx - old_anchor[0], my - old_anchor[1], rot_delta)
             targets.append((new_anchor[0] + ox, new_anchor[1] + oy))
+        clamped = False
+        if self.board_geometry is not None and not self.allow_outside_board:
+            clamped_targets = []
+            board_bbox = _geometry_bbox(self.board_geometry)
+            for actual, (tx, ty) in zip(members, targets):
+                _x, _y, current_rot = self.positions[actual]
+                target_rot = current_rot if abs(rot_delta) <= 1e-9 else _normalize_rotation(current_rot + rot_delta)
+                target_bbox = footprint_bbox_at(self.footprints[actual], tx, ty, target_rot, self.model).bbox
+                cx, cy = tx, ty
+                if target_bbox.width <= board_bbox.width:
+                    if target_bbox.min_x < board_bbox.min_x:
+                        cx += board_bbox.min_x - target_bbox.min_x
+                    elif target_bbox.max_x > board_bbox.max_x:
+                        cx += board_bbox.max_x - target_bbox.max_x
+                else:
+                    cx = min(max(cx, self.board_geometry.min_x), self.board_geometry.max_x)
+                if target_bbox.height <= board_bbox.height:
+                    if target_bbox.min_y < board_bbox.min_y:
+                        cy += board_bbox.min_y - target_bbox.min_y
+                    elif target_bbox.max_y > board_bbox.max_y:
+                        cy += board_bbox.max_y - target_bbox.max_y
+                else:
+                    cy = min(max(cy, self.board_geometry.min_y), self.board_geometry.max_y)
+                clamped_targets.append((cx, cy))
+            if clamped_targets != targets:
+                outside_count = sum(1 for (tx, ty), (cx, cy) in zip(targets, clamped_targets)
+                                    if abs(tx - cx) > 1e-9 or abs(ty - cy) > 1e-9)
+                self.messages.append(Message(
+                    "warn",
+                    f"cluster {name} had {outside_count} member target(s) outside board bounds; "
+                    "clamped those anchors inside the board for best-effort placement"))
+                targets = clamped_targets
+                clamped = True
         margin = self.model.policy.max_search_radius + 5.0
         cluster_region = BBox(
             min(t[0] for t in targets) - margin, min(t[1] for t in targets) - margin,
@@ -2851,7 +2886,7 @@ class PlacementEngine:
             _x, _y, rot = self.positions[actual]
             new_rot = None if abs(rot_delta) <= 1e-9 else _normalize_rotation(rot + rot_delta)
             self.place(actual, tx, ty, new_rot, f"cluster {name}", rule.get("note"),
-                       region_override=cluster_region)
+                       avoid_overlap=clamped, region_override=cluster_region)
             self.last_cluster_by_ref[actual] = name
         if self._rule_flag(rule.get("placement", {}), "edge_required", False):
             self.lock(anchor_ref, f"edge_required cluster {name}")
@@ -4500,7 +4535,7 @@ class PlacementEngine:
         if ref not in self.footprints:
             return None
         test_info = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model)
-        if not _board_contains_bbox(self.board_geometry, test_info.bbox):
+        if not self.allow_outside_board and not _board_contains_bbox(self.board_geometry, test_info.bbox):
             if ref not in self.allow_body_outside_refs:
                 return "would leave board bounds"
             if self.board_geometry is not None and not self.board_geometry.contains(x, y):
@@ -5379,6 +5414,7 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
                             max_floorplan_iterations=max_floorplan_iterations, strict=strict)
     engine = PlacementEngine(footprints, model, strict=strict, allow_suffix_match=allow_suffix_match,
                              cardinal_rotations=cardinal_rotations, board_geometry=board_geometry,
+                             allow_outside_board=allow_outside_board,
                              allow_keepout_overlap=allow_keepout_overlap,
                              allow_outside_region=allow_outside_region,
                              best_effort=best_effort, fail_fast=fail_fast,
@@ -5761,7 +5797,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if args.list_aliases:
@@ -5912,9 +5948,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
-if __name__ == "__main__":
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point that reports placement failures without a Python traceback."""
+
     try:
-        raise SystemExit(main())
+        return _main(argv)
     except PlacementError as exc:
         print(f"pcb-place error: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
