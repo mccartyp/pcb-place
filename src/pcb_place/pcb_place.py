@@ -2748,6 +2748,31 @@ class PlacementEngine:
         parts.append(f"fallback_used={outcome.fallback_used}")
         return "; ".join(parts)
 
+    def _resolve_unplaceable_search(self, actual_ref: str, why: str, outcome: SearchOutcome,
+                                    requested: Point, rot: Optional[float], *,
+                                    region: Optional[BBox], clearance_override: Optional[float],
+                                    allow_keepout_overlap: bool) -> Tuple[float, float]:
+        """No-abort handling when a single-part candidate search finds nothing.
+
+        Shared by NearPad / Satellite / Between (and their auto-side variants):
+        try a Level-2 reflow that frees movable support near the requested
+        point, otherwise park.  Only strict / fail-fast actually raise.
+        """
+
+        primary_x, primary_y = requested
+        eval_rot = rot if rot is not None else self.positions[actual_ref][2]
+        if self.best_effort:
+            placed = self._reflow_single(actual_ref, primary_x, primary_y, eval_rot,
+                                         clearance_override=clearance_override, region=region,
+                                         allow_keepout_overlap=allow_keepout_overlap, why=why)
+            if placed is not None:
+                return (placed[0], placed[1])
+        detail = self._format_search_failure(actual_ref, why, outcome, requested=requested)
+        if not self.best_effort:
+            raise PlacementError(detail)
+        self._park(actual_ref, primary_x, primary_y, why, reason=detail, penalty=200.0)
+        return (primary_x, primary_y)
+
     def _board_inward_sides(self, x: float, y: float) -> List[str]:
         """Order cardinal sides preferring the direction toward the board interior."""
 
@@ -2920,7 +2945,14 @@ class PlacementEngine:
                                               forbidden_bboxes=forbidden_bboxes)
                 chosen = outcome.chosen
         if chosen is None:
-            raise PlacementError(self._format_search_failure(actual_ref, why, outcome, requested=(primary_x, primary_y)))
+            px, py = self._resolve_unplaceable_search(
+                actual_ref, why, outcome, (primary_x, primary_y), rot,
+                region=region, clearance_override=clearance_override,
+                allow_keepout_overlap=allow_keepout_overlap)
+            self.place(rule["ref"], px, py, rot, why, rule.get("note"),
+                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
+                       clearance_override=clearance_override, rule=rule)
+            return
 
         self.place(rule["ref"], chosen.x, chosen.y, rot, why, rule.get("note"),
                    allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
@@ -2973,7 +3005,14 @@ class PlacementEngine:
                                               forbidden_bboxes=forbidden_bboxes)
                 chosen = outcome.chosen
         if chosen is None:
-            raise PlacementError(self._format_search_failure(actual_ref, "satellite", outcome, requested=(primary_x, primary_y)))
+            sx, sy = self._resolve_unplaceable_search(
+                actual_ref, "satellite", outcome, (primary_x, primary_y), rot,
+                region=region, clearance_override=clearance_override,
+                allow_keepout_overlap=allow_keepout_overlap)
+            self.place(rule["ref"], sx, sy, rot, "satellite", rule.get("note"),
+                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
+                       clearance_override=clearance_override, rule=rule)
+            return
 
         self.place(rule["ref"], chosen.x, chosen.y, rot, "satellite", rule.get("note"),
                    allow_arbitrary_rotation=self._allow_arbitrary_rotation(dict(rule)),
@@ -3022,7 +3061,14 @@ class PlacementEngine:
                                               allow_keepout_overlap=allow_keepout_overlap)
                 chosen = outcome.chosen
         if chosen is None:
-            raise PlacementError(self._format_search_failure(actual_ref, "between", outcome, requested=(primary_x, primary_y)))
+            bx2, by2 = self._resolve_unplaceable_search(
+                actual_ref, "between", outcome, (primary_x, primary_y), rot,
+                region=region, clearance_override=clearance_override,
+                allow_keepout_overlap=allow_keepout_overlap)
+            self.place(rule["ref"], bx2, by2, rot, "between", rule.get("note"),
+                       allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
+                       clearance_override=clearance_override, rule=rule)
+            return
 
         self.place(rule["ref"], chosen.x, chosen.y, rot, "between", rule.get("note"),
                    allow_arbitrary_rotation=self._allow_arbitrary_rotation(rule),
@@ -4185,7 +4231,8 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
                         allow_overlap: bool = False, warn_overlap: bool = False,
                         allow_outside_board: bool = False,
                         allow_keepout_overlap: bool = False,
-                        allow_outside_region: bool = False) -> List[Message]:
+                        allow_outside_region: bool = False,
+                        degraded_refs: Optional[Set[str]] = None) -> List[Message]:
     """Run lightweight, CI-friendly placement validation.
 
     KiCad footprints can have complex outlines.  This first validator uses
@@ -4196,6 +4243,13 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
     """
 
     messages: List[Message] = []
+    # Parked (degraded) footprints are already reported as no-abort warnings; do
+    # not let them re-trip fatal validation in best-effort mode.
+    degraded = degraded_refs or set()
+
+    def _level(*refs: str, base: str = "error") -> str:
+        return "warn" if any(r in degraded for r in refs) else base
+
     geometry = engine.board_geometry
     if geometry is not None and geometry.source != "inferred_from_footprints":
         if geometry.width <= 0 or geometry.height <= 0:
@@ -4203,7 +4257,7 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
         for ref in sorted(engine.updates):
             x, y, _rot = engine.positions[ref]
             if not geometry.contains(x, y) and not allow_outside_board:
-                messages.append(Message("error", f"{ref!r} is outside Board geometry ({geometry.source}): x={_fmt_num(x)} y={_fmt_num(y)}"))
+                messages.append(Message(_level(ref), f"{ref!r} is outside Board geometry ({geometry.source}): x={_fmt_num(x)} y={_fmt_num(y)}"))
 
     # Near-coincident origins are usually accidental overlaps in generated placements.
     # Limit this initial check to footprints touched by this run; otherwise an
@@ -4215,26 +4269,26 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
         for b in refs[i + 1:]:
             bx, by, _ = engine.positions[b]
             if math.hypot(ax - bx, ay - by) < min_spacing:
-                messages.append(Message("warn" if (allow_overlap or warn_overlap) else "error",
+                messages.append(Message("warn" if (allow_overlap or warn_overlap) else _level(a, b),
                                         f"{a!r} and {b!r} have overlapping/near-coincident origins"))
 
     for item in keepout_violations(engine, refs=engine.updates, allow_keepout_overlap=allow_keepout_overlap):
-        messages.append(Message("error", f"{item['ref']!r} bbox overlaps keepout {item['keepout']!r}"))
+        messages.append(Message(_level(item['ref']), f"{item['ref']!r} bbox overlaps keepout {item['keepout']!r}"))
     for item in region_violations(engine, refs=engine.updates, allow_outside_region=allow_outside_region):
-        messages.append(Message("error", f"{item['ref']!r} bbox is outside region {item['region']!r}"))
+        messages.append(Message(_level(item['ref']), f"{item['ref']!r} bbox is outside region {item['region']!r}"))
 
     collisions, violations, bbox_warnings = spacing_analysis(engine, refs=engine.updates)
     for warning in bbox_warnings:
         messages.append(Message("warn", warning["message"]))
-    overlap_level = "warn" if (allow_overlap or warn_overlap) else "error"
     for item in collisions:
+        overlap_level = "warn" if (allow_overlap or warn_overlap) else _level(item['ref_a'], item['ref_b'])
         messages.append(Message(overlap_level,
             f"ERROR: {item['ref_a']} overlaps {item['ref_b']}\n"
             f"  {item['ref_a']} bbox: {item['bbox_a']}\n"
             f"  {item['ref_b']} bbox: {item['bbox_b']}\n"
             f"  required clearance: {_fmt_num(item['required_clearance'])} mm"))
     for item in violations:
-        level = "warn" if (allow_overlap or warn_overlap) else "error"
+        level = "warn" if (allow_overlap or warn_overlap) else _level(item['ref_a'], item['ref_b'])
         messages.append(Message(level,
             f"{item['ref_a']} and {item['ref_b']} spacing {_fmt_num(item['actual_clearance'])} mm is below "
             f"required {_fmt_num(item['required_clearance'])} mm ({item['class_a']} to {item['class_b']})"))
@@ -4243,8 +4297,11 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
 
 
 def validate_safe_placements(engine: PlacementEngine, *, allow_large_move: bool = False,
-                             allow_outside_board: bool = False) -> List[Message]:
+                             allow_outside_board: bool = False,
+                             degraded_refs: Optional[Set[str]] = None) -> List[Message]:
     """Pre-write safety checks intended to prevent dangerous KiCad output."""
+
+    degraded = degraded_refs or set()
 
     messages: List[Message] = []
     original_bounds = footprint_bounds(engine.footprints)
@@ -4265,14 +4322,18 @@ def validate_safe_placements(engine: PlacementEngine, *, allow_large_move: bool 
             messages.append(Message("error", message.text))
 
     for update in engine.updates.values():
+        # Non-finite coordinates are always fatal (they corrupt KiCad output),
+        # even for parked parts.  Geometric degradations for parked parts are
+        # demoted to warnings so the no-abort default does not abort on write.
+        degraded_level = "warn" if update.ref in degraded else "error"
         if not all(math.isfinite(v) for v in (update.x, update.y, update.final_rot)):
             messages.append(Message("error", f"{update.ref!r} has non-finite placement coordinate or rotation"))
         if update.outside_board and not allow_outside_board:
-            messages.append(Message("error", f"{update.ref!r} would be outside Board bounds at x={_fmt_num(update.x)} y={_fmt_num(update.y)}; use --allow-outside-board to override"))
+            messages.append(Message(degraded_level, f"{update.ref!r} would be outside Board bounds at x={_fmt_num(update.x)} y={_fmt_num(update.y)}; use --allow-outside-board to override"))
         far_x = update.x < safe_bounds["min_x"] - margin_x or update.x > safe_bounds["max_x"] + margin_x
         far_y = update.y < safe_bounds["min_y"] - margin_y or update.y > safe_bounds["max_y"] + margin_y
         if (far_x or far_y) and not allow_large_move:
-            messages.append(Message("error", f"{update.ref!r} would move far outside BoardGeometry bounds; use --allow-large-move to override"))
+            messages.append(Message(degraded_level, f"{update.ref!r} would move far outside BoardGeometry bounds; use --allow-large-move to override"))
     return messages
 
 
@@ -4728,13 +4789,18 @@ def apply_placements(text: str, model: PlacementModel, *, strict: bool = False,
                              best_effort=best_effort, fail_fast=fail_fast,
                              max_floorplan_iterations=max_floorplan_iterations)
     engine.run_floorplan()
+    # In no-abort mode, parked footprints are intentionally degraded; their
+    # geometric violations are reported as warnings, not fatal errors.
+    degraded_refs = set(engine.parked)
     collision_messages = validate_placements(engine, allow_overlap=allow_overlap, warn_overlap=warn_overlap,
                                              allow_outside_board=allow_outside_board,
                                              allow_keepout_overlap=allow_keepout_overlap,
-                                             allow_outside_region=allow_outside_region)
+                                             allow_outside_region=allow_outside_region,
+                                             degraded_refs=degraded_refs)
     validation_messages = collision_messages if (validate or safe) else []
     safety_messages = validate_safe_placements(engine, allow_large_move=allow_large_move,
-                                               allow_outside_board=allow_outside_board) if safe else []
+                                               allow_outside_board=allow_outside_board,
+                                               degraded_refs=degraded_refs) if safe else []
     engine.messages.extend(validation_messages)
     if strict and any(m.level == "error" for m in engine.messages):
         raise PlacementError("validation failed: " + "; ".join(m.text for m in engine.messages if m.level == "error"))

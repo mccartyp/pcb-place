@@ -253,6 +253,48 @@ def test_spacing_profile_enforced(tmp_path):
             assert dist >= 1.0
 
 
+def _satellite_blocked_scene():
+    """A satellite cap that cannot find any legal location near its parent."""
+
+    pcb = _pcb([_fp("U1", "U", 2, 2, pad=3.4), _fp("C1", "C", 0, 0)])
+    ppl = (
+        "Board(width=4, height=4)\n"
+        "Spacing(default=0.25)\n"
+        "PlacementPolicy(allow_anchor_move=False, max_search_radius=1, search_step=0.5)\n"
+        'Anchor("U1", x=2, y=2, rot=0)\n'
+        'Satellite("C1", parent="U1", side="top", distance=2)\n'
+    )
+    return pcb, ppl
+
+
+def test_primitive_search_failure_parks_by_default(tmp_path):
+    """NearPad/Satellite/Between search failures must not abort in best-effort mode."""
+
+    pcb, ppl = _satellite_blocked_scene()
+    _out, _msgs, report = _run(tmp_path, pcb, ppl)
+    floor = report["floorplan"]
+    assert floor["parking_fallback_used"] >= 1
+    assert "C1" in {p["ref"] for p in floor["parked"]}
+    assert report["placements_applied"] >= 1  # parked part still gets a coordinate
+
+
+def test_primitive_search_failure_aborts_in_strict(tmp_path):
+    pcb, ppl = _satellite_blocked_scene()
+    with pytest.raises(PlacementError):
+        _run(tmp_path, pcb, ppl, strict=True)
+
+
+def test_parked_parts_do_not_abort_fatal_write_validation(tmp_path):
+    """Parked (degraded) parts must not trip fatal safe validation on a real write."""
+
+    pcb, ppl = _decoupling_scene(obstacles_locked=True, allow_anchor_move=False)
+    # safety_fatal mirrors the normal (non-dry-run) CLI write path.
+    _out, msgs, report = _run(tmp_path, pcb, ppl, safe=True, safety_fatal=True)
+    assert report["floorplan"]["parking_fallback_used"] >= 1
+    # No fatal errors survive for the parked refs in best-effort mode.
+    assert all(m.level != "error" for m in msgs)
+
+
 def test_best_effort_never_raises_but_strict_does(tmp_path):
     """Same unplaceable input: default succeeds (parks), strict raises."""
 
