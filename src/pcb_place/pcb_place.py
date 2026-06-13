@@ -662,6 +662,10 @@ def infer_geometry_from_footprints(footprints: Mapping[str, Footprint],
     """
 
     bounds = footprint_extents_bounds(footprints)
+    if not footprints:
+        # Nothing to infer from: stay invalid (zero size) so callers reject it with
+        # a clear, sourced error instead of inventing a 2*margin square board.
+        return BoardGeometry(bounds["min_x"], bounds["min_y"], 0.0, 0.0, "footprint_extents")
     margin = max(0.0, float(margin))
     width = bounds["max_x"] - bounds["min_x"] + 2.0 * margin
     height = bounds["max_y"] - bounds["min_y"] + 2.0 * margin
@@ -4299,14 +4303,17 @@ def validate_placements(engine: PlacementEngine, *, min_spacing: float = 0.25,
         return "warn" if any(r in degraded for r in refs) else base
 
     geometry = engine.board_geometry
-    if geometry is not None and geometry.source != "footprint_extents":
+    if geometry is not None:
         if geometry.width <= 0 or geometry.height <= 0:
+            # Non-positive dimensions are always invalid, even for the low-confidence
+            # footprint_extents fallback (e.g. a board with no parseable footprints).
             messages.append(Message("error", f"invalid board geometry: width={_fmt_num(geometry.width)} "
                                               f"height={_fmt_num(geometry.height)} source={geometry.source}"))
-        for ref in sorted(engine.updates):
-            x, y, _rot = engine.positions[ref]
-            if not geometry.contains(x, y) and not allow_outside_board:
-                messages.append(Message(_level(ref), f"{ref!r} is outside Board geometry ({geometry.source}): x={_fmt_num(x)} y={_fmt_num(y)}"))
+        elif geometry.source != "footprint_extents":
+            for ref in sorted(engine.updates):
+                x, y, _rot = engine.positions[ref]
+                if not geometry.contains(x, y) and not allow_outside_board:
+                    messages.append(Message(_level(ref), f"{ref!r} is outside Board geometry ({geometry.source}): x={_fmt_num(x)} y={_fmt_num(y)}"))
 
     # Near-coincident origins are usually accidental overlaps in generated placements.
     # Limit this initial check to footprints touched by this run; otherwise an

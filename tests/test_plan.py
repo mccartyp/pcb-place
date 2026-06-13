@@ -706,12 +706,14 @@ def test_pcb_plan_emit_allow_low_confidence_override(tmp_path):
 # Two coincident footprints (both at 10,10) regressed to a zero-size board because
 # the old fallback used only footprint at-positions, not their bounding boxes.
 _COINCIDENT_FOOTPRINT_BOARD = '''(kicad_pcb (version 20240108) (generator "pcb-plan-test")
-  (footprint "Resistor_SMD:R_0402" (layer "F.Cu") (at 10 10 0)
+  (footprint "Resistor_SMD:R_0402" (layer "F.Cu")
+    (at 10 10 0)
     (property "Reference" "R1" (at 0 0 0))
     (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu"))
     (pad "2" smd rect (at 0.5 0) (size 0.5 0.5) (layers "F.Cu"))
   )
-  (footprint "Resistor_SMD:R_0402" (layer "F.Cu") (at 10 10 0)
+  (footprint "Resistor_SMD:R_0402" (layer "F.Cu")
+    (at 10 10 0)
     (property "Reference" "R2" (at 0 0 0))
     (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu"))
     (pad "2" smd rect (at 0.5 0) (size 0.5 0.5) (layers "F.Cu"))
@@ -772,6 +774,25 @@ def test_zero_geometry_fails_with_sourced_message():
         assert str(exc) == "invalid board geometry: width=0 height=0 source=footprint_extents"
     else:
         raise AssertionError("expected PlacementError for zero geometry")
+
+
+def test_empty_footprints_stay_invalid(tmp_path):
+    # With no parseable footprints there is nothing to infer from; the margin must
+    # not fabricate a board. Geometry stays zero-size and is rejected with a
+    # clear, sourced message rather than producing a 10x10 board.
+    from pcb_place import infer_geometry_from_footprints, PlacementError
+    geom = infer_geometry_from_footprints({})
+    assert geom.source == "footprint_extents"
+    assert geom.width == 0 and geom.height == 0
+    board_path = tmp_path / "empty.kicad_pcb"
+    board_path.write_text("(kicad_pcb (version 20240108) (generator \"t\"))\n", encoding="utf-8")
+    try:
+        pcb_plan._load_plan_from_inputs(board_path, None, None)
+    except PlacementError as exc:
+        assert "invalid board geometry" in str(exc)
+        assert "source=footprint_extents" in str(exc)
+    else:
+        raise AssertionError("expected PlacementError for empty footprints")
 
 
 def test_cli_geometry_overrides_footprint_extents(tmp_path):
