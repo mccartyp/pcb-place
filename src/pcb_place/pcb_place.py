@@ -2564,6 +2564,14 @@ class PlacementEngine:
             self._spatial_index_built_version = self._index_version
         return self._spatial_index
 
+    def _raise_strict_timeout(self) -> None:
+        """Raise the strict-mode timeout error after the budget has expired."""
+
+        if self.runtime.strict:
+            raise PlacementError(
+                f"placement time budget of {self.runtime.time_budget_seconds:g}s exceeded "
+                f"after {self.runtime.elapsed():.1f}s (strict mode)")
+
     def _maybe_degrade_on_timeout(self) -> None:
         """If the wall-clock budget is spent, enter best-effort degrade mode.
 
@@ -2576,10 +2584,7 @@ class PlacementEngine:
             return
         # expired() set timed_out=True.  Check strict before the once-only guard
         # so a timeout first observed on a non-strict search path still aborts.
-        if self.runtime.strict:
-            raise PlacementError(
-                f"placement time budget of {self.runtime.time_budget_seconds:g}s exceeded "
-                f"after {self.runtime.elapsed():.1f}s (strict mode)")
+        self._raise_strict_timeout()
         if self._degrade_announced:
             return
         self._degrade_announced = True
@@ -3152,6 +3157,7 @@ class PlacementEngine:
                     break
             # Honour the wall-clock budget mid-search; keep the best so far.
             if evaluated % 64 == 0 and budget.expired():
+                self._raise_strict_timeout()
                 break
         chosen = best_legal
         outcome = SearchOutcome(ref, target, attempted, chosen, search_radius_used, fallback_used)
@@ -4403,15 +4409,17 @@ class PlacementEngine:
                             if scored.score <= excellent:
                                 self.profiler.incr("candidates_early_accepted")
                                 search_done = True
-                        # Bounding only kicks in once a legal layout exists, so the
-                        # spacing-escalation ladder is never cut short before a legal
-                        # placement is found.  After a legal layout, only a small
-                        # post-legal budget of better-score probing is allowed.
-                        if chosen_attempt is not None:
+                        # Honour the wall-clock budget even before a legal layout
+                        # exists; strict mode must fail promptly and best-effort mode
+                        # keeps the best attempt seen so far.  Candidate-count bounding
+                        # still kicks in only once a legal layout exists, so the spacing
+                        # ladder is not capped prematurely when time remains.
+                        if len(attempts) % 32 == 0 and self.runtime.expired():
+                            self._raise_strict_timeout()
+                            search_done = True
+                        elif chosen_attempt is not None:
                             since_legal = len(attempts) - (attempts_at_first_legal or 0)
                             if len(attempts) >= attempt_cap or since_legal >= post_legal_budget:
-                                search_done = True
-                            elif len(attempts) % 32 == 0 and self.runtime.expired():
                                 search_done = True
                         if search_done:
                             break
