@@ -1003,3 +1003,25 @@ def test_floorplan_keeps_core_parts_out_of_keepouts():
     # U1's body (±3 mm) must not intrude the keepout rectangle [20,80]x[20,80].
     assert x - 3.0 >= 80.0 or x + 3.0 <= 20.0 or y - 3.0 >= 80.0 or y + 3.0 <= 20.0, \
         f"U1 at ({x:.1f},{y:.1f}) intrudes the keepout"
+
+
+def test_floorplan_keeps_ic_bodies_clear_on_a_tight_board():
+    # Several ICs all wired to one right-edge connector would jam toward that
+    # corner; the floorplanner must still return clearance-clean IC positions.
+    board = pcb_plan.BoardGeometry(0.0, 0.0, 45.0, 45.0, "cli")
+    components = {"J1": _conn_component("J1", 43.0, 22.0, 4.0, 6.0, ["BUS", "GND"])}
+    for i in range(5):
+        c = _plan_component(f"U{i+1}", 5.0, 5.0 + i, "ic", ["BUS", "GND"])
+        components[f"U{i+1}"] = pcb_plan.dataclasses.replace(
+            c, bbox=pcb_plan.BBox(c.x - 3, c.y - 3, c.x + 3, c.y + 3))
+    nets = _plan_nets(components)
+    fp = pcb_plan.compute_floorplan(board, components, nets, {}, {}, [],
+                                    pcb_plan.DEFAULT_SPACING_PROFILE)
+    ics = [r for r in fp.core_xy if r.startswith("U")]
+    for i, a in enumerate(ics):
+        ax, ay = fp.core_xy[a]
+        for b in ics[i + 1:]:
+            bx, by = fp.core_xy[b]
+            # real 6 mm bodies must not overlap (centers >= 6 mm apart on an axis)
+            assert abs(ax - bx) >= 6.0 - 1e-6 or abs(ay - by) >= 6.0 - 1e-6, \
+                f"{a} and {b} bodies overlap"

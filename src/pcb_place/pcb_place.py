@@ -2966,12 +2966,19 @@ class PlacementEngine:
             min(t[0] for t in targets) - margin, min(t[1] for t in targets) - margin,
             max(t[0] for t in targets) + margin, max(t[1] for t in targets) + margin,
         )
+        other_cluster_anchors = self._cluster_anchor_refs()
         for idx, (actual, (tx, ty)) in enumerate(zip(members, targets)):
             if actual != anchor_ref and actual in self.locked:
                 self.locked_move_attempts.append({"ref": actual, "by": f"cluster {name}", "locked_by": self.locked[actual]})
                 self.messages.append(Message(
                     "warn",
                     f"cluster {name} left locked member {actual!r} in place; locked by {self.locked[actual]}"))
+                continue
+            # A member that is itself another cluster's anchor owns its own
+            # (floorplanned) position; do not relocate it as a satellite here.
+            # This stops circular cluster membership (e.g. J4 listing U11 and
+            # U11 listing J4) from dragging an anchored part onto its neighbor.
+            if actual != anchor_ref and actual in other_cluster_anchors:
                 continue
             _x, _y, rot = self.positions[actual]
             new_rot = None if abs(rot_delta) <= 1e-9 else _normalize_rotation(rot + rot_delta)

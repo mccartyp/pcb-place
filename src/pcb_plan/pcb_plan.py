@@ -1912,6 +1912,7 @@ class FloorplanResult:
     notes: List[str]
     wirelength_before: float
     wirelength_after: float
+    rf_keepouts: Dict[str, Dict[str, float]]               # rf ref -> board-local keepout rect
 
 
 def _fp_net_weight(name: str) -> float:
@@ -2022,6 +2023,17 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
     _gap = float(spacing.get("connector_to_component", 1.0))
     _all_edges = ("left", "right", "top", "bottom")
 
+    # Corner mounting holes eat into both edges that meet at their corner, so
+    # connectors must start beyond the hole's reach (inset + hole half-extent).
+    _corner_reserve = 0.0
+    for assignment in mounting_hole_plan:
+        ref = assignment.get("ref")
+        if assignment.get("kind") != "corner" or ref not in components:
+            continue
+        hw, hh = _fp_component_extent(components[ref])
+        _corner_reserve = max(_corner_reserve,
+                              float(assignment.get("inset", 3.0)) + 0.5 * max(hw, hh) + _gap)
+
     def _edge_span(side: str) -> float:
         # Connectors on a vertical (left/right) edge are distributed along y, so
         # the available length is the board height; horizontal edges use width.
@@ -2029,7 +2041,7 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
 
     def _edge_margin(side: str) -> float:
         span = _edge_span(side)
-        return min(max(0.1 * span, 8.0), 0.45 * span)
+        return min(max(max(0.1 * span, 8.0), _corner_reserve), 0.45 * span)
 
     def _edge_usable(side: str) -> float:
         return max(_edge_span(side) - 2.0 * _edge_margin(side), 1e-6)
@@ -2091,9 +2103,14 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
         refs.sort(key=lambda r: (_orig_along(r), r))
         n = len(refs)
         max_extent = max((max(_fp_component_extent(components[r])) for r in refs), default=0.0)
+        # The first/last connector's body (center +/- half its extent) must also
+        # clear the corner reserve, so push the end margin out by that half.
+        end_margin = max(margin, _corner_reserve + max_extent / 2.0)
+        usable = max(span - 2.0 * end_margin, 1e-6)
         pitch = max(usable / n, max_extent + _gap)
         total = pitch * n
         start = (span / 2.0) - total / 2.0 + pitch / 2.0
+        margin = end_margin
         for i, r in enumerate(refs):
             along = _clamp(start + i * pitch, margin, span - margin)
             edge_along_abs[r] = (side, along)
@@ -2163,18 +2180,19 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
         if best is not None:
             support_count[best] += 1
 
-    # Effective extents.  RF modules also reserve their antenna keepout footprint
-    # on every side so nothing is placed inside the synthesized RF keepout.
-    extent: Dict[str, Tuple[float, float]] = {}
+    # Two extent maps.  ``extent_hard`` is the real footprint that pcb-place
+    # validates -- it must never overlap, so it drives clamping and the final
+    # legalization.  ``extent_soft`` adds a support halo so, when the board has
+    # room, ICs are spread far enough apart for the executor to pack their
+    # decoupling/pullup arrays without reflowing the IC; on a tight board the
+    # soft pass simply can't fully separate and the hard pass takes over.
+    extent_hard: Dict[str, Tuple[float, float]] = {}
+    extent_soft: Dict[str, Tuple[float, float]] = {}
     for ref in core_refs:
         w, h = _fp_component_extent(components[ref])
+        extent_hard[ref] = (w, h)
         halo = min(10.0, 1.6 * math.sqrt(support_count[ref])) if support_count[ref] else 0.0
-        w += 2.0 * halo
-        h += 2.0 * halo
-        if components[ref].role == "rf_module":
-            w += 12.0
-            h += 10.0
-        extent[ref] = (w, h)
+        extent_soft[ref] = (w + 2.0 * halo, h + 2.0 * halo)
 
     # Fixed obstacles the ICs must avoid: edge-connector bodies and mounting
     # holes.  An edge connector's footprint origin sits roughly half its body
@@ -2213,7 +2231,9 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
         fixed_boxes.append((ox + kx + kw / 2.0, oy + ky + kh / 2.0, kw / 2.0, kh / 2.0, "keepout"))
 
     def _clamp_core(ref: str, x: float, y: float) -> Tuple[float, float]:
-        w, h = extent[ref]
+        # Clamp by the real footprint so parts can use the whole core even when
+        # their soft halo would otherwise be pinned against the inset boundary.
+        w, h = extent_hard[ref]
         lo_x, hi_x = core_min_x + w / 2.0, max(core_min_x + w / 2.0, core_max_x - w / 2.0)
         lo_y, hi_y = core_min_y + h / 2.0, max(core_min_y + h / 2.0, core_max_y - h / 2.0)
         return (_clamp(x, lo_x, hi_x), _clamp(y, lo_y, hi_y))
@@ -2272,7 +2292,9 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
 
     wl_before = _wirelength()
 
-    def _resolve_overlaps(eps: float) -> int:
+    def _resolve_overlaps(eps: float, ext: Dict[str, Tuple[float, float]],
+                          boxes: Sequence[Tuple[float, float, float, float, str]],
+                          movable: Sequence[str]) -> int:
         """One separation pass; pushes movable ICs apart and out of fixed bodies.
 
         Returns the number of pairs that were overlapping.  Separation is applied
@@ -2282,11 +2304,11 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
         """
 
         moved = 0
-        for a_i, a in enumerate(core_refs):
-            wa, ha = extent[a]
+        for a_i, a in enumerate(movable):
+            wa, ha = ext[a]
             # movable vs movable
-            for b in core_refs[a_i + 1:]:
-                wb, hb = extent[b]
+            for b in movable[a_i + 1:]:
+                wb, hb = ext[b]
                 clr = _fp_pair_clearance(components[a].role, components[b].role, spacing)
                 dx = pos[b][0] - pos[a][0]
                 dy = pos[b][1] - pos[a][1]
@@ -2305,7 +2327,7 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
                     pos[b][0], pos[b][1] = _clamp_core(b, pos[b][0], pos[b][1])
                     moved += 1
             # movable vs fixed obstacle (connector body / mounting hole / keepout)
-            for (fx, fy, fhw, fhh, frole) in fixed_boxes:
+            for (fx, fy, fhw, fhh, frole) in boxes:
                 # A keepout is a hard no-overlap zone; any small gap satisfies it,
                 # so do not pile on the IC spread/isolation margins here.
                 clr = (float(spacing.get("default", 0.25)) if frole == "keepout"
@@ -2363,12 +2385,81 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
             pos[ref][1] += max(-6.0, min(6.0, force[ref][1] * 0.05 * cooling))
             pos[ref][0], pos[ref][1] = _clamp_core(ref, pos[ref][0], pos[ref][1])
 
-        _resolve_overlaps(eps=0.0)
+        _resolve_overlaps(0.0, extent_soft, fixed_boxes, core_refs)
 
-    # --- final legalization sweep (guarantee class clearance if possible) ----
-    for _ in range(1500):
-        if _resolve_overlaps(eps=1e-6) == 0:
+    # Soft spreading pass: use the halo extents while there is still room.
+    for _ in range(800):
+        if _resolve_overlaps(1e-6, extent_soft, fixed_boxes, core_refs) == 0:
             break
+
+    # Now synthesize each RF antenna keepout at the module's solved location and
+    # pin the module: the keepout becomes a hard obstacle so no other part is
+    # legalized into it (a keepout overlap is a hard pcb-place failure).
+    rf_keepouts: Dict[str, Dict[str, float]] = {}
+    hard_boxes = list(fixed_boxes)
+    rf_refs = [r for r in core_refs if components[r].role == "rf_module"]
+    for ref in rf_refs:
+        comp = components[ref]
+        new_origin = (pos[ref][0], pos[ref][1])
+        delta = (new_origin[0] - comp.x, new_origin[1] - comp.y)
+        moved_comp = dataclasses.replace(
+            comp, x=new_origin[0], y=new_origin[1],
+            bbox=comp.bbox.translated(delta[0], delta[1]) if comp.bbox is not None else None)
+        rect = _synthesized_rf_keepout(moved_comp, board)
+        rf_keepouts[ref] = rect
+        hard_boxes.append((ox + rect["x"] + rect["w"] / 2.0, oy + rect["y"] + rect["h"] / 2.0,
+                           rect["w"] / 2.0, rect["h"] / 2.0, "keepout"))
+        # The module itself is now fixed; treat its real body as an obstacle.
+        rw, rh = extent_hard[ref]
+        hard_boxes.append((pos[ref][0], pos[ref][1], rw / 2.0, rh / 2.0, "connector"))
+
+    # --- final legalization: guarantee real-body + keepout clearance ---------
+    movable_hard = [r for r in core_refs if r not in rf_refs]
+    for _ in range(2000):
+        if _resolve_overlaps(1e-6, extent_hard, hard_boxes, movable_hard) == 0:
+            break
+
+    # Decompaction fallback: pairwise relaxation can wedge parts against the core
+    # boundary (common on small boards where wirelength concentrates parts).  Any
+    # part still overlapping is relocated to the first genuinely free grid cell,
+    # which guarantees a clearance-clean layout whenever the core has room.
+    def _spot_free(ref: str, x: float, y: float) -> bool:
+        wa, ha = extent_hard[ref]
+        for o in movable_hard:
+            if o == ref:
+                continue
+            wo, ho = extent_hard[o]
+            clr = _fp_pair_clearance(components[ref].role, components[o].role, spacing)
+            if ((wa + wo) / 2.0 + clr - abs(pos[o][0] - x) > 1e-6 and
+                    (ha + ho) / 2.0 + clr - abs(pos[o][1] - y) > 1e-6):
+                return False
+        for (fx, fy, fhw, fhh, frole) in hard_boxes:
+            clr = (float(spacing.get("default", 0.25)) if frole == "keepout"
+                   else _fp_pair_clearance(components[ref].role, frole, spacing))
+            if (wa / 2.0 + fhw + clr - abs(fx - x) > 1e-6 and
+                    ha / 2.0 + fhh + clr - abs(fy - y) > 1e-6):
+                return False
+        return True
+
+    for _ in range(3):
+        if all(_spot_free(r, pos[r][0], pos[r][1]) for r in movable_hard):
+            break
+        for ref in movable_hard:
+            if _spot_free(ref, pos[ref][0], pos[ref][1]):
+                continue
+            wa, ha = extent_hard[ref]
+            step = max(1.5, 0.5 * min(wa, ha))
+            placed = False
+            gy = core_min_y + ha / 2.0
+            while gy <= core_max_y - ha / 2.0 + 1e-9 and not placed:
+                gx = core_min_x + wa / 2.0
+                while gx <= core_max_x - wa / 2.0 + 1e-9:
+                    if _spot_free(ref, gx, gy):
+                        pos[ref] = [gx, gy]
+                        placed = True
+                        break
+                    gx += step
+                gy += step
 
     core_xy: Dict[str, Tuple[float, float]] = {}
     for ref in core_refs:
@@ -2381,7 +2472,8 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
 
     edge_connectors = {ref: (side, along) for ref, (side, along) in edge_along_abs.items()}
     return FloorplanResult(edge_connectors=edge_connectors, core_xy=core_xy,
-                           notes=notes, wirelength_before=wl_before, wirelength_after=wl_after)
+                           notes=notes, wirelength_before=wl_before, wirelength_after=wl_after,
+                           rf_keepouts=rf_keepouts)
 
 
 def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], nets: Dict[str, PlanNet], aliases: Dict[str, str], alias_diagnostics: AliasDiagnostics, intent: Mapping[str, Any], warnings: List[str]) -> Plan:
@@ -2600,14 +2692,16 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             clusters.append({"name": name, "anchor": comp.ref, "members": members, "role": comp.role, "category": _cluster_category(comp), "confidence": "high" if len(members) > 1 else "low"})
             explanations.setdefault(comp.ref, {}).update({"role": comp.role, "generated_rule": text})
             if comp.role == "rf_module" and not any(k.get("role") == "rf" for k in keepouts if isinstance(k, dict)):
-                # Synthesize the antenna keepout at the module's floorplanned
-                # location, not its stale source coordinates.
-                new_origin = (board.origin_x + anchor_x, board.origin_y + anchor_y)
-                delta = (new_origin[0] - comp.x, new_origin[1] - comp.y)
-                moved_comp = dataclasses.replace(
-                    comp, x=new_origin[0], y=new_origin[1],
-                    bbox=comp.bbox.translated(delta[0], delta[1]) if comp.bbox is not None else None)
-                rect = _synthesized_rf_keepout(moved_comp, board)
+                # Use the exact keepout rectangle the floorplanner reserved (and
+                # legalized other parts out of) at the module's solved location.
+                rect = floorplan.rf_keepouts.get(comp.ref)
+                if rect is None:
+                    new_origin = (board.origin_x + anchor_x, board.origin_y + anchor_y)
+                    delta = (new_origin[0] - comp.x, new_origin[1] - comp.y)
+                    moved_comp = dataclasses.replace(
+                        comp, x=new_origin[0], y=new_origin[1],
+                        bbox=comp.bbox.translated(delta[0], delta[1]) if comp.bbox is not None else None)
+                    rect = _synthesized_rf_keepout(moved_comp, board)
                 ko = f'Keepout({_q(comp.ref + "_ANTENNA")}, x={rect["x"]:.3f}, y={rect["y"]:.3f}, w={rect["w"]:.3f}, h={rect["h"]:.3f}, role="rf")'
                 rules.append(PlanRule("keepout", ko, [comp.ref], f"{comp.ref} inferred RF/module; synthesized antenna keepout adjacent to module edge and requires engineering review."))
 

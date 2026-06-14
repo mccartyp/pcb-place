@@ -1953,3 +1953,30 @@ def test_strict_grouped_array_timeout_raises_mid_search(monkeypatch, tmp_path, c
 
     with pytest.raises(PlacementError, match="strict mode"):
         engine._attempt_array_placement({}, ["C1"], (0.0, 0.0), "decoupling_array")
+
+
+def test_cluster_does_not_drag_a_member_that_owns_its_own_cluster(tmp_path):
+    # Circular membership: A lists U2, B lists U1.  Each IC must stay at its own
+    # cluster's anchor position rather than being dragged onto its neighbor.
+    pcb = '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 5 5 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:U" (layer "F.Cu")
+    (at 6 6 0)
+    (property "Reference" "U2" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+)
+'''
+    model = _load_inline(tmp_path, '''
+Board(width=50, height=50)
+Cluster("A", anchor="U1", members=["U1", "U2"], placement=Anchor(x=12, y=12))
+Cluster("B", anchor="U2", members=["U2", "U1"], placement=Anchor(x=34, y=12))
+''')
+    _out, _messages, report = apply_placements(pcb, model, strict=True)
+    pl = {p["ref"]: p for p in report["placements"]}
+    assert (round(pl["U1"]["x"]), round(pl["U1"]["y"])) == (12, 12)
+    assert (round(pl["U2"]["x"]), round(pl["U2"]["y"])) == (34, 12)
