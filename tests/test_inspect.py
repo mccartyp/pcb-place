@@ -121,6 +121,27 @@ def test_inspect_parse_kicad_groups_unit():
     assert groups[0]["unresolved_member_uuids"] == ["uuid-missing"]
 
 
+def test_inspect_honors_unsupported_stackup_layers(tmp_path):
+    board = ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb"
+    out = _run_inspect(tmp_path, board, ["--width", "75", "--height", "75", "--stackup-layers", "12"])
+    hints = json.loads((out / "board-hints.json").read_text())
+    stackup = hints["stackup_assumptions"]
+    # The requested layer count must be preserved, not replaced by 4/2-layer heuristics.
+    assert stackup["layers"] == 12
+    assert stackup["source"] == "requested_layer_count_no_template"
+    assert stackup.get("requires_review") is True
+    assert any("--stackup-layers=12" in w for w in hints["warnings"])
+
+
+def test_inspect_supported_stackup_layers_uses_template(tmp_path):
+    board = ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb"
+    out = _run_inspect(tmp_path, board, ["--width", "75", "--height", "75", "--stackup-layers", "6"])
+    stackup = json.loads((out / "board-hints.json").read_text())["stackup_assumptions"]
+    assert stackup["layers"] == 6
+    assert stackup["profile"] == "6_layer_high_speed"
+    assert stackup["source"] == "candidate_from_requested_layer_count"
+
+
 def test_inspect_ai_pln_prompt_mentions_board_pln(tmp_path):
     board = ROOT / "tests/fixtures/high_speed_connector/layout.kicad_pcb"
     out = _run_inspect(tmp_path, board, ["--width", "75", "--height", "75"])

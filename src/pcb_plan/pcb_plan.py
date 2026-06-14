@@ -4408,6 +4408,23 @@ def inspect_stackup_assumptions(nets: Mapping[str, PlanNet],
             "source": "candidate_from_requested_layer_count",
             "note": _STACKUP_IMPEDANCE_WARNING,
         }
+    if layers is not None:
+        # An explicit --stackup-layers value with no built-in template (e.g. a
+        # 12-layer board) must be honored, not silently replaced by the 4/2-layer
+        # heuristic. Preserve the requested count and flag that the layer
+        # roles/planes must be defined explicitly in board.pln.
+        return {
+            "layers": layers,
+            "profile": None,
+            "reference_planes": [],
+            "high_speed_preferred_layers": [],
+            "power_planes": [],
+            "source": "requested_layer_count_no_template",
+            "requires_review": True,
+            "note": f"Requested {layers}-layer stackup has no built-in template; the requested "
+                    "layer count is preserved but layer roles, reference planes, and high-speed "
+                    f"layers must be defined explicitly in board.pln. {_STACKUP_IMPEDANCE_WARNING}",
+        }
     if has_high_speed:
         return {
             "layers": 4,
@@ -4481,6 +4498,14 @@ def build_planning_hints(board: BoardGeometry,
         cr = _candidate_role(comp)
         candidate_role_counts[cr] = candidate_role_counts.get(cr, 0) + 1
 
+    all_warnings = list(warnings)
+    stackup_assumptions = inspect_stackup_assumptions(nets, differential_pairs, stackup_layers)
+    if stackup_assumptions.get("source") == "requested_layer_count_no_template":
+        all_warnings.append(
+            f"WARNING: requested --stackup-layers={stackup_layers} has no built-in stackup "
+            "template; the requested layer count is preserved but layer roles/planes must be "
+            "defined explicitly in board.pln.")
+
     hints: Dict[str, Any] = {
         "schema": "pcb-plan-board-hints/0.1",
         "generator": "pcb-plan inspect",
@@ -4515,13 +4540,13 @@ def build_planning_hints(board: BoardGeometry,
         "candidate_rf_zones": rf_zones,
         "differential_pairs": [dataclasses.asdict(p) for p in differential_pairs],
         "routing_classes": inspect_routing_classes(nets, differential_pairs),
-        "stackup_assumptions": inspect_stackup_assumptions(nets, differential_pairs, stackup_layers),
+        "stackup_assumptions": stackup_assumptions,
         "simulation_candidates": inspect_simulation_candidates(nets, components, differential_pairs),
         "imported_kicad_groups": kicad_groups,
         "kicad_groups_note": "KiCad groups are preserved for information only and must not drive placement.",
         "aliases_recovered": dict(aliases),
         "alias_diagnostics": dataclasses.asdict(alias_diagnostics),
-        "warnings": list(warnings),
+        "warnings": all_warnings,
     }
     return _json_safe(hints)
 
