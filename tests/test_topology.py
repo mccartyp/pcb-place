@@ -207,6 +207,32 @@ def test_cluster_edge_rotation_rotates_members_rigidly(tmp_path):
     assert round(placements["C9"]["y"] - placements["J1"]["y"], 6) == -2.0
 
 
+def test_edge_connector_cluster_places_connector_alone(tmp_path):
+    # An edge-locked, rotated connector must carry only itself in its rigid Edge
+    # placement; its nearby support passive is placed interior by its own
+    # pad-relative rule, never rotated off-board inside the connector cluster.
+    board = _board(50, 30, "\n".join([
+        _footprint("J1", 4, 15, rot=0, value="HDMI_IN", footprint="Connector_HDMI:HDMI_A",
+                   pads=_pad("1", -1, 0, 1, "DDC_SCL") + _pad("2", 1, 0, 2, "GND")),
+        _footprint("R1", 9, 15, rot=0, value="2k2",
+                   pads=_pad("1", -0.4, 0, 1, "DDC_SCL") + _pad("2", 0.4, 0, 3, "3V3")),
+    ]))
+    intent = (
+        "board: { width: 50, height: 30, origin_x: 0, origin_y: 0 }\n"
+        "components:\n"
+        "  J1: { role: hdmi_connector, edge_required: true, access_side: left, rotation: auto }\n"
+    )
+    plan = _plan_for(board, tmp_path, intent)
+    edge_clusters = [r for r in plan.rules if r.kind == "cluster" and "placement=Edge(" in r.text
+                     and 'anchor="J1"' in r.text]
+    assert edge_clusters, "expected an edge cluster for J1"
+    rule = edge_clusters[0]
+    assert 'members=["J1"]' in rule.text  # connector alone; R1 is not rigidly carried
+    assert "R1" not in rule.refs
+    # The support resistor still has its own placement rule (pad-relative).
+    assert any("R1" in r.refs and r.kind != "cluster" for r in plan.rules)
+
+
 def test_connector_body_outside_board_flagged_when_not_allowed(tmp_path):
     wide_pads = _pad("1", -4, 0, 1, "SIG") + _pad("2", 4, 0, 1, "SIG")
     pcb = _board(50, 30, _footprint("J1", 2, 15, rot=0, value="CONN", pads=wide_pads))

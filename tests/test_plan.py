@@ -886,6 +886,51 @@ def test_cluster_members_keeps_nearby_signal_connected_and_support_parts():
     assert "U4" in members
 
 
+def test_assign_support_owners_prefers_signal_parent_over_adjacent_ic():
+    # A pull-up that biases a connector's signal but sits physically next to an
+    # unrelated regulator (as messy auto-layouts often place it) must be owned by
+    # the connector it serves, not the regulator it happens to touch.
+    components = {
+        "J1": _plan_component("J1", 0.0, 0.0, "high_speed_connector", ["DDC_SCL", "GND"]),
+        "U7": _plan_component("U7", 20.0, 20.0, "power_regulator", ["5V", "3V3", "GND"]),
+        "R1": _plan_component("R1", 19.5, 20.0, "pullup_pulldown", ["DDC_SCL", "3V3"]),
+    }
+    nets = _plan_nets(components)
+    owners = pcb_plan.assign_support_owners(components, nets)
+    assert owners["R1"] == "J1"
+
+
+def test_assign_support_owners_power_only_cap_goes_to_nearest_anchor():
+    # A decoupling cap shares only power/ground, so it is owned by the nearest
+    # power-sharing IC (where its decoupling array will be packed), not a distant
+    # IC on the same rail.
+    components = {
+        "U1": _plan_component("U1", 0.0, 0.0, "ic", ["3V3", "GND", "SIG_A"]),
+        "U2": _plan_component("U2", 30.0, 0.0, "ic", ["3V3", "GND", "SIG_B"]),
+        "C1": _plan_component("C1", 1.0, 0.0, "decoupling", ["3V3", "GND"]),
+    }
+    nets = _plan_nets(components)
+    owners = pcb_plan.assign_support_owners(components, nets)
+    assert owners["C1"] == "U1"
+
+
+def test_cluster_members_respects_support_owner_assignment():
+    # A support cap physically inside an IC's radius but owned (by connectivity)
+    # by a different anchor must not be swept into this IC's cluster.
+    components = {
+        "U7": _plan_component("U7", 0.0, 0.0, "power_regulator", ["5V", "3V3", "GND"]),
+        "R1": _plan_component("R1", 2.0, 0.0, "pullup_pulldown", ["DDC_SCL", "3V3"]),
+    }
+    nets = _plan_nets(components)
+    # R1 is geometrically inside U7's radius and would be grabbed without ownership.
+    grabbed = pcb_plan._cluster_members(components["U7"], components, nets, {}, radius=12.0)
+    assert "R1" in grabbed
+    # With an ownership map pointing R1 elsewhere, U7 no longer claims it.
+    owned = pcb_plan._cluster_members(components["U7"], components, nets, {}, radius=12.0,
+                                      support_owner={"R1": "J1"})
+    assert "R1" not in owned
+
+
 def test_cluster_members_connector_proximity_any_role_disabled():
     # With proximity_any_role disabled (used for connector clusters), a
     # nearby but electrically-unrelated IC should not be swept into the
