@@ -2673,6 +2673,7 @@ class PlacementEngine:
               *, allow_arbitrary_rotation: bool = False, avoid_overlap: bool = False,
               clearance_override: Optional[float] = None, candidate_sides: Optional[Sequence[str]] = None,
               region_override: Optional[BBox] = None,
+              ignore_collision_refs: Optional[Set[str]] = None,
               rule: Optional[Mapping[str, Any]] = None) -> None:
         actual_ref = self.resolve_ref(ref)
         if actual_ref is None:
@@ -2732,6 +2733,7 @@ class PlacementEngine:
                                                          clearance_override=clearance_override,
                                                          candidate_sides=candidate_sides,
                                                          region=region,
+                                                         ignore_refs=ignore_collision_refs,
                                                          allow_keepout_overlap=(self.allow_keepout_overlap or
                                                                                 self._rule_flag(rule, "allow_keepout_overlap", False)))
             if placed is None and self.best_effort:
@@ -2867,7 +2869,7 @@ class PlacementEngine:
             min(t[0] for t in targets) - margin, min(t[1] for t in targets) - margin,
             max(t[0] for t in targets) + margin, max(t[1] for t in targets) + margin,
         )
-        for actual, (tx, ty) in zip(members, targets):
+        for idx, (actual, (tx, ty)) in enumerate(zip(members, targets)):
             if actual != anchor_ref and actual in self.locked:
                 self.locked_move_attempts.append({"ref": actual, "by": f"cluster {name}", "locked_by": self.locked[actual]})
                 self.messages.append(Message(
@@ -2883,8 +2885,14 @@ class PlacementEngine:
                  self._rule_flag(rule.get("placement", {}), "locked", False) or
                  self._rule_soft(rule, actual))
             )
+            # Later members in this cluster are still at their pre-cluster
+            # coordinates while this member searches. Ignore only those stale
+            # locations; earlier members (including the anchor) have already
+            # moved and remain real obstacles at their final locations.
+            ignore_refs = set(members[idx + 1:]) if avoid_overlap else None
             self.place(actual, tx, ty, new_rot, f"cluster {name}", rule.get("note"),
-                       avoid_overlap=avoid_overlap, region_override=cluster_region)
+                       avoid_overlap=avoid_overlap, region_override=cluster_region,
+                       ignore_collision_refs=ignore_refs)
             self.last_cluster_by_ref[actual] = name
         if self._rule_flag(rule.get("placement", {}), "edge_required", False):
             self.lock(anchor_ref, f"edge_required cluster {name}")
@@ -3012,7 +3020,8 @@ class PlacementEngine:
 
     def _clearance_margin(self, ref: str, x: float, y: float, rot: float,
                           clearance_override: Optional[float], allow_keepout_overlap: bool,
-                          forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None) -> Optional[float]:
+                          forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None,
+                          ignore_refs: Optional[Set[str]] = None) -> Optional[float]:
         """Smallest clearance margin to obstacles, keepouts, and the board edge (positive is safe)."""
 
         if ref not in self.footprints:
@@ -3029,8 +3038,9 @@ class PlacementEngine:
         window = self._max_clearance + 6.0
         ref_fp = self.footprints[ref]
         ref_class = _part_class_for(self.model, ref)
+        ignored = ignore_refs or set()
         for other in index.query(info.bbox.expanded(window)):
-            if other == ref or other not in self.footprints or not _same_physical_side(ref_fp, self.footprints[other]):
+            if other == ref or other in ignored or other not in self.footprints or not _same_physical_side(ref_fp, self.footprints[other]):
                 continue
             other_bbox = index.bbox_of(other)
             if other_bbox is None:
@@ -3117,15 +3127,16 @@ class PlacementEngine:
                             *, clearance_override: Optional[float], region: Optional[BBox],
                             allow_keepout_overlap: bool,
                             forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None,
+                            ignore_refs: Optional[Set[str]] = None,
                             metadata: Optional[Dict[str, Any]] = None) -> SearchCandidate:
         """Score a single candidate location for legality, distance, clearance, routing, and simplicity."""
 
         reason = self._collides_at(ref, x, y, rot, clearance_override=clearance_override,
                                    region=region, allow_keepout_overlap=allow_keepout_overlap,
-                                   forbidden_bboxes=forbidden_bboxes)
+                                   forbidden_bboxes=forbidden_bboxes, ignore_refs=ignore_refs)
         legal = reason is None
         distance = math.hypot(x - target[0], y - target[1])
-        margin = self._clearance_margin(ref, x, y, rot, clearance_override, allow_keepout_overlap, forbidden_bboxes)
+        margin = self._clearance_margin(ref, x, y, rot, clearance_override, allow_keepout_overlap, forbidden_bboxes, ignore_refs)
         edge = None
         routing_penalty = 0.0
         region_penalty = 0.0
@@ -3154,7 +3165,8 @@ class PlacementEngine:
                            *, clearance_override: Optional[float], region: Optional[BBox],
                            allow_keepout_overlap: bool, search_radius_used: float,
                            fallback_used: bool = False,
-                           forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None) -> SearchOutcome:
+                           forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None,
+                           ignore_refs: Optional[Set[str]] = None) -> SearchOutcome:
         """Evaluate candidate points and choose the lowest-cost legal one. Records diagnostics on self.search_log."""
 
         attempted: List[SearchCandidate] = []
@@ -3177,7 +3189,8 @@ class PlacementEngine:
             candidate = self._evaluate_candidate(ref, x, y, rot, target, label,
                                                  clearance_override=clearance_override, region=region,
                                                  allow_keepout_overlap=allow_keepout_overlap,
-                                                 forbidden_bboxes=forbidden_bboxes)
+                                                 forbidden_bboxes=forbidden_bboxes,
+                                                 ignore_refs=ignore_refs)
             attempted.append(candidate)
             evaluated += 1
             self.profiler.incr("candidates_evaluated")
@@ -3200,13 +3213,15 @@ class PlacementEngine:
     def _mark_fallback(self, outcome: SearchOutcome, ref: str, x: float, y: float, rot: float,
                        *, clearance_override: Optional[float], region: Optional[BBox],
                        allow_keepout_overlap: bool,
-                       forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None) -> SearchOutcome:
+                       forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None,
+                       ignore_refs: Optional[Set[str]] = None) -> SearchOutcome:
         """Append a generic grid-search fallback candidate and mark the outcome as having used it."""
 
         candidate = self._evaluate_candidate(ref, x, y, rot, outcome.target, "fallback_grid_search",
                                              clearance_override=clearance_override, region=region,
                                              allow_keepout_overlap=allow_keepout_overlap,
-                                             forbidden_bboxes=forbidden_bboxes)
+                                             forbidden_bboxes=forbidden_bboxes,
+                                             ignore_refs=ignore_refs)
         attempted = outcome.attempted + [candidate]
         chosen = candidate if candidate.legal else outcome.chosen
         new_outcome = SearchOutcome(ref, outcome.target, attempted, chosen, outcome.search_radius_used, True)
@@ -4529,7 +4544,8 @@ class PlacementEngine:
 
     def _collides_at(self, ref: str, x: float, y: float, rot: float, *, clearance_override: Optional[float] = None,
                     region: Optional[BBox] = None, allow_keepout_overlap: bool = False,
-                    forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None) -> Optional[str]:
+                    forbidden_bboxes: Optional[Sequence[Tuple[str, BBox]]] = None,
+                    ignore_refs: Optional[Set[str]] = None) -> Optional[str]:
         if ref not in self.footprints:
             return None
         test_info = footprint_bbox_at(self.footprints[ref], x, y, rot, self.model)
@@ -4560,8 +4576,9 @@ class PlacementEngine:
         self.profiler.incr("spatial_index_queries")
         ref_fp = self.footprints[ref]
         ref_class = _part_class_for(self.model, ref)
+        ignored = ignore_refs or set()
         for other in sorted(nearby):
-            if other == ref or other not in self.footprints or not _same_physical_side(ref_fp, self.footprints[other]):
+            if other == ref or other in ignored or other not in self.footprints or not _same_physical_side(ref_fp, self.footprints[other]):
                 continue
             other_bbox = index.bbox_of(other)
             if other_bbox is None:
@@ -4577,9 +4594,11 @@ class PlacementEngine:
     def _find_non_overlapping_position(self, ref: str, x: float, y: float, rot: float,
                                        *, clearance_override: Optional[float],
                                        candidate_sides: Optional[Sequence[str]], region: Optional[BBox] = None,
-                                       allow_keepout_overlap: bool = False) -> Optional[Tuple[float, float, str]]:
+                                       allow_keepout_overlap: bool = False,
+                                       ignore_refs: Optional[Set[str]] = None) -> Optional[Tuple[float, float, str]]:
         first = self._collides_at(ref, x, y, rot, clearance_override=clearance_override,
-                                  region=region, allow_keepout_overlap=allow_keepout_overlap)
+                                  region=region, allow_keepout_overlap=allow_keepout_overlap,
+                                  ignore_refs=ignore_refs)
         if first is None:
             return (x, y, "requested location is legal")
         step = self.model.policy.search_step
@@ -4607,7 +4626,7 @@ class PlacementEngine:
                 points.append((x + vx * d, y + vy * d, f"radial{side}{d:g}"))
         outcome = self._search_candidates(ref, (x, y), rot, points, clearance_override=clearance_override,
                                           region=region, allow_keepout_overlap=allow_keepout_overlap,
-                                          search_radius_used=max_r)
+                                          search_radius_used=max_r, ignore_refs=ignore_refs)
         chosen = outcome.chosen
         if chosen is None:
             return None
