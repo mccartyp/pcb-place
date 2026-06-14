@@ -1787,24 +1787,36 @@ Anchor("U1", x=20, y=20, rot=0)
     assert "locked footprint 'U1'" in str(excinfo.value)
 
 
-def test_cluster_targets_are_clamped_inside_board(tmp_path):
+def test_cluster_off_board_is_rigidly_translated_inside(tmp_path):
+    # A cluster whose planned anchor lands off the board must be shifted as a
+    # rigid body back onto the board, preserving the spacing between its members
+    # rather than collapsing every member onto the edge (the old clamp behavior).
+    pcb = '''(kicad_pcb (version 20240108) (generator "pcb-place-test")
+  (footprint "Test:U" (layer "F.Cu")
+    (at 100 25 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+  (footprint "Test:C" (layer "F.Cu")
+    (at 104 25 0)
+    (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  )
+)
+'''
     model = _load_inline(tmp_path, '''
-Board(width=10, height=10)
-Cluster("EDGE_CLUSTER", anchor="U1", members=["U1", "C1"], placement=Edge(edge="right", y=5))
+Board(width=50, height=50)
+Cluster("GRP", anchor="U1", members=["U1", "C1"], placement=Anchor(x=60, y=25))
 ''')
-    _out, messages, report = apply_placements(
-        _pcb_with_at("(at 0 5)"),
-        model,
-        strict=True,
-        safe=True,
-        allow_overlap=True,
-    )
+    _out, messages, report = apply_placements(pcb, model, strict=True, safe=True)
 
     placements = {item["ref"]: item for item in report["placements"]}
     assert placements["U1"]["outside_board"] is False
     assert placements["C1"]["outside_board"] is False
-    assert placements["C1"]["x"] == 10.0
-    assert any("clamped those anchors inside the board" in message.text for message in messages)
+    # The ~4 mm member-to-member spacing is preserved (rigid translation, not a
+    # per-coordinate clamp that would pile both members onto x = 50).
+    assert placements["C1"]["x"] - placements["U1"]["x"] >= 3.5
+    assert any("translated rigidly" in message.text for message in messages)
 
 
 def test_cluster_targets_honor_allow_outside_board(tmp_path):
