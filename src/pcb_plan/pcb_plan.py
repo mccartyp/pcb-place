@@ -1986,7 +1986,8 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
                       nets: Mapping[str, PlanNet], intent: Mapping[str, Any],
                       regions: Mapping[str, Mapping[str, Any]],
                       mounting_hole_plan: Sequence[Mapping[str, Any]],
-                      spacing: Mapping[str, float]) -> FloorplanResult:
+                      spacing: Mapping[str, float],
+                      keepouts: Optional[Sequence[Mapping[str, Any]]] = None) -> FloorplanResult:
     notes: List[str] = []
     W, H = board.width, board.height
     ox, oy = board.origin_x, board.origin_y
@@ -2022,7 +2023,9 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
     _all_edges = ("left", "right", "top", "bottom")
 
     def _edge_span(side: str) -> float:
-        return W if side in ("left", "right") else H
+        # Connectors on a vertical (left/right) edge are distributed along y, so
+        # the available length is the board height; horizontal edges use width.
+        return H if side in ("left", "right") else W
 
     def _edge_margin(side: str) -> float:
         span = _edge_span(side)
@@ -2195,6 +2198,20 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
         else:
             fixed_boxes.append((fx, fy, 2.0, 2.0, "mechanical"))
 
+    # Declared keepouts are hard obstacles: the solver must not pull a core part
+    # into a forbidden region (strict pcb-place rejects any keepout overlap).
+    for keepout in (keepouts or []):
+        if not isinstance(keepout, dict):
+            continue
+        try:
+            kx, ky = float(keepout.get("x", 0)), float(keepout.get("y", 0))
+            kw, kh = float(keepout.get("w", 0)), float(keepout.get("h", 0))
+        except (TypeError, ValueError):
+            continue
+        if kw <= 0 or kh <= 0:
+            continue
+        fixed_boxes.append((ox + kx + kw / 2.0, oy + ky + kh / 2.0, kw / 2.0, kh / 2.0, "keepout"))
+
     def _clamp_core(ref: str, x: float, y: float) -> Tuple[float, float]:
         w, h = extent[ref]
         lo_x, hi_x = core_min_x + w / 2.0, max(core_min_x + w / 2.0, core_max_x - w / 2.0)
@@ -2287,9 +2304,12 @@ def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanCompone
                     pos[a][0], pos[a][1] = _clamp_core(a, pos[a][0], pos[a][1])
                     pos[b][0], pos[b][1] = _clamp_core(b, pos[b][0], pos[b][1])
                     moved += 1
-            # movable vs fixed obstacle (connector body / mounting hole)
+            # movable vs fixed obstacle (connector body / mounting hole / keepout)
             for (fx, fy, fhw, fhh, frole) in fixed_boxes:
-                clr = _fp_pair_clearance(components[a].role, frole, spacing)
+                # A keepout is a hard no-overlap zone; any small gap satisfies it,
+                # so do not pile on the IC spread/isolation margins here.
+                clr = (float(spacing.get("default", 0.25)) if frole == "keepout"
+                       else _fp_pair_clearance(components[a].role, frole, spacing))
                 dx = fx - pos[a][0]
                 dy = fy - pos[a][1]
                 pen_x = wa / 2.0 + fhw + clr - abs(dx)
@@ -2450,7 +2470,7 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     # Solve the floorplan once (connector edge distribution + force-directed,
     # wirelength-driven IC placement) and feed its coordinates to the emitters.
     floorplan = compute_floorplan(board, components, nets, intent, regions,
-                                  mounting_hole_plan, spacing)
+                                  mounting_hole_plan, spacing, keepouts)
     for note in floorplan.notes:
         warnings.append(f"floorplan: {note}")
 

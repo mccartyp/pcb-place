@@ -968,3 +968,38 @@ def test_floorplan_shortens_wirelength_and_separates_ics():
     (u2x, u2y) = fp.core_xy["U2"]
     # ICs must not be coincident/overlapping after the solve.
     assert abs(u1x - u2x) + abs(u1y - u2y) > 3.0
+
+
+def test_floorplan_uses_edge_height_for_vertical_edges_on_rectangular_board():
+    # Regression: left/right edges distribute along y, so the span is the board
+    # height.  On a wide-but-short board the along (y) values must stay on board.
+    board = pcb_plan.BoardGeometry(0.0, 0.0, 100.0, 30.0, "cli")
+    components = {}
+    for i in range(3):
+        components[f"J{i+1}"] = _conn_component(f"J{i+1}", 95.0, 6.0 + i * 8.0, 4.0, 5.0,
+                                                [f"HDMI_D{i}_P", "GND"])
+    nets = _plan_nets(components)
+    fp = pcb_plan.compute_floorplan(board, components, nets, {}, {}, [],
+                                    pcb_plan.DEFAULT_SPACING_PROFILE)
+    for ref, (side, along) in fp.edge_connectors.items():
+        if side in ("left", "right"):
+            assert 0.0 <= along <= board.height, f"{ref} along={along} off the {side} edge"
+
+
+def test_floorplan_keeps_core_parts_out_of_keepouts():
+    # Regression: a keepout over the board center must not swallow an IC that the
+    # centering/wirelength forces would otherwise pull into it.
+    board = pcb_plan.BoardGeometry(0.0, 0.0, 100.0, 100.0, "cli")
+    components = {
+        "U1": _plan_component("U1", 10.0, 10.0, "ic", ["NET_A", "GND"]),
+    }
+    components["U1"] = pcb_plan.dataclasses.replace(
+        components["U1"], bbox=pcb_plan.BBox(7.0, 7.0, 13.0, 13.0))
+    nets = _plan_nets(components)
+    keepouts = [{"name": "CENTER", "x": 20.0, "y": 20.0, "w": 60.0, "h": 60.0, "role": "rf"}]
+    fp = pcb_plan.compute_floorplan(board, components, nets, {}, {}, [],
+                                    pcb_plan.DEFAULT_SPACING_PROFILE, keepouts)
+    x, y = fp.core_xy["U1"]
+    # U1's body (±3 mm) must not intrude the keepout rectangle [20,80]x[20,80].
+    assert x - 3.0 >= 80.0 or x + 3.0 <= 20.0 or y - 3.0 >= 80.0 or y + 3.0 <= 20.0, \
+        f"U1 at ({x:.1f},{y:.1f}) intrudes the keepout"
