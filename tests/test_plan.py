@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -95,7 +96,11 @@ def test_rf_module_synthesized_keepout_does_not_reject_generated_plan(tmp_path):
         text=True,
     )
     ppl = out.read_text()
-    assert 'Keepout("U12_ANTENNA", x=42.000, y=0.000, w=12.000, h=7.250, role="rf")' in ppl
+    # The antenna keepout follows the module to its floorplanned location, so we
+    # assert the invariant (a reserved RF keepout for U12) rather than a fixed
+    # coordinate.  The strict pcb-place run below is the real check: the
+    # synthesized keepout must not overlap the module or other parts.
+    assert re.search(r'Keepout\("U12_ANTENNA", x=[\d.]+, y=[\d.]+, w=[\d.]+, h=[\d.]+, role="rf"\)', ppl)
     subprocess.run(
         [sys.executable, str(PLACE_CLI), str(board_path), str(out), "--dry-run", "--strict"],
         check=True,
@@ -910,3 +915,56 @@ def test_cluster_members_connector_excludes_unrelated_nearby_support_part():
     members = pcb_plan._cluster_members(components["J1"], components, nets, {}, radius=18.0, proximity_any_role=False)
     assert "C1" not in members
     assert "C2" in members
+
+
+def _conn_component(ref, x, y, w, h, nets):
+    pads = [pcb_plan.PlanPad(number=str(i), name="", local_x=0.0, local_y=0.0,
+                             abs_x=x, abs_y=y, layers=["F.Cu"], shape="rect",
+                             size=(0.5, 0.5), net=net)
+            for i, net in enumerate(nets, start=1)]
+    bbox = pcb_plan.BBox(x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
+    return pcb_plan.PlanComponent(
+        ref=ref, footprint="Test:Conn", uuid=None, value=None,
+        x=x, y=y, rot=0.0, layer="F.Cu", pads=pads, bbox=bbox, role="high_speed_connector")
+
+
+def test_floorplan_spills_connectors_to_multiple_edges_when_one_edge_is_full():
+    board = pcb_plan.BoardGeometry(0.0, 0.0, 40.0, 40.0, "cli")
+    # Six tall connectors all preferring the right edge cannot all fit there.
+    components = {}
+    for i in range(6):
+        components[f"J{i+1}"] = _conn_component(f"J{i+1}", 35.0, 4.0 + i * 6.0, 6.0, 10.0,
+                                                [f"HDMI_D{i}_P", "GND"])
+    nets = _plan_nets(components)
+    fp = pcb_plan.compute_floorplan(board, components, nets, {}, {}, [],
+                                    pcb_plan.DEFAULT_SPACING_PROFILE)
+    sides = {side for (side, _along) in fp.edge_connectors.values()}
+    assert len(fp.edge_connectors) == 6           # all are edge-placed
+    assert len(sides) >= 2                         # spilled onto more than one edge
+    assert any("spilled" in note for note in fp.notes)
+
+
+def test_floorplan_shortens_wirelength_and_separates_ics():
+    board = pcb_plan.BoardGeometry(0.0, 0.0, 80.0, 80.0, "cli")
+    # Two connectors on the right edge, two ICs each wired to one connector by a
+    # high-speed net.  A good floorplan pulls each IC toward its connector while
+    # keeping the two ICs apart.
+    components = {
+        "J1": _conn_component("J1", 78.0, 20.0, 6.0, 8.0, ["HS_A_P", "GND"]),
+        "J2": _conn_component("J2", 78.0, 60.0, 6.0, 8.0, ["HS_B_P", "GND"]),
+        "U1": _plan_component("U1", 5.0, 5.0, "ic", ["HS_A_P", "GND"]),
+        "U2": _plan_component("U2", 5.0, 6.0, "ic", ["HS_B_P", "GND"]),
+    }
+    # give the ICs a real footprint extent
+    for ref in ("U1", "U2"):
+        c = components[ref]
+        components[ref] = pcb_plan.dataclasses.replace(
+            c, bbox=pcb_plan.BBox(c.x - 3, c.y - 3, c.x + 3, c.y + 3))
+    nets = _plan_nets(components)
+    fp = pcb_plan.compute_floorplan(board, components, nets, {}, {}, [],
+                                    pcb_plan.DEFAULT_SPACING_PROFILE)
+    assert fp.wirelength_after <= fp.wirelength_before
+    (u1x, u1y) = fp.core_xy["U1"]
+    (u2x, u2y) = fp.core_xy["U2"]
+    # ICs must not be coincident/overlapping after the solve.
+    assert abs(u1x - u2x) + abs(u1y - u2y) > 3.0

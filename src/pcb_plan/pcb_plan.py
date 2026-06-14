@@ -1864,6 +1864,506 @@ def compute_semantic_groups(clusters: Sequence[Mapping[str, Any]],
     return groups
 
 
+# ---------------------------------------------------------------------------
+# Constraint-driven floorplanner
+#
+# The planner does not copy the (often un-placed) source coordinates into the
+# plan.  Instead it derives a real floorplan from connectivity and footprint
+# geometry using SI/EMI best practices:
+#
+#   * I/O and edge connectors are distributed along their access edge so they
+#     never stack, and ICs are pulled toward the board core.
+#   * IC positions are solved with a deterministic force-directed model whose
+#     attractive forces are pin-to-pin springs taken from the netlist and the
+#     real pad coordinates of each footprint.  High-speed/differential nets are
+#     weighted heavily so their endpoints sit close together (short, direct
+#     traces); power feeds pull moderately; ground/plane nets are ignored
+#     because they return on copper pours, not point-to-point traces.
+#   * Repulsion enforces class-aware clearance plus extra isolation for RF
+#     modules and switching regulators, so noisy and sensitive blocks are
+#     spaced apart rather than crammed together.
+#   * Weak region springs honor topology intent (regulators toward the POWER
+#     region, RF toward its reserved strip), and ICs are kept inside a core
+#     rectangle inset from the connector band.
+# ---------------------------------------------------------------------------
+
+# Pin-to-pin spring weights by net class (higher = shorter, more direct).
+_FP_WEIGHT_HIGH_SPEED = 6.0
+_FP_WEIGHT_CONTROL = 2.0
+_FP_WEIGHT_POWER = 1.0
+# Nets wider than this (rails, floods, big enables) are returned on planes and
+# would otherwise dominate the spring model, so they are skipped for pull.
+_FP_MAX_NET_FANOUT = 16
+# Extra isolation clearance (mm) added on top of class clearance.
+_FP_ISOLATION_RF = 4.0
+_FP_ISOLATION_REGULATOR = 2.0
+# Baseline breathing room added to every IC pair so the core is not packed
+# shoulder-to-shoulder (helps routing/return paths and rework).
+_FP_SPREAD_MARGIN = 1.2
+_FP_CORE_ROLES = {"ic", "mcu", "hdmi_retimer", "rf_module", "power_regulator"}
+
+
+@dataclasses.dataclass
+class FloorplanResult:
+    """Floorplan decisions consumed by the rule emitters."""
+
+    edge_connectors: Dict[str, Tuple[str, float]]          # ref -> (access_side, along)
+    core_xy: Dict[str, Tuple[float, float]]                # ref -> (local_x, local_y)
+    notes: List[str]
+    wirelength_before: float
+    wirelength_after: float
+
+
+def _fp_net_weight(name: str) -> float:
+    if is_ground(name):
+        return 0.0
+    if is_high_speed(name):
+        return _FP_WEIGHT_HIGH_SPEED
+    if is_power(name):
+        return _FP_WEIGHT_POWER
+    return _FP_WEIGHT_CONTROL
+
+
+def _fp_component_extent(comp: PlanComponent) -> Tuple[float, float]:
+    if comp.bbox is not None:
+        w, h = comp.bbox.width, comp.bbox.height
+        if w > 0 and h > 0:
+            return (w, h)
+    return (2.0, 2.0)
+
+
+def _fp_pad_class(role: str) -> str:
+    if "connector" in role or role == "debug_header":
+        return "connector"
+    return "ic"
+
+
+def _fp_pair_clearance(role_a: str, role_b: str, spacing: Mapping[str, float]) -> float:
+    ca, cb = _fp_pad_class(role_a), _fp_pad_class(role_b)
+    if "connector" in (ca, cb):
+        base = float(spacing.get("connector_to_component", 1.0))
+    else:
+        base = float(spacing.get("ic_to_ic", 0.75))
+    base += _FP_SPREAD_MARGIN
+    if "rf_module" in (role_a, role_b):
+        base += _FP_ISOLATION_RF
+    if role_a == "power_regulator" and role_b == "power_regulator":
+        base += _FP_ISOLATION_REGULATOR
+    return base
+
+
+def _fp_connector_edge_decision(comp: PlanComponent, board: BoardGeometry,
+                                intent: Mapping[str, Any]) -> Optional[Tuple[str, bool, bool]]:
+    """Return (access_side, edge_required, near_edge) when a connector is edge-placed."""
+
+    cfg = _component_intent(intent, comp.ref)
+    local_x = max(0.0, min(board.width, comp.x - board.origin_x))
+    local_y = max(0.0, min(board.height, comp.y - board.origin_y))
+    distances = {"left": local_x, "right": board.width - local_x,
+                 "top": local_y, "bottom": board.height - local_y}
+    nearest_edge = min(distances, key=distances.get)
+    edge_span = board.width if nearest_edge in ("left", "right") else board.height
+    inset = 2.0
+    near_edge = edge_span > 0 and distances[nearest_edge] / edge_span <= 0.25 and distances[nearest_edge] > inset
+    haystack = f"{comp.footprint.upper()} {(comp.value or '').upper()}"
+    inferred_edge_required = (comp.role == "high_speed_connector" or
+                              any(token in haystack for token in _EDGE_CONNECTOR_TOKENS))
+    if "edge_required" in cfg:
+        edge_required = bool(cfg.get("edge_required"))
+    elif cfg.get("access_side") is not None:
+        edge_required = True
+    elif "connector" in comp.role:
+        edge_required = near_edge or inferred_edge_required
+    else:
+        edge_required = False
+    if not (edge_required or near_edge):
+        return None
+    access_side = str(cfg.get("access_side") or nearest_edge)
+    return access_side, edge_required, near_edge
+
+
+def compute_floorplan(board: BoardGeometry, components: Mapping[str, PlanComponent],
+                      nets: Mapping[str, PlanNet], intent: Mapping[str, Any],
+                      regions: Mapping[str, Mapping[str, Any]],
+                      mounting_hole_plan: Sequence[Mapping[str, Any]],
+                      spacing: Mapping[str, float]) -> FloorplanResult:
+    notes: List[str] = []
+    W, H = board.width, board.height
+    ox, oy = board.origin_x, board.origin_y
+    cx_board, cy_board = ox + W / 2.0, oy + H / 2.0
+
+    # --- pad offsets (pin geometry) and a fast net -> pads index -------------
+    pad_off: Dict[str, Dict[str, Tuple[float, float]]] = {}
+    for ref, comp in components.items():
+        table: Dict[str, Tuple[float, float]] = {}
+        for pad in comp.pads:
+            table[pad.number] = (pad.abs_x - comp.x, pad.abs_y - comp.y)
+        pad_off[ref] = table
+
+    # --- classify -----------------------------------------------------------
+    edge_conn: Dict[str, Tuple[str, bool, bool]] = {}
+    for comp in components.values():
+        if "connector" not in comp.role and comp.role != "debug_header":
+            continue
+        decision = _fp_connector_edge_decision(comp, board, intent)
+        if decision is not None:
+            edge_conn[comp.ref] = decision
+
+    core_refs = sorted(
+        [c.ref for c in components.values()
+         if c.role in _FP_CORE_ROLES or
+         (("connector" in c.role or c.role == "debug_header") and c.ref not in edge_conn)],
+        key=lambda r: r)
+
+    # --- assign connectors to edges, spilling to other edges on overflow ----
+    edge_along_abs: Dict[str, Tuple[str, float]] = {}        # ref -> (side, along local)
+    fixed_pos: Dict[str, Tuple[float, float]] = {}           # abs anchor positions
+    _gap = float(spacing.get("connector_to_component", 1.0))
+    _all_edges = ("left", "right", "top", "bottom")
+
+    def _edge_span(side: str) -> float:
+        return W if side in ("left", "right") else H
+
+    def _edge_margin(side: str) -> float:
+        span = _edge_span(side)
+        return min(max(0.1 * span, 8.0), 0.45 * span)
+
+    def _edge_usable(side: str) -> float:
+        return max(_edge_span(side) - 2.0 * _edge_margin(side), 1e-6)
+
+    # Each connector needs roughly its footprint extent along the edge plus a
+    # clearance gap.  Forced connectors (explicit access_side in intent) may not
+    # be relocated; inferred ones spill to the emptiest alternate edge.
+    pitch_need: Dict[str, float] = {}
+    forced_side: Dict[str, bool] = {}
+    for ref, (side, _req, _near) in edge_conn.items():
+        w, h = _fp_component_extent(components[ref])
+        pitch_need[ref] = max(w, h) + _gap
+        forced_side[ref] = _component_intent(intent, ref).get("access_side") is not None
+
+    assign: Dict[str, List[str]] = {e: [] for e in _all_edges}
+    for ref, (side, _req, _near) in sorted(edge_conn.items()):
+        assign[side].append(ref)
+
+    def _load(side: str) -> float:
+        return sum(pitch_need[r] for r in assign[side])
+
+    progressed = True
+    while progressed:
+        progressed = False
+        for side in _all_edges:
+            usable = _edge_usable(side)
+            movable = [r for r in assign[side] if not forced_side[r]]
+            while _load(side) > usable and movable:
+                victim = max(movable, key=lambda r: pitch_need[r])
+                targets = sorted((t for t in _all_edges if t != side),
+                                 key=lambda t: _edge_usable(t) - _load(t), reverse=True)
+                relocated = False
+                for t in targets:
+                    if _load(t) + pitch_need[victim] <= _edge_usable(t):
+                        assign[side].remove(victim)
+                        assign[t].append(victim)
+                        notes.append(f"connector {victim} spilled from {side} to {t} edge "
+                                     "(preferred edge over capacity)")
+                        progressed = True
+                        relocated = True
+                        break
+                movable = [r for r in assign[side] if not forced_side[r]]
+                if not relocated:
+                    break  # no edge has room; leave it and pack tightly
+
+    # --- distribute connectors along their (possibly reassigned) edges -------
+    for side in _all_edges:
+        refs = assign[side]
+        if not refs:
+            continue
+        span, margin, usable = _edge_span(side), _edge_margin(side), _edge_usable(side)
+
+        def _orig_along(r: str) -> float:
+            comp = components[r]
+            lx = max(0.0, min(W, comp.x - ox))
+            ly = max(0.0, min(H, comp.y - oy))
+            return ly if side in ("left", "right") else lx
+
+        refs.sort(key=lambda r: (_orig_along(r), r))
+        n = len(refs)
+        max_extent = max((max(_fp_component_extent(components[r])) for r in refs), default=0.0)
+        pitch = max(usable / n, max_extent + _gap)
+        total = pitch * n
+        start = (span / 2.0) - total / 2.0 + pitch / 2.0
+        for i, r in enumerate(refs):
+            along = _clamp(start + i * pitch, margin, span - margin)
+            edge_along_abs[r] = (side, along)
+            if side == "left":
+                fixed_pos[r] = (ox, oy + along)
+            elif side == "right":
+                fixed_pos[r] = (ox + W, oy + along)
+            elif side == "top":
+                fixed_pos[r] = (ox + along, oy)
+            else:  # bottom
+                fixed_pos[r] = (ox + along, oy + H)
+        if n > 1:
+            notes.append(f"distributed {n} connector(s) along {side} edge with {pitch:.2f} mm pitch")
+
+    # mounting holes are fixed obstacles at their corners.
+    for assignment in mounting_hole_plan:
+        ref = assignment.get("ref")
+        if not ref or ref not in components:
+            continue
+        if assignment.get("kind") == "corner":
+            inset = float(assignment.get("inset", 3.0))
+            corner = assignment.get("corner", "top_left")
+            fx = ox + (W - inset if "right" in corner else inset)
+            fy = oy + (H - inset if "bottom" in corner else inset)
+            fixed_pos[ref] = (fx, fy)
+        elif assignment.get("x") is not None:
+            fixed_pos[ref] = (ox + float(assignment["x"]), oy + float(assignment["y"]))
+
+    # --- region springs (topology intent) -----------------------------------
+    def _region_center(name: Optional[str]) -> Optional[Tuple[float, float]]:
+        if not name or name not in regions:
+            return None
+        r = regions[name]
+        return (ox + float(r.get("x", 0)) + float(r.get("w", 0)) / 2.0,
+                oy + float(r.get("y", 0)) + float(r.get("h", 0)) / 2.0)
+
+    region_target: Dict[str, Tuple[float, float]] = {}
+    for ref in core_refs:
+        role = components[ref].role
+        name = ("POWER" if role == "power_regulator" else
+                "RF" if role == "rf_module" else
+                "HIGH_SPEED" if role == "hdmi_retimer" else
+                "CONTROL")
+        center = _region_center(name) or _region_center("CONTROL")
+        if center is not None:
+            region_target[ref] = center
+
+    # --- core rectangle (keep ICs off the connector band) -------------------
+    core_inset = min(max(0.12 * min(W, H), 8.0), 22.0)
+    core_min_x, core_max_x = ox + core_inset, ox + W - core_inset
+    core_min_y, core_max_y = oy + core_inset, oy + H - core_inset
+
+    # Reserve a halo around each IC for the support parts (decoupling caps,
+    # pullups, series elements) the executor will pack against its pads.  Each
+    # passive is assigned to the IC it shares the most signals with; without
+    # this room the executor would reflow the IC itself to fit its array.
+    ic_nets = {ref: set(components[ref].nets) for ref in core_refs}
+    support_count: Dict[str, int] = {ref: 0 for ref in core_refs}
+    for comp in components.values():
+        if comp.ref in support_count or "connector" in comp.role or comp.role in {"mechanical", "debug_header"}:
+            continue
+        best, best_shared = None, 0
+        for ref in core_refs:
+            shared = len(ic_nets[ref] & set(comp.nets))
+            if shared > best_shared:
+                best, best_shared = ref, shared
+        if best is not None:
+            support_count[best] += 1
+
+    # Effective extents.  RF modules also reserve their antenna keepout footprint
+    # on every side so nothing is placed inside the synthesized RF keepout.
+    extent: Dict[str, Tuple[float, float]] = {}
+    for ref in core_refs:
+        w, h = _fp_component_extent(components[ref])
+        halo = min(10.0, 1.6 * math.sqrt(support_count[ref])) if support_count[ref] else 0.0
+        w += 2.0 * halo
+        h += 2.0 * halo
+        if components[ref].role == "rf_module":
+            w += 12.0
+            h += 10.0
+        extent[ref] = (w, h)
+
+    # Fixed obstacles the ICs must avoid: edge-connector bodies and mounting
+    # holes.  An edge connector's footprint origin sits roughly half its body
+    # inside the outline, so the body reaches inward by about its full depth; we
+    # reserve an edge-aligned rectangle that deep so ICs never collide with it.
+    fixed_boxes: List[Tuple[float, float, float, float, str]] = []
+    for ref, (fx, fy) in fixed_pos.items():
+        if ref in edge_along_abs:
+            side, _along = edge_along_abs[ref]
+            w, h = _fp_component_extent(components[ref])
+            reach = max(w, h) + _gap + 2.0
+            along_half = 0.5 * max(w, h) + _gap
+            if side == "right":
+                fixed_boxes.append((ox + W - reach / 2.0, fy, reach / 2.0, along_half, "connector"))
+            elif side == "left":
+                fixed_boxes.append((ox + reach / 2.0, fy, reach / 2.0, along_half, "connector"))
+            elif side == "top":
+                fixed_boxes.append((fx, oy + reach / 2.0, along_half, reach / 2.0, "connector"))
+            else:  # bottom
+                fixed_boxes.append((fx, oy + H - reach / 2.0, along_half, reach / 2.0, "connector"))
+        else:
+            fixed_boxes.append((fx, fy, 2.0, 2.0, "mechanical"))
+
+    def _clamp_core(ref: str, x: float, y: float) -> Tuple[float, float]:
+        w, h = extent[ref]
+        lo_x, hi_x = core_min_x + w / 2.0, max(core_min_x + w / 2.0, core_max_x - w / 2.0)
+        lo_y, hi_y = core_min_y + h / 2.0, max(core_min_y + h / 2.0, core_max_y - h / 2.0)
+        return (_clamp(x, lo_x, hi_x), _clamp(y, lo_y, hi_y))
+
+    # --- deterministic seed: centered grid ordered by ref --------------------
+    pos: Dict[str, List[float]] = {}
+    n_core = len(core_refs)
+    if n_core:
+        cols = max(1, int(math.ceil(math.sqrt(n_core))))
+        rows = max(1, int(math.ceil(n_core / cols)))
+        gx = (core_max_x - core_min_x) / max(1, cols)
+        gy = (core_max_y - core_min_y) / max(1, rows)
+        for i, ref in enumerate(core_refs):
+            c, r = i % cols, i // cols
+            sx = core_min_x + gx * (c + 0.5)
+            sy = core_min_y + gy * (r + 0.5)
+            pos[ref] = list(_clamp_core(ref, sx, sy))
+
+    def _all_pos(ref: str) -> Optional[Tuple[float, float]]:
+        if ref in pos:
+            return (pos[ref][0], pos[ref][1])
+        return fixed_pos.get(ref)
+
+    # Pre-index nets that actually drive placement (small fanout, non-ground).
+    spring_nets: List[Tuple[float, List[Tuple[str, str]]]] = []
+    for net in nets.values():
+        w = _fp_net_weight(net.name)
+        if w <= 0:
+            continue
+        pads = [(r, p) for (r, p) in net.pads if r in components and p in pad_off.get(r, {})]
+        # only nets touching at least one movable part matter
+        if len(pads) < 2 or len(pads) > _FP_MAX_NET_FANOUT:
+            continue
+        if not any(r in pos for (r, _p) in pads):
+            continue
+        spring_nets.append((w / (len(pads) - 1), pads))
+
+    def _wirelength() -> float:
+        total = 0.0
+        for net in nets.values():
+            w = _fp_net_weight(net.name)
+            if w <= 0:
+                continue
+            xs: List[float] = []
+            ys: List[float] = []
+            for (r, p) in net.pads:
+                base = _all_pos(r)
+                off = pad_off.get(r, {}).get(p)
+                if base is None or off is None:
+                    continue
+                xs.append(base[0] + off[0])
+                ys.append(base[1] + off[1])
+            if len(xs) >= 2:
+                total += w * ((max(xs) - min(xs)) + (max(ys) - min(ys)))
+        return total
+
+    wl_before = _wirelength()
+
+    def _resolve_overlaps(eps: float) -> int:
+        """One separation pass; pushes movable ICs apart and out of fixed bodies.
+
+        Returns the number of pairs that were overlapping.  Separation is applied
+        on the minimal-penetration axis; when that axis is pinned by the core
+        boundary the orthogonal axis (which has room on a large board) takes the
+        remaining push on subsequent passes.
+        """
+
+        moved = 0
+        for a_i, a in enumerate(core_refs):
+            wa, ha = extent[a]
+            # movable vs movable
+            for b in core_refs[a_i + 1:]:
+                wb, hb = extent[b]
+                clr = _fp_pair_clearance(components[a].role, components[b].role, spacing)
+                dx = pos[b][0] - pos[a][0]
+                dy = pos[b][1] - pos[a][1]
+                pen_x = (wa + wb) / 2.0 + clr - abs(dx)
+                pen_y = (ha + hb) / 2.0 + clr - abs(dy)
+                if pen_x > eps and pen_y > eps:
+                    if pen_x <= pen_y:
+                        push = (pen_x / 2.0 + 1e-4) * (1.0 if dx >= 0 else -1.0)
+                        pos[a][0] -= push
+                        pos[b][0] += push
+                    else:
+                        push = (pen_y / 2.0 + 1e-4) * (1.0 if dy >= 0 else -1.0)
+                        pos[a][1] -= push
+                        pos[b][1] += push
+                    pos[a][0], pos[a][1] = _clamp_core(a, pos[a][0], pos[a][1])
+                    pos[b][0], pos[b][1] = _clamp_core(b, pos[b][0], pos[b][1])
+                    moved += 1
+            # movable vs fixed obstacle (connector body / mounting hole)
+            for (fx, fy, fhw, fhh, frole) in fixed_boxes:
+                clr = _fp_pair_clearance(components[a].role, frole, spacing)
+                dx = fx - pos[a][0]
+                dy = fy - pos[a][1]
+                pen_x = wa / 2.0 + fhw + clr - abs(dx)
+                pen_y = ha / 2.0 + fhh + clr - abs(dy)
+                if pen_x > eps and pen_y > eps:
+                    if pen_x <= pen_y:
+                        pos[a][0] -= (pen_x + 1e-4) * (1.0 if dx >= 0 else -1.0)
+                    else:
+                        pos[a][1] -= (pen_y + 1e-4) * (1.0 if dy >= 0 else -1.0)
+                    pos[a][0], pos[a][1] = _clamp_core(a, pos[a][0], pos[a][1])
+                    moved += 1
+        return moved
+
+    # --- force-directed solve ------------------------------------------------
+    iterations = 600
+    for it in range(iterations):
+        cooling = 1.0 - (it / iterations) * 0.7
+        force: Dict[str, List[float]] = {ref: [0.0, 0.0] for ref in pos}
+
+        # 1) pin-to-pin springs toward each net's pad centroid
+        for wp, pads in spring_nets:
+            cx = cy = 0.0
+            abspads: List[Tuple[str, float, float]] = []
+            for (r, p) in pads:
+                base = _all_pos(r)
+                if base is None:
+                    continue
+                off = pad_off[r][p]
+                px, py = base[0] + off[0], base[1] + off[1]
+                abspads.append((r, px, py))
+                cx += px
+                cy += py
+            if len(abspads) < 2:
+                continue
+            cx /= len(abspads)
+            cy /= len(abspads)
+            for (r, px, py) in abspads:
+                if r in force:
+                    force[r][0] += (cx - px) * wp
+                    force[r][1] += (cy - py) * wp
+
+        # 2) weak region + centering springs
+        for ref in pos:
+            tx, ty = region_target.get(ref, (cx_board, cy_board))
+            force[ref][0] += (tx - pos[ref][0]) * 0.012
+            force[ref][1] += (ty - pos[ref][1]) * 0.012
+
+        # apply attractive step (damped, cooling)
+        for ref in pos:
+            pos[ref][0] += max(-6.0, min(6.0, force[ref][0] * 0.05 * cooling))
+            pos[ref][1] += max(-6.0, min(6.0, force[ref][1] * 0.05 * cooling))
+            pos[ref][0], pos[ref][1] = _clamp_core(ref, pos[ref][0], pos[ref][1])
+
+        _resolve_overlaps(eps=0.0)
+
+    # --- final legalization sweep (guarantee class clearance if possible) ----
+    for _ in range(1500):
+        if _resolve_overlaps(eps=1e-6) == 0:
+            break
+
+    core_xy: Dict[str, Tuple[float, float]] = {}
+    for ref in core_refs:
+        core_xy[ref] = (pos[ref][0] - ox, pos[ref][1] - oy)
+
+    wl_after = _wirelength()
+    if wl_before > 0:
+        notes.append(f"weighted pin-to-pin wirelength {wl_before:.0f} -> {wl_after:.0f} mm "
+                     f"({100.0 * (wl_before - wl_after) / wl_before:.0f}% shorter)")
+
+    edge_connectors = {ref: (side, along) for ref, (side, along) in edge_along_abs.items()}
+    return FloorplanResult(edge_connectors=edge_connectors, core_xy=core_xy,
+                           notes=notes, wirelength_before=wl_before, wirelength_after=wl_after)
+
+
 def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], nets: Dict[str, PlanNet], aliases: Dict[str, str], alias_diagnostics: AliasDiagnostics, intent: Mapping[str, Any], warnings: List[str]) -> Plan:
     infer_roles(components, intent)
     pairs = detect_differential_pairs(nets)
@@ -1947,6 +2447,13 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
         explanations.setdefault(ref, {}).update({"role": "mechanical", "generated_rule": rules[-1].text,
                                                   "mounting_hole_assignment": assignment})
 
+    # Solve the floorplan once (connector edge distribution + force-directed,
+    # wirelength-driven IC placement) and feed its coordinates to the emitters.
+    floorplan = compute_floorplan(board, components, nets, intent, regions,
+                                  mounting_hole_plan, spacing)
+    for note in floorplan.notes:
+        warnings.append(f"floorplan: {note}")
+
     clusters: List[Dict[str, Any]] = []
     edge_rotation_plan: List[Dict[str, Any]] = []
     # Connector/high-speed clusters. Edge-required connectors are mechanically
@@ -1982,8 +2489,11 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
         else:
             edge_required = False
         access_side = str(cfg.get("access_side") or nearest_edge)
-        if edge_required or near_edge:
-            along = local_y if access_side in ("left", "right") else local_x
+        fp_edge = floorplan.edge_connectors.get(comp.ref)
+        if fp_edge is not None:
+            # Floorplan distributes connectors along their edge; use its solved
+            # access side and along-edge coordinate instead of the source layout.
+            access_side, along = fp_edge
             placement_kw = "y" if access_side in ("left", "right") else "x"
             allow_outside = bool(cfg.get("allow_body_outside_board", edge_required))
             rotation_cfg = cfg.get("rotation", "auto")
@@ -2012,8 +2522,9 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
                                        "allow_body_outside_board": allow_outside,
                                        "edge_required": edge_required, "locked": locked})
         else:
-            text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement=Anchor(x={local_x:.3f}, y={local_y:.3f}, rot={comp.rot:g}), role={_q(comp.role)})'
-            rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector cluster kept at existing location; not adjacent to a board edge and not edge-required."))
+            anchor_x, anchor_y = floorplan.core_xy.get(comp.ref, (local_x, local_y))
+            text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement=Anchor(x={anchor_x:.3f}, y={anchor_y:.3f}, rot={comp.rot:g}), role={_q(comp.role)})'
+            rules.append(PlanRule("cluster", text, members, f"{comp.ref} connector placed in board core by floorplanner (not edge-required)."))
         clusters.append({"name": name, "anchor": comp.ref, "members": members, "role": comp.role,
                          "category": _cluster_category(comp), "confidence": "high" if len(members) > 1 else "low",
                          "metadata_only": True,
@@ -2062,13 +2573,21 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
             members = _cluster_members(comp, components, nets, aliases, radius=12.0)
             region = "POWER" if comp.role == "power_regulator" and "POWER" in regions else "RF" if comp.role == "rf_module" and "RF" in regions else "CONTROL" if comp.role != "rf_module" and "CONTROL" in regions else None
             name = re.sub(r"[^A-Za-z0-9_]+", "_", (("IC" if comp.role == "mcu" else comp.role.upper()) + "_" + comp.ref))
-            placement = f'Anchor(x={comp.x - board.origin_x:.3f}, y={comp.y - board.origin_y:.3f}' + (f', region={_q(region)}' if region else '') + ')'
+            anchor_x, anchor_y = floorplan.core_xy.get(comp.ref, (comp.x - board.origin_x, comp.y - board.origin_y))
+            placement = f'Anchor(x={anchor_x:.3f}, y={anchor_y:.3f}' + (f', region={_q(region)}' if region else '') + ')'
             text = f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, placement={placement}, role={_q(comp.role)})'
-            rules.append(PlanRule("cluster", text, members, f"{comp.ref} {comp.role} support cluster preserves coarse neighborhood before pin-aware refinements."))
+            rules.append(PlanRule("cluster", text, members, f"{comp.ref} {comp.role} cluster placed by wirelength-driven floorplanner; pin-aware refinements follow."))
             clusters.append({"name": name, "anchor": comp.ref, "members": members, "role": comp.role, "category": _cluster_category(comp), "confidence": "high" if len(members) > 1 else "low"})
             explanations.setdefault(comp.ref, {}).update({"role": comp.role, "generated_rule": text})
             if comp.role == "rf_module" and not any(k.get("role") == "rf" for k in keepouts if isinstance(k, dict)):
-                rect = _synthesized_rf_keepout(comp, board)
+                # Synthesize the antenna keepout at the module's floorplanned
+                # location, not its stale source coordinates.
+                new_origin = (board.origin_x + anchor_x, board.origin_y + anchor_y)
+                delta = (new_origin[0] - comp.x, new_origin[1] - comp.y)
+                moved_comp = dataclasses.replace(
+                    comp, x=new_origin[0], y=new_origin[1],
+                    bbox=comp.bbox.translated(delta[0], delta[1]) if comp.bbox is not None else None)
+                rect = _synthesized_rf_keepout(moved_comp, board)
                 ko = f'Keepout({_q(comp.ref + "_ANTENNA")}, x={rect["x"]:.3f}, y={rect["y"]:.3f}, w={rect["w"]:.3f}, h={rect["h"]:.3f}, role="rf")'
                 rules.append(PlanRule("keepout", ko, [comp.ref], f"{comp.ref} inferred RF/module; synthesized antenna keepout adjacent to module edge and requires engineering review."))
 

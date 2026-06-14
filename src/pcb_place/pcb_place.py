@@ -2811,6 +2811,111 @@ class PlacementEngine:
             return cx + radius * math.cos(theta), cy + radius * math.sin(theta)
         raise PlacementError(f"Cluster placement type {typ!r} cannot resolve a coordinate")
 
+    @staticmethod
+    def _board_fit_shift(union: Optional[BBox], geometry: "BoardGeometry") -> Point:
+        """Single (dx, dy) that brings ``union`` inside the board, preserving shape."""
+
+        if union is None:
+            return (0.0, 0.0)
+
+        def _axis_shift(lo: float, hi: float, bmin: float, bmax: float) -> float:
+            # Cluster wider than the board on this axis: best-effort align to the
+            # low edge so as much of it as possible stays inside.
+            if hi - lo > bmax - bmin:
+                return bmin - lo
+            if lo < bmin:
+                return bmin - lo
+            if hi > bmax:
+                return bmax - hi
+            return 0.0
+
+        return (_axis_shift(union.min_x, union.max_x, geometry.min_x, geometry.max_x),
+                _axis_shift(union.min_y, union.max_y, geometry.min_y, geometry.max_y))
+
+    def _cluster_anchor_refs(self) -> Set[str]:
+        """Resolved refs that are the anchor of some cluster rule (cached)."""
+
+        cached = getattr(self, "_cluster_anchor_cache", None)
+        if cached is None:
+            cached = set()
+            for rule in self.model.rules:
+                if rule.get("type") == "cluster" and rule.get("anchor") is not None:
+                    resolved = self.resolve_ref(str(rule["anchor"]))
+                    if resolved is not None:
+                        cached.add(resolved)
+            self._cluster_anchor_cache = cached
+        return cached
+
+    def _fit_cluster_inside_board(self, name: str, members: Sequence[str],
+                                  targets: Sequence[Point], rot_delta: float,
+                                  *, edge_side: Optional[str] = None) -> List[Point]:
+        """Translate a cluster rigidly so its member origins fall inside the board.
+
+        The previous behavior clamped every member coordinate independently,
+        which collapsed an off-board cluster onto the board edge (all members
+        sharing the clamped x or y) and manufactured overlaps even when the
+        board had abundant free space.  Here we instead shift the whole cluster
+        by a single vector, preserving the intra-cluster geometry the planner
+        intended.
+
+        The fit is computed from member *origins* rather than footprint bodies
+        so edge connectors whose bodies legitimately overhang the outline
+        (allow_body_outside_board) are not dragged inward; only the placement
+        origins, which is what board-bounds validation checks, are guaranteed to
+        land on the board.
+        """
+
+        geometry = self.board_geometry
+        targets = list(targets)
+        if geometry is None or not targets:
+            return targets
+
+        # The shift is derived from the cluster's *intended* shape, taken from
+        # the original layout offsets of each member relative to the anchor (and
+        # rotated rigidly), not from members' current coordinates.  Two kinds of
+        # member would otherwise distort the fit and drag the anchor across the
+        # board:
+        #   * support parts owned by a later rule (e.g. decoupling caps placed by
+        #     a DecouplingArray) are still at stale coordinates when this cluster
+        #     runs; the original-offset model already neutralizes those.
+        #   * members that are themselves the anchor of another cluster (e.g. a
+        #     connector cluster that lists neighboring ICs) get their final
+        #     position from their own rule, so they must not constrain this fit.
+        # Only the anchor and members it genuinely owns shape the translation.
+        anchor = members[0]
+        a_fp = self.footprints[anchor]
+        a_target = targets[0]
+        other_anchors = self._cluster_anchor_refs()
+        xs: List[float] = []
+        ys: List[float] = []
+        for actual in members:
+            if actual != anchor and actual in other_anchors:
+                continue
+            fp = self.footprints[actual]
+            rx, ry = _rot_point(fp.x - a_fp.x, fp.y - a_fp.y, rot_delta)
+            xs.append(a_target[0] + rx)
+            ys.append(a_target[1] + ry)
+        if not xs:
+            xs, ys = [a_target[0]], [a_target[1]]
+        union = BBox(min(xs), min(ys), max(xs), max(ys))
+        sx, sy = self._board_fit_shift(union, geometry)
+        # An edge-required cluster's anchor must stay on its edge: never translate
+        # perpendicular to the edge (that would pull the connector inward).  Its
+        # inward support members are repositioned by their own rules instead.
+        if edge_side in ("left", "right"):
+            sx = 0.0
+        elif edge_side in ("top", "bottom"):
+            sy = 0.0
+        if abs(sx) <= 1e-9 and abs(sy) <= 1e-9:
+            return targets
+
+        self.messages.append(Message(
+            "warn",
+            f"cluster {name} had member target(s) outside board bounds; translated rigidly by "
+            f"({_fmt_num(sx)}, {_fmt_num(sy)}) mm to fit inside the board while preserving "
+            "cluster geometry"))
+        return [(tx + sx, ty + sy) for tx, ty in targets]
+
     def place_cluster(self, rule: Mapping[str, Any]) -> None:
         name = str(rule["name"])
         anchor_ref = self.resolve_ref(str(rule["anchor"]))
@@ -2851,19 +2956,11 @@ class PlacementEngine:
             ox, oy = _rot_point(mx - old_anchor[0], my - old_anchor[1], rot_delta)
             targets.append((new_anchor[0] + ox, new_anchor[1] + oy))
         if self.board_geometry is not None and not self.allow_outside_board:
-            clamped_targets = []
-            for tx, ty in targets:
-                cx = min(max(tx, self.board_geometry.min_x), self.board_geometry.max_x)
-                cy = min(max(ty, self.board_geometry.min_y), self.board_geometry.max_y)
-                clamped_targets.append((cx, cy))
-            if clamped_targets != targets:
-                outside_count = sum(1 for (tx, ty), (cx, cy) in zip(targets, clamped_targets)
-                                    if abs(tx - cx) > 1e-9 or abs(ty - cy) > 1e-9)
-                self.messages.append(Message(
-                    "warn",
-                    f"cluster {name} had {outside_count} member target(s) outside board bounds; "
-                    "clamped those anchors inside the board for best-effort placement"))
-                targets = clamped_targets
+            placement = rule.get("placement", {}) or {}
+            edge_side = (str(placement.get("edge") or placement.get("access_side"))
+                         if str(placement.get("type")) == "edge" else None)
+            targets = self._fit_cluster_inside_board(name, members, targets, rot_delta,
+                                                     edge_side=edge_side)
         margin = self.model.policy.max_search_radius + 5.0
         cluster_region = BBox(
             min(t[0] for t in targets) - margin, min(t[1] for t in targets) - margin,
