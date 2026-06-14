@@ -1,14 +1,79 @@
 # pcb-plan
 
-`pcb-plan` owns the planning lifecycle for a PCB design. It creates and evolves
-`board.pln`, explains inferred planning intent, and emits the deterministic
-`placement.ppl` consumed by `pcb-place`.
+`pcb-plan` is the **board-intelligence extractor** and `board.pln` reviewer for
+a PCB design. Its `inspect` command extracts facts and candidate hints into a
+`planning-hints/` directory; an AI (Claude) turns those hints into `board.pln`,
+the authoritative design-intent document; and `pcb-plan` then reviews, validates,
+updates, and emits the deterministic `placement.ppl` consumed by `pcb-place`.
+
+```text
+pcb-plan inspect  ->  planning-hints/  ->  AI generates board.pln  ->  pcb-plan check/emit  ->  pcb-place
+```
 
 The boundary is intentional:
 
-- `pcb-plan` creates and updates `board.pln`, infers placement/routing/simulation intent, generates reports, and emits `placement.ppl` plus routing/simulation planning artifacts.
-- `pcb-place` consumes `placement.ppl`, applies placement, validates placement, and writes KiCad board files.
-- `pcb-plan` does **not** move footprints in a KiCad board and does **not** route traces.
+- `pcb-plan inspect` extracts facts (geometry, connectivity) and *candidate
+  hints* (roles, functional paths, power islands, edge connectors, mechanicals,
+  RF zones). It does **not** place components, create placement ownership, build
+  topology clusters heuristically, or infer a final floorplan — those are AI
+  planning problems solved in `board.pln`.
+- The AI (Claude) is the primary planning engine: it authors `board.pln` from
+  `planning-hints/` (see the `pcb-bootstrap` skill).
+- `pcb-plan` reviews/validates `board.pln` (`check`, `review`, `explain`),
+  updates it from feedback (`update`), and emits `placement.ppl` (`emit`).
+- `pcb-place` consumes `placement.ppl`, applies/reflows/optimizes placement,
+  validates it, and writes KiCad board files.
+- `pcb-plan` does **not** move footprints in a KiCad board and does **not**
+  route traces. KiCad groups are exported as metadata only and must not drive
+  placement.
+
+## pcb-plan inspect
+
+`pcb-plan inspect` extracts board intelligence into a `planning-hints/`
+directory for AI-driven `board.pln` generation:
+
+```bash
+pcb-plan inspect \
+  --board layout.kicad_pcb \
+  --netlist default.net \
+  --width 75 --height 75 \
+  --out planning-hints
+```
+
+| Flag | Purpose |
+| --- | --- |
+| `--board` (required) | Input KiCad `.kicad_pcb` board. |
+| `--netlist` | Optional Zener/pcb netlist for connectivity. |
+| `--width` / `--height` | Override board geometry in mm (use together). |
+| `--origin-x` / `--origin-y` | Override board origin in mm. |
+| `--stackup-layers` | Optional known layer count to inform stackup assumptions. |
+| `--out` (required) | Output `planning-hints/` directory. |
+
+It writes facts and *candidate hints* (never authoritative placement):
+
+| File | Contents |
+| --- | --- |
+| `board-hints.json` | Master facts + candidate hints (geometry, counts, candidate roles, paths, power islands, edge connectors, mechanicals, RF zones, differential pairs, routing classes, stackup assumptions, simulation candidates, imported KiCad groups). |
+| `board-hints.md` | Human-readable summary. |
+| `component-table.csv` | Per-component facts (role, candidate role, bbox, area, nets). |
+| `connectivity-graph.json` | Component/net connectivity plus candidate ownership hints. |
+| `footprint-bboxes.json` | Bounding box, centroid, and area per component. |
+| `pad-locations.json` | Absolute/local pad coordinates and nets. |
+| `candidate-functional-paths.json` | connector → protection → IC signal paths. |
+| `candidate-power-islands.json` | Regulator + hot-loop topology. |
+| `candidate-high-speed-paths.json` | High-speed subset of functional paths. |
+| `candidate-edge-connectors.json` | Access side, auto-rotation, and `edge_required` hints. |
+| `candidate-mechanicals.json` | Mounting-hole corner assignments. |
+| `candidate-rf-zones.json` | RF antenna keepout candidates. |
+| `routing-classes.json` | Candidate routing classes (impedance still requires the fab stackup). |
+| `ai-pln-prompt.md` | Prompt to help Claude generate `board.pln`. |
+| `ai-placement-review.md` | Checklist for reviewing `board.pln` against the hints. |
+
+KiCad `(group ...)` blocks are exported under `imported_kicad_groups` with
+`metadata_only: true`; they are preserved for information only and **must not
+drive placement**. Simulation opportunities are surfaced as hints
+(`openems_candidate`, `ngspice_candidate`, `si_candidate`), not simulation
+results.
 
 ## board.pln Overview
 
@@ -613,6 +678,11 @@ provenance:
 visible instead of hidden in generated files.
 
 ## pcb-plan init
+
+> **Note:** `init` is a legacy heuristic generator kept for quick starts and
+> compatibility. The preferred path is `pcb-plan inspect` followed by
+> AI-authored `board.pln` (the `pcb-bootstrap` skill), which keeps fact
+> extraction and design-intent generation cleanly separated.
 
 `init` generates an initial `board.pln` from a KiCad board and optional netlist:
 

@@ -1,6 +1,6 @@
 ---
 name: pcb-automation-orchestrator
-description: Coordinate the end-to-end PCB automation workflow across pcb (Zener), pcb-plan, pcb-place, KiCad routing tools, KiCad DRC/ERC, and optional OpenEMS/ngspice simulation. Use for full board iterations (build -> plan -> place -> route -> verify -> simulate -> update plan), all-net or high-speed routing with constraints, and bounded autonomous iteration loops.
+description: Coordinate the end-to-end PCB automation workflow across pcb (Zener), pcb-plan, pcb-place, KiCad routing tools, KiCad DRC/ERC, and optional OpenEMS/ngspice simulation. Use for full board iterations (inspect -> bootstrap board.pln -> validate -> place -> analyze -> update board.pln, repeat), all-net or high-speed routing with constraints, and bounded autonomous iteration loops.
 ---
 
 # pcb-automation-orchestrator
@@ -10,12 +10,20 @@ description: Coordinate the end-to-end PCB automation workflow across pcb (Zener
 This skill coordinates the full PCB automation workflow. It does **not**
 replace any individual tool — it sequences them, passes artifacts between
 them, and decides (in review mode) or applies (in autonomous mode) the
-resulting `board.pln` updates:
+resulting `board.pln` updates. In the current architecture, **Claude is the
+primary planning engine**: `pcb-plan inspect` extracts facts and candidate
+hints, Claude (via the **pcb-bootstrap** skill) generates `board.pln` from
+those hints, and `pcb-place` executes deterministically.
 
 - **`pcb` (Zener)** — hardware-as-code board build/layout (`pcb build`,
   `pcb layout`).
-- **`pcb-plan`** — owns `board.pln`, emits `placement.ppl` and routing/SI
-  handoff artifacts. See [`../pcb-plan/SKILL.md`](../pcb-plan/SKILL.md).
+- **`pcb-plan`** — board-intelligence extractor and `board.pln` toolkit;
+  `pcb-plan inspect` produces `planning-hints/`, and `pcb-plan
+  check`/`review`/`emit` validate and emit from `board.pln`. See
+  [`../pcb-plan/SKILL.md`](../pcb-plan/SKILL.md).
+- **`pcb-bootstrap`** — the primary planning skill; generates `board.pln`
+  from `planning-hints/`. See
+  [`../pcb-bootstrap/SKILL.md`](../pcb-bootstrap/SKILL.md).
 - **`pcb-place`** — deterministic placement executor. See
   [`../pcb-place/SKILL.md`](../pcb-place/SKILL.md).
 - **KiCadRoutingTools** — external autorouter/router invoked using
@@ -27,9 +35,15 @@ resulting `board.pln` updates:
 - **ngspice** (optional) — circuit simulation for regulators, resets,
   filters, and analog sections.
 
+`board.pln` is the **authoritative design-intent document** and **the
+optimization surface**. The AI optimization loop primarily modifies
+`board.pln`, never `placement.ppl` (which is a regenerated emit artifact).
+KiCad groups are metadata only and must not drive placement.
+
 ## Prerequisites
 
 - `pcb-plan` and `pcb-place` installed (see their skills for details).
+- The `pcb-bootstrap` skill available for generating `board.pln` from hints.
 - `pcb` (Zener) CLI for board build/layout, if starting from a `.zen` design.
 - KiCadRoutingTools (or another routing tool that consumes
   `routing-policy.yaml`) and a KiCad DRC/ERC runner available on `PATH` for
@@ -43,10 +57,16 @@ Primary generated artifacts (paths are conventions; adjust to project
 layout):
 
 ```text
-board.pln                      # owned by pcb-plan
-pcb-plan-init-report.json      # pcb-plan init report for AI review
+planning-hints/                # pcb-plan inspect -> facts + candidate hints
+                               #   (board-hints.json master, board-hints.md,
+                               #    ai-pln-prompt.md, ai-placement-review.md,
+                               #    component-table.csv, connectivity-graph.json,
+                               #    footprint-bboxes.json, pad-locations.json,
+                               #    candidate-*.json, routing-classes.json, ...)
+board.pln                      # AI-generated (pcb-bootstrap) design intent; the
+                               #   optimization surface
 pcb-plan-check-report.json     # pcb-plan check report for AI review
-placement.ppl                  # pcb-plan emit -> pcb-place input
+placement.ppl                  # pcb-plan emit -> pcb-place input (regenerated)
 pcb-plan-report.json           # pcb-plan emit report
 pcb-place-report.json          # pcb-place dry-run/write report
 routing-policy.yaml            # pcb-plan emit --emit-routing-policy
@@ -61,58 +81,72 @@ iteration-summary.md           # per-iteration summary for review/autonomous mod
 ## Workflow
 
 ```bash
-# 1. Build/layout (Zener)
+# 1. Build/layout (Zener, optional)
 pcb build board.zen
 pcb layout board.zen
 
-# 2. Plan and AI-optimize board.pln before emit
-pcb-plan init --board layout.kicad_pcb --netlist default.net -o board.pln \
-  --report-json pcb-plan-init-report.json
-# AI review/optimization of board.pln: geometry, regions, keepouts, clusters,
-# edge-required/access_side, high-speed corridors, arrays, routing/SI, sim hooks
+# 2. Inspect: extract board intelligence into planning-hints/
+pcb-plan inspect --board layout.kicad_pcb --netlist default.net \
+  --width 75 --height 75 --out planning-hints
+# inspect extracts FACTS and CANDIDATE HINTS only; it does not place,
+# floorplan, or own placement.
+
+# 3. Generate board.pln from the hints (AI is the primary planning engine)
+# Use the pcb-bootstrap skill: read planning-hints/ (board-hints.json,
+# ai-pln-prompt.md, candidate-*.json, ...) and author board.pln —
+# geometry, regions, keepouts, clusters, edge-required/access_side,
+# high-speed corridors, arrays, routing/SI, sim hooks.
+
+# 4. Validate board.pln
 pcb-plan check --pln board.pln --board layout.kicad_pcb --netlist default.net \
   --report-json pcb-plan-check-report.json
-# AI review/optimization of pcb-plan-check-report.json
+# AI review/optimization of pcb-plan-check-report.json, feeding fixes back
+# into board.pln.
+
+# 5. Emit placement.ppl (and routing/SI handoff artifacts)
 pcb-plan emit --pln board.pln --board layout.kicad_pcb --netlist default.net \
   -o placement.ppl --report-json pcb-plan-report.json \
   --emit-routing-policy routing-policy.yaml \
   --emit-openems-plan simulation/openems/openems-plan.yaml
 
-# 3. Place and AI-review the dry-run report
+# 6. Place (deterministic executor)
 pcb-place layout.kicad_pcb placement.ppl --dry-run --report-json pcb-place-report.json
-# AI review/optimization of pcb-place-report.json, feeding fixes back to board.pln
-# before writing if needed.
+# AI review of pcb-place-report.json, feeding fixes back to board.pln before
+# writing if needed.
 pcb-place layout.kicad_pcb placement.ppl -o layout.placed.kicad_pcb --report-json pcb-place-report.json
 
-# 4. Route (external tool, driven by routing-policy.yaml)
+# 7. Route (external tool, driven by routing-policy.yaml) + verify + simulate
 KiCadRoutingTools route layout.placed.kicad_pcb \
   --policy routing-policy.yaml \
   --report-json routing-report.json
+# Run KiCad DRC/ERC on the routed board (via kicad-cli or equivalent).
+# Optional: OpenEMS using simulation/openems/openems-plan.yaml; ngspice for
+# regulators/reset/filter/analog sections.
 
-# 5. Verify
-# Run KiCad DRC/ERC on the routed board (via kicad-cli or equivalent)
-
-# 6. Optional simulation
-# OpenEMS using simulation/openems/openems-plan.yaml
-# ngspice for regulators/reset/filter/analog sections
-
-# 7. Feed results back into the plan
+# 8. Analyze reports and UPDATE board.pln, then repeat
 pcb-plan update --pln board.pln --board layout.placed.kicad_pcb \
   --place-report pcb-place-report.json \
   --routing-report routing-report.json \
   --openems-report openems-report.json \
   --ngspice-report ngspice-report.json \
   -o board.updated.pln --patch board.pln.patch
+# Claude analyzes the reports and edits board.pln (the optimization surface);
+# loop back to step 4.
 ```
 
-Each stage's output feeds the next: `board.pln` plus AI review ->
-`pcb-plan check` -> `placement.ppl` -> `pcb-place` dry-run report plus AI
-review -> `layout.placed.kicad_pcb` -> routed board -> DRC/ERC + simulation
-reports -> `board.pln` update proposals.
+The pipeline is: **inspect -> bootstrap `board.pln` -> validate -> place ->
+analyze -> update `board.pln` -> repeat**. Each stage's output feeds the
+next: `planning-hints/` -> AI-authored `board.pln` -> `pcb-plan check` ->
+`placement.ppl` -> `pcb-place` report plus AI review -> routed board ->
+DRC/ERC + simulation reports -> `board.pln` update proposals.
 
 ## AI Optimization Loop
 
-The orchestrator has three operating modes:
+The orchestrator has three operating modes. In all modes, the loop
+**modifies `board.pln` (the optimization surface)**, not `placement.ppl`:
+`pcb-plan inspect` only extracts facts, and `pcb-place` stays deterministic.
+Preference order for any fix is 1) `board.pln`, 2) a `placement.ppl`
+override, 3) a manual `Anchor()`.
 
 ### Review mode (default)
 
@@ -129,14 +163,16 @@ The orchestrator has three operating modes:
 
 ### Autonomous mode
 
-- May run bounded `init/check/edit/emit/place/route/sim/update` iterations.
+- May run bounded `inspect/bootstrap/check/edit/emit/place/route/sim/update`
+  iterations.
 - Default `max_iterations = 3`.
 - Stop early if the score no longer improves, if changes converge, or if
   remaining work requires human engineering judgment.
 
 Each iteration should:
 
-1. Run or read the latest init/check/emit/place/routing/simulation reports.
+1. Run or read the latest inspect/check/emit/place/routing/simulation
+   reports.
 2. Score the design and write or update `design-score.json`.
 3. Identify the highest-impact `board.pln` changes.
 4. Edit `board.pln` with minimal visible diffs and provenance.
@@ -161,7 +197,7 @@ Scoring should consider:
 
 ### Board.pln editing rules
 
-When Claude modifies `board.pln`:
+`board.pln` is the optimization surface. When Claude modifies `board.pln`:
 
 - preserve user comments if possible;
 - keep provenance for inferred changes;
@@ -185,7 +221,9 @@ rationale: "..."
 
 ### AI should optimize intent, not hide failures
 
-- Prefer `board.pln` edits over manual `placement.ppl` hacks.
+- Modify `board.pln` (the optimization surface), not `placement.ppl` hacks;
+  fall back to `placement.ppl` override or manual `Anchor()` only when
+  `board.pln` cannot express the intent.
 - Preserve provenance and user-authored constraints.
 - Emit review-required notes for inferred or uncertain changes.
 - Report uncertainty and remaining engineering decisions.
@@ -281,7 +319,9 @@ becomes visible `provenance.update_proposals`, not silent edits.
 Use the AI Optimization Loop modes above. In all modes, `pcb-plan update` may
 incorporate placement/routing/simulation feedback into `board.updated.pln` and
 `board.pln.patch`, but the orchestrator should still inspect the proposed
-changes rather than accepting them blindly.
+changes rather than accepting them blindly. The loop edits `board.pln` and
+re-runs `check -> emit -> place -> analyze`; `placement.ppl` is always
+regenerated from `board.pln`.
 
 Autonomous mode should still surface every `requires_review: true` item from
 `board.pln` provenance to the user at the end of the run, even if iteration
@@ -319,10 +359,11 @@ Single review-mode pass with all-net routing using existing constraints:
 pcb build board.zen
 pcb layout board.zen
 
-pcb-plan init --board layout.kicad_pcb --netlist default.net -o board.pln \
-  --report-json pcb-plan-init-report.json
-# Claude reviews/optimizes board.pln, e.g. HDMI edge_required/access_side,
-# U10 decoupling effective_side/stagger, POWER/HIGH_SPEED regions.
+pcb-plan inspect --board layout.kicad_pcb --netlist default.net \
+  --width 75 --height 75 --out planning-hints
+# Claude (pcb-bootstrap skill) reads planning-hints/ and generates board.pln,
+# e.g. HDMI edge_required/access_side, U10 decoupling effective_side/stagger,
+# POWER/HIGH_SPEED regions.
 pcb-plan check --pln board.pln --board layout.kicad_pcb --netlist default.net \
   --report-json pcb-plan-check-report.json
 pcb-plan emit --pln board.pln --board layout.kicad_pcb --netlist default.net \
@@ -345,10 +386,11 @@ pcb-plan update --pln board.pln --board layout.placed.kicad_pcb \
 Bounded autonomous loop (3 iterations max), only when explicitly requested:
 
 ```text
+inspect once -> planning-hints/; bootstrap board.pln from hints (pcb-bootstrap)
 for i in 1..3:
-  run/read latest init/check/place/route/sim reports
+  run/read latest check/place/route/sim reports
   score design -> design-score.json
-  edit board.pln for highest-impact intent fixes, with provenance
+  edit board.pln (the optimization surface) for highest-impact intent fixes, with provenance
   pcb-plan check ... --report-json pcb-plan-check-report.json
   emit placement.ppl from board.pln
   pcb-place ... --dry-run --report-json pcb-place-report.json
@@ -360,7 +402,8 @@ for i in 1..3:
 report final status + outstanding review items; never claim compliance
 ```
 
-See [`../pcb-plan/SKILL.md`](../pcb-plan/SKILL.md) and
+See [`../pcb-bootstrap/SKILL.md`](../pcb-bootstrap/SKILL.md),
+[`../pcb-plan/SKILL.md`](../pcb-plan/SKILL.md), and
 [`../pcb-place/SKILL.md`](../pcb-place/SKILL.md) for tool-specific details, and
 the root [`README.md`](../../README.md) for the repository-level workflow
 diagram.

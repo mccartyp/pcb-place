@@ -41,7 +41,7 @@ from pcb_place import (
     parse_netlist_aliases,
 )
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 Point = Tuple[float, float]
 _POWER_RE = re.compile(r"^(?:\+?(?:1V[0-9]|1V[0-9]|[0-9]+V[0-9]*|VCC|VDD|VBAT|VIN|VBUS|AVDD|DVDD|PVDD|3V3|5V|12V))", re.I)
@@ -3871,6 +3871,16 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--origin-y", type=float, help="Override board origin Y in mm when --width/--height are supplied")
     init.add_argument("--summary-md", type=Path, help="Write human-readable init summary markdown")
 
+    inspect = sub.add_parser("inspect", help="Extract board intelligence into planning-hints/ for AI board.pln generation")
+    inspect.add_argument("--board", required=True, type=Path, help="Input KiCad .kicad_pcb board")
+    inspect.add_argument("--netlist", type=Path, help="Optional Zener/pcb netlist artifact for connectivity")
+    inspect.add_argument("--width", type=float, help="Override board width in mm")
+    inspect.add_argument("--height", type=float, help="Override board height in mm")
+    inspect.add_argument("--origin-x", type=float, help="Override board origin X in mm")
+    inspect.add_argument("--origin-y", type=float, help="Override board origin Y in mm")
+    inspect.add_argument("--stackup-layers", type=int, help="Optional known layer count to inform stackup assumptions")
+    inspect.add_argument("--out", required=True, type=Path, help="Output planning-hints directory")
+
     update = sub.add_parser("update", help="Update board.pln from feedback reports")
     update.add_argument("--pln", required=True, type=Path, help="Existing board.pln")
     update.add_argument("--board", type=Path, help="Optional KiCad board for regenerated report context")
@@ -4052,6 +4062,749 @@ def ai_edit_hints_text(plan: Plan) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------------------
+# pcb-plan inspect: board-intelligence extraction -> planning-hints/
+#
+# `inspect` is a board-intelligence *extractor*, not a floorplanner. It reads
+# facts (geometry, components, connectivity) and produces *candidate* hints for
+# an AI (or human) to turn into an authoritative board.pln. It never performs
+# placement, never creates placement ownership, and never infers a final
+# floorplan. Everything it emits is explicitly marked as a hint/candidate.
+# ---------------------------------------------------------------------------
+
+# At rot=0 a connector's mating face points toward the top board edge (-y);
+# auto-rotation maps the chosen access side onto that convention.
+_AUTO_ROTATION_BY_SIDE: Dict[str, float] = {"top": 0.0, "right": 90.0, "bottom": 180.0, "left": 270.0}
+
+
+def _candidate_role(comp: PlanComponent) -> str:
+    """Refine the coarse inferred role into a more specific *candidate* role hint.
+
+    These are hints only. They never drive placement; they help an AI map a
+    component to design intent in board.pln.
+    """
+
+    haystack = f"{comp.footprint.upper()} {(comp.value or '').upper()} {' '.join(n.upper() for n in comp.nets)}"
+    role = comp.role
+    if "connector" in role or role == "debug_header":
+        if "HDMI" in haystack:
+            return "hdmi_connector"
+        if "USB" in haystack:
+            return "usb_connector"
+        if any(tok in haystack for tok in ("RJ45", "ETHERNET", "ETH", "MAGJACK")):
+            return "ethernet_connector"
+        if any(tok in haystack for tok in ("BARREL", "DC_JACK", "DCJACK", "DC-JACK", "PJ-")):
+            return "dc_jack"
+        if role == "debug_header":
+            return "debug_header"
+        return "edge_connector" if role == "high_speed_connector" else "connector"
+    if role == "hdmi_retimer":
+        if "REDRIVER" in haystack or "REDRIVE" in haystack:
+            return "redriver"
+        if "RETIMER" in haystack:
+            return "retimer"
+        return "retimer"
+    if role == "clock":
+        return "oscillator"
+    if role == "power_regulator":
+        return "regulator"
+    if role == "decoupling":
+        return "decoupling_cap"
+    if role == "esd_protection":
+        return "esd"
+    if role == "pullup_pulldown":
+        return "pullup"
+    if role == "mechanical":
+        return "mounting_hole"
+    if role == "ic":
+        if "FLASH" in haystack or "EEPROM" in haystack or "NOR" in haystack:
+            return "flash"
+        return "ic"
+    return role
+
+
+def parse_kicad_groups(text: str, components: Mapping[str, PlanComponent]) -> List[Dict[str, Any]]:
+    """Parse KiCad ``(group ...)`` blocks as *metadata only*.
+
+    KiCad groups are preserved for information only and must NOT drive
+    placement ownership. Member footprint UUIDs are resolved back to component
+    references when possible; unresolved UUIDs are reported verbatim.
+    """
+
+    uuid_to_ref = {comp.uuid: ref for ref, comp in components.items() if comp.uuid}
+    groups: List[Dict[str, Any]] = []
+    idx = 0
+    while True:
+        start = text.find("(group", idx)
+        if start == -1:
+            break
+        try:
+            end = _find_matching_paren(text, start)
+        except PlacementError:
+            break
+        block = text[start:end]
+        idx = end
+        name_match = re.search(r'\(group\s+"([^"]*)"', block)
+        name = name_match.group(1) if name_match else ""
+        member_ids: List[str] = []
+        for chunk in re.findall(r"\(members\b([^)]*)\)", block):
+            member_ids.extend(re.findall(r'"([^"]+)"', chunk))
+        member_refs = sorted({uuid_to_ref[u] for u in member_ids if u in uuid_to_ref})
+        unresolved = sorted({u for u in member_ids if u not in uuid_to_ref})
+        groups.append({
+            "name": name,
+            "members": member_refs,
+            "unresolved_member_uuids": unresolved,
+            "metadata_only": True,
+        })
+    return groups
+
+
+def inspect_edge_connectors(board: BoardGeometry, components: Mapping[str, PlanComponent]) -> List[Dict[str, Any]]:
+    """Candidate edge connectors with access-side and auto-rotation hints.
+
+    Hints only: edge_required/access_side/rotation require confirmation against
+    the enclosure. No placement is performed.
+    """
+
+    out: List[Dict[str, Any]] = []
+    for comp in sorted(components.values(), key=lambda c: c.ref):
+        if "connector" not in comp.role and comp.role != "debug_header":
+            continue
+        local_x = max(0.0, min(board.width, comp.x - board.origin_x))
+        local_y = max(0.0, min(board.height, comp.y - board.origin_y))
+        distances = {
+            "left": local_x,
+            "right": board.width - local_x,
+            "top": local_y,
+            "bottom": board.height - local_y,
+        }
+        nearest_edge = min(distances, key=distances.get)
+        edge_span = board.width if nearest_edge in ("left", "right") else board.height
+        inset = 2.0
+        near_edge = edge_span > 0 and distances[nearest_edge] / edge_span <= 0.25 and distances[nearest_edge] > inset
+        haystack = f"{comp.footprint.upper()} {(comp.value or '').upper()}"
+        inferred_edge_required = (comp.role == "high_speed_connector"
+                                  or any(token in haystack for token in _EDGE_CONNECTOR_TOKENS))
+        candidate_edge_required = bool(near_edge or inferred_edge_required)
+        out.append({
+            "ref": comp.ref,
+            "role": comp.role,
+            "candidate_role": _candidate_role(comp),
+            "candidate_access_side": nearest_edge,
+            "candidate_rotation_auto_deg": _AUTO_ROTATION_BY_SIDE[nearest_edge],
+            "candidate_edge_required": candidate_edge_required,
+            "near_board_edge": bool(near_edge),
+            "distance_to_nearest_edge_mm": round(distances[nearest_edge], 3),
+            "allow_body_outside_board_hint": candidate_edge_required,
+            "nets": comp.nets,
+            "high_speed_nets": [n for n in comp.nets if is_high_speed(n)],
+            "metadata_only": True,
+            "note": "Candidate edge connector hint; confirm access side, rotation, and "
+                    "edge_required against the enclosure before committing in board.pln.",
+        })
+    return out
+
+
+def inspect_mechanicals(board: BoardGeometry, components: Mapping[str, PlanComponent]) -> List[Dict[str, Any]]:
+    """Candidate mechanical constraints (mounting holes -> distinct corners)."""
+
+    warnings: List[str] = []
+    plan_holes = plan_mounting_holes(board, components, {}, warnings)
+    out: List[Dict[str, Any]] = []
+    for hole in plan_holes:
+        item = dict(hole)
+        item["metadata_only"] = True
+        out.append(item)
+    return out
+
+
+def inspect_rf_zones(board: BoardGeometry, components: Mapping[str, PlanComponent]) -> List[Dict[str, Any]]:
+    """Candidate RF antenna keepout zones adjacent to RF modules."""
+
+    out: List[Dict[str, Any]] = []
+    for comp in sorted(components.values(), key=lambda c: c.ref):
+        if comp.role != "rf_module":
+            continue
+        rect = _synthesized_rf_keepout(comp, board)
+        out.append({
+            "ref": comp.ref,
+            "candidate_role": _candidate_role(comp),
+            "candidate_keepout": rect,
+            "openems_candidate": True,
+            "metadata_only": True,
+            "note": "Candidate RF antenna keepout; reserve clearance and validate detuning/EMI manually.",
+        })
+    return out
+
+
+def inspect_connectivity_graph(components: Mapping[str, PlanComponent],
+                               nets: Mapping[str, PlanNet]) -> Dict[str, Any]:
+    """Component/net connectivity facts plus candidate ownership hints (no placement)."""
+
+    graph = ConnectivityGraph(components, nets)
+    ic_roles = {"ic", "mcu", "hdmi_retimer", "rf_module", "power_regulator"}
+    ic_candidates = [c for c in components.values() if c.role in ic_roles]
+    comp_nodes: Dict[str, Any] = {}
+    for ref in sorted(components):
+        comp = components[ref]
+        neighbors: set[str] = set()
+        for net in comp.nets:
+            for peer, _pin in graph.net_members(net):
+                if peer != ref and peer in components:
+                    neighbors.add(peer)
+        candidate_owner: Optional[str] = None
+        if comp.role in _PASSIVE_SUPPORT_ROLES and comp.nets:
+            parent = _nearest_parent(comp, ic_candidates, set(comp.nets))
+            candidate_owner = parent.ref if parent is not None else None
+        comp_nodes[ref] = {
+            "role": comp.role,
+            "candidate_role": _candidate_role(comp),
+            "nets": comp.nets,
+            "neighbors": sorted(neighbors),
+            "degree": len(neighbors),
+            "candidate_owner_hint": candidate_owner,
+        }
+    net_nodes: Dict[str, Any] = {}
+    for name in sorted(nets):
+        net = nets[name]
+        members = sorted([list(pad) for pad in net.pads])
+        net_nodes[name] = {
+            "members": members,
+            "degree": len({r for r, _ in net.pads}),
+            "is_power": is_power(name),
+            "is_ground": is_ground(name),
+            "is_high_speed": is_high_speed(name),
+        }
+    return {
+        "note": "Connectivity facts and candidate ownership hints. candidate_owner_hint is a "
+                "hint only; pcb-plan inspect never assigns placement ownership.",
+        "components": comp_nodes,
+        "nets": net_nodes,
+    }
+
+
+def inspect_footprint_bboxes(board: BoardGeometry, components: Mapping[str, PlanComponent]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for ref in sorted(components):
+        comp = components[ref]
+        bbox = comp.bbox
+        bbox_block: Optional[Dict[str, float]] = None
+        area = 0.0
+        if bbox is not None:
+            bbox_block = {
+                "min_x": bbox.min_x, "min_y": bbox.min_y,
+                "max_x": bbox.max_x, "max_y": bbox.max_y,
+                "width": bbox.width, "height": bbox.height,
+            }
+            area = round(bbox.width * bbox.height, 4)
+        out[ref] = {
+            "footprint": comp.footprint,
+            "value": comp.value,
+            "layer": comp.layer,
+            "x": comp.x,
+            "y": comp.y,
+            "rotation": comp.rot,
+            "centroid": [comp.x, comp.y],
+            "bbox": bbox_block,
+            "footprint_area_mm2": area,
+        }
+    return out
+
+
+def inspect_pad_locations(components: Mapping[str, PlanComponent]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for ref in sorted(components):
+        comp = components[ref]
+        out[ref] = [
+            {
+                "number": pad.number,
+                "name": pad.name,
+                "abs_x": pad.abs_x,
+                "abs_y": pad.abs_y,
+                "local_x": pad.local_x,
+                "local_y": pad.local_y,
+                "net": pad.net,
+                "shape": pad.shape,
+                "size": list(pad.size),
+                "layers": pad.layers,
+            }
+            for pad in comp.pads
+        ]
+    return out
+
+
+def inspect_component_table_csv(components: Mapping[str, PlanComponent],
+                                nets: Mapping[str, PlanNet]) -> str:
+    import csv as _csv
+    import io as _io
+
+    buf = _io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow([
+        "reference", "value", "footprint", "role", "candidate_role",
+        "x", "y", "rotation", "layer", "bbox_w", "bbox_h", "area_mm2",
+        "net_degree", "nets",
+    ])
+    for ref in sorted(components):
+        comp = components[ref]
+        bw = f"{comp.bbox.width:.4f}" if comp.bbox else ""
+        bh = f"{comp.bbox.height:.4f}" if comp.bbox else ""
+        area = f"{comp.bbox.width * comp.bbox.height:.4f}" if comp.bbox else ""
+        writer.writerow([
+            comp.ref, comp.value or "", comp.footprint, comp.role, _candidate_role(comp),
+            f"{comp.x:g}", f"{comp.y:g}", f"{comp.rot:g}", comp.layer or "",
+            bw, bh, area, len(comp.nets), ";".join(comp.nets),
+        ])
+    return buf.getvalue()
+
+
+def inspect_routing_classes(nets: Mapping[str, PlanNet],
+                            differential_pairs: Sequence[DifferentialPair]) -> Dict[str, Any]:
+    """Candidate routing classes (hints only; impedance requires the fab stackup)."""
+
+    classes: Dict[str, Any] = {
+        "low_speed": {
+            "trace_width_mm": 0.15,
+            "clearance_mm": 0.15,
+            "preferred_layers": ["F.Cu", "B.Cu"],
+            "via_policy": "allow",
+            "source": "candidate_default_low_speed",
+        }
+    }
+    if differential_pairs:
+        classes["high_speed_diff"] = {
+            "differential": True,
+            "impedance_ohms": 100,
+            "trace_width_mm": 0.12,
+            "trace_spacing_mm": 0.15,
+            "via_policy": "avoid",
+            "max_skew_mm": 0.25,
+            "si_candidate": True,
+            "source": "candidate_from_differential_pairs",
+        }
+    return {
+        "note": "Candidate routing classes only. Controlled impedance always requires the "
+                "actual fabricator stackup; treat trace widths/spacings as starting hints.",
+        "mode": "all_nets_constrained" if differential_pairs else "low_speed_only",
+        "classes": classes,
+    }
+
+
+def inspect_stackup_assumptions(nets: Mapping[str, PlanNet],
+                                differential_pairs: Sequence[DifferentialPair],
+                                layers: Optional[int]) -> Dict[str, Any]:
+    """Candidate stackup assumptions (intent only; never impedance-accurate)."""
+
+    has_high_speed = bool(differential_pairs) or any(is_high_speed(n) for n in nets)
+    if layers is not None and layers in _LAYER_COUNT_PROFILES:
+        profile = STACKUP_PROFILES[_LAYER_COUNT_PROFILES[layers]]
+        return {
+            "layers": layers,
+            "profile": _LAYER_COUNT_PROFILES[layers],
+            "reference_planes": list(profile.get("reference_planes", [])),
+            "high_speed_preferred_layers": list(profile.get("high_speed_preferred_layers", [])),
+            "power_planes": list(profile.get("power_planes", [])),
+            "source": "candidate_from_requested_layer_count",
+            "note": _STACKUP_IMPEDANCE_WARNING,
+        }
+    if layers is not None:
+        # An explicit --stackup-layers value with no built-in template (e.g. a
+        # 12-layer board) must be honored, not silently replaced by the 4/2-layer
+        # heuristic. Preserve the requested count and flag that the layer
+        # roles/planes must be defined explicitly in board.pln.
+        return {
+            "layers": layers,
+            "profile": None,
+            "reference_planes": [],
+            "high_speed_preferred_layers": [],
+            "power_planes": [],
+            "source": "requested_layer_count_no_template",
+            "requires_review": True,
+            "note": f"Requested {layers}-layer stackup has no built-in template; the requested "
+                    "layer count is preserved but layer roles, reference planes, and high-speed "
+                    f"layers must be defined explicitly in board.pln. {_STACKUP_IMPEDANCE_WARNING}",
+        }
+    if has_high_speed:
+        return {
+            "layers": 4,
+            "profile": "4_layer_signal_gnd_pwr_signal",
+            "reference_planes": ["In1.GND"],
+            "high_speed_preferred_layers": ["F.Cu"],
+            "power_planes": ["In2.PWR"],
+            "source": "candidate_from_high_speed_nets",
+            "note": _STACKUP_IMPEDANCE_WARNING,
+        }
+    return {
+        "layers": 2,
+        "profile": "2_layer_basic",
+        "reference_planes": [],
+        "high_speed_preferred_layers": ["F.Cu"],
+        "power_planes": [],
+        "source": "candidate_from_board_complexity",
+        "note": _STACKUP_IMPEDANCE_WARNING,
+    }
+
+
+def inspect_simulation_candidates(nets: Mapping[str, PlanNet],
+                                  components: Mapping[str, PlanComponent],
+                                  differential_pairs: Sequence[DifferentialPair]) -> Dict[str, Any]:
+    """Identify simulation opportunities as hints (not simulation results)."""
+
+    net_names = " ".join(nets.keys()).upper()
+    openems = bool(differential_pairs) or any(
+        token in net_names for token in ("HDMI", "USB", "ETH", "RF", "TMDS", "SSTX", "SSRX", "PCIE"))
+    ngspice = any(c.role in {"power_regulator", "clock", "rf_module"} for c in components.values())
+    si = bool(differential_pairs)
+    return {
+        "note": "Simulation opportunities are hints, not results. Confirm before triggering solvers.",
+        "openems_candidate": openems,
+        "ngspice_candidate": ngspice,
+        "si_candidate": si,
+        "differential_pairs": [p.name for p in differential_pairs],
+    }
+
+
+def build_planning_hints(board: BoardGeometry,
+                         components: Dict[str, PlanComponent],
+                         nets: Dict[str, PlanNet],
+                         aliases: Mapping[str, str],
+                         alias_diagnostics: AliasDiagnostics,
+                         board_text: str,
+                         warnings: Sequence[str],
+                         *,
+                         board_path: Path,
+                         netlist_path: Optional[Path],
+                         stackup_layers: Optional[int]) -> Dict[str, Any]:
+    """Build the full board-hints.json payload from extracted facts.
+
+    Everything here is facts + candidate hints. No placement, no ownership, no
+    floorplan.
+    """
+
+    differential_pairs = detect_differential_pairs(nets)
+    functional_paths = detect_functional_paths(components, nets, {})
+    power_islands = detect_power_islands(components, nets, {})
+    high_speed_paths = {name: path for name, path in functional_paths.items()
+                        if "high_speed" in str(path.get("type", ""))}
+    edge_connectors = inspect_edge_connectors(board, components)
+    mechanicals = inspect_mechanicals(board, components)
+    rf_zones = inspect_rf_zones(board, components)
+    kicad_groups = parse_kicad_groups(board_text, components)
+    role_counts: Dict[str, int] = {}
+    candidate_role_counts: Dict[str, int] = {}
+    for comp in components.values():
+        role_counts[comp.role] = role_counts.get(comp.role, 0) + 1
+        cr = _candidate_role(comp)
+        candidate_role_counts[cr] = candidate_role_counts.get(cr, 0) + 1
+
+    all_warnings = list(warnings)
+    stackup_assumptions = inspect_stackup_assumptions(nets, differential_pairs, stackup_layers)
+    if stackup_assumptions.get("source") == "requested_layer_count_no_template":
+        all_warnings.append(
+            f"WARNING: requested --stackup-layers={stackup_layers} has no built-in stackup "
+            "template; the requested layer count is preserved but layer roles/planes must be "
+            "defined explicitly in board.pln.")
+
+    hints: Dict[str, Any] = {
+        "schema": "pcb-plan-board-hints/0.1",
+        "generator": "pcb-plan inspect",
+        "intent": "Facts and candidate hints for AI-generated board.pln. Hints are NOT "
+                  "authoritative and do NOT assign placement ownership or a final floorplan.",
+        "inputs": {
+            "board": str(board_path),
+            "netlist": str(netlist_path) if netlist_path else None,
+        },
+        "board_geometry": {
+            **board_geometry_report(board),
+            "edge_cuts_available": board.source == "edge_cuts",
+            "geometry_source_note": geometry_source_label(board.source),
+        },
+        "counts": {
+            "components": len(components),
+            "nets": len(nets),
+            "differential_pairs": len(differential_pairs),
+            "high_speed_nets": sum(1 for n in nets if is_high_speed(n)),
+            "power_nets": sum(1 for n in nets if is_power(n)),
+            "ground_nets": sum(1 for n in nets if is_ground(n)),
+        },
+        "candidate_role_counts": candidate_role_counts,
+        "role_counts": role_counts,
+        "candidate_roles": {ref: _candidate_role(components[ref]) for ref in sorted(components)},
+        "inferred_roles": {ref: components[ref].role for ref in sorted(components)},
+        "candidate_functional_paths": functional_paths,
+        "candidate_high_speed_paths": high_speed_paths,
+        "candidate_power_islands": power_islands,
+        "candidate_edge_connectors": edge_connectors,
+        "candidate_mechanicals": mechanicals,
+        "candidate_rf_zones": rf_zones,
+        "differential_pairs": [dataclasses.asdict(p) for p in differential_pairs],
+        "routing_classes": inspect_routing_classes(nets, differential_pairs),
+        "stackup_assumptions": stackup_assumptions,
+        "simulation_candidates": inspect_simulation_candidates(nets, components, differential_pairs),
+        "imported_kicad_groups": kicad_groups,
+        "kicad_groups_note": "KiCad groups are preserved for information only and must not drive placement.",
+        "aliases_recovered": dict(aliases),
+        "alias_diagnostics": dataclasses.asdict(alias_diagnostics),
+        "warnings": all_warnings,
+    }
+    return _json_safe(hints)
+
+
+def board_hints_markdown(hints: Mapping[str, Any]) -> str:
+    geom = _as_mapping(hints.get("board_geometry"))
+    counts = _as_mapping(hints.get("counts"))
+    lines = ["# Board hints", "",
+             "Facts and **candidate hints** extracted by `pcb-plan inspect`. These are not",
+             "authoritative: an AI or human turns them into `board.pln`. Hints never assign",
+             "placement ownership or a final floorplan.", "",
+             "## Board geometry", ""]
+    lines.append(f"- size: {geom.get('width')} x {geom.get('height')} mm")
+    lines.append(f"- origin: ({geom.get('origin_x')}, {geom.get('origin_y')})")
+    lines.append(f"- source: {geom.get('source')} (Edge.Cuts available: {geom.get('edge_cuts_available')})")
+    lines.extend(["", "## Counts", ""])
+    for key in ("components", "nets", "differential_pairs", "high_speed_nets", "power_nets", "ground_nets"):
+        lines.append(f"- {key}: {counts.get(key)}")
+    lines.extend(["", "## Candidate roles", ""])
+    for role, count in sorted(_as_mapping(hints.get("candidate_role_counts")).items()):
+        lines.append(f"- {role}: {count}")
+    lines.extend(["", "## Candidate high-speed paths", ""])
+    hs = _as_mapping(hints.get("candidate_high_speed_paths"))
+    if hs:
+        for name, path in sorted(hs.items()):
+            lines.append(f"- {name}: {' -> '.join(_as_list(_as_mapping(path).get('sequence')))}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Candidate power islands", ""])
+    islands = _as_list(hints.get("candidate_power_islands"))
+    if islands:
+        for island in islands:
+            island = _as_mapping(island)
+            lines.append(f"- {island.get('name')}: regulator {island.get('regulator')}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Candidate edge connectors", ""])
+    edges = _as_list(hints.get("candidate_edge_connectors"))
+    if edges:
+        for item in edges:
+            item = _as_mapping(item)
+            lines.append(f"- {item.get('ref')}: access {item.get('candidate_access_side')}, "
+                         f"edge_required hint {item.get('candidate_edge_required')}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Imported KiCad groups (metadata only)", "",
+                  "KiCad groups are preserved for information only and must not drive placement.", ""])
+    groups = _as_list(hints.get("imported_kicad_groups"))
+    if groups:
+        for group in groups:
+            group = _as_mapping(group)
+            lines.append(f"- {group.get('name')!r}: {', '.join(_as_list(group.get('members'))) or '(no resolved members)'}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Warnings", ""])
+    warnings = _as_list(hints.get("warnings"))
+    lines.extend(f"- {w}" for w in warnings) if warnings else lines.append("- none")
+    return "\n".join(lines) + "\n"
+
+
+def ai_pln_prompt_markdown(hints: Mapping[str, Any]) -> str:
+    """ai-pln-prompt.md: a prompt to help an AI generate board.pln from hints."""
+
+    geom = _as_mapping(hints.get("board_geometry"))
+    counts = _as_mapping(hints.get("counts"))
+    lines = [
+        "# Generate board.pln from planning hints", "",
+        "You are generating `board.pln`, the **authoritative design-intent document** for",
+        "a PCB. The files in this `planning-hints/` directory are *facts and candidate",
+        "hints* extracted by `pcb-plan inspect` — they are not authoritative and contain",
+        "no placement ownership or final floorplan. Your job is to reason about them and",
+        "produce intentional `board.pln` design decisions.", "",
+        "## What board.pln must contain", "",
+        "- mechanical constraints (mounting holes, board outline/keepouts)",
+        "- edge-required components, connector orientation, and access sides",
+        "- placement regions",
+        "- power islands (electrical topology, not type piles)",
+        "- high-speed corridors and functional paths (signal-flow topology)",
+        "- ownership (exactly one owner per ref; groups are metadata only)",
+        "- routing classes and SI constraints",
+        "- stackup assumptions and simulation triggers", "",
+        "## Board summary", "",
+        f"- size: {geom.get('width')} x {geom.get('height')} mm (source: {geom.get('source')})",
+        f"- components: {counts.get('components')}, nets: {counts.get('nets')}",
+        f"- differential pairs: {counts.get('differential_pairs')}, "
+        f"high-speed nets: {counts.get('high_speed_nets')}",
+        "",
+        "## Component counts by candidate role", "",
+    ]
+    for role, count in sorted(_as_mapping(hints.get("candidate_role_counts")).items()):
+        lines.append(f"- {role}: {count}")
+    lines.extend(["", "## High-speed interfaces / candidate paths", ""])
+    hs = _as_mapping(hints.get("candidate_high_speed_paths"))
+    if hs:
+        for name, path in sorted(hs.items()):
+            path = _as_mapping(path)
+            lines.append(f"- {name} ({path.get('type')}): {' -> '.join(_as_list(path.get('sequence')))}")
+    else:
+        lines.append("- none detected; confirm there are no high-speed interfaces")
+    lines.extend(["", "## Candidate power islands", ""])
+    islands = _as_list(hints.get("candidate_power_islands"))
+    if islands:
+        for island in islands:
+            island = _as_mapping(island)
+            members = _as_list(island.get("input_caps")) + _as_list(island.get("output_caps")) + _as_list(island.get("feedback"))
+            ind = island.get("inductor")
+            if ind:
+                members.append(str(ind))
+            lines.append(f"- {island.get('name')}: regulator {island.get('regulator')}; "
+                         f"members {', '.join(str(m) for m in members) or '(review)'}")
+    else:
+        lines.append("- none detected")
+    lines.extend(["", "## Mechanical constraints", ""])
+    mech = _as_list(hints.get("candidate_mechanicals"))
+    if mech:
+        for item in mech:
+            item = _as_mapping(item)
+            loc = item.get("corner") or (f"({item.get('x')}, {item.get('y')})" if item.get("x") is not None else "review")
+            lines.append(f"- {item.get('ref')}: {loc}")
+    else:
+        lines.append("- none detected")
+    lines.extend(["", "## Edge connectors to confirm", ""])
+    edges = _as_list(hints.get("candidate_edge_connectors"))
+    if edges:
+        for item in edges:
+            item = _as_mapping(item)
+            lines.append(f"- {item.get('ref')}: access {item.get('candidate_access_side')}, "
+                         f"rotation(auto) {item.get('candidate_rotation_auto_deg')} deg, "
+                         f"edge_required hint {item.get('candidate_edge_required')}")
+    else:
+        lines.append("- none detected")
+    stackup = _as_mapping(hints.get("stackup_assumptions"))
+    lines.extend(["", "## Stackup assumptions", "",
+                  f"- candidate: {stackup.get('layers')}-layer ({stackup.get('profile')})",
+                  f"- {stackup.get('note')}"])
+    sim = _as_mapping(hints.get("simulation_candidates"))
+    lines.extend(["", "## Placement risks and simulation triggers", "",
+                  f"- openems_candidate: {sim.get('openems_candidate')}",
+                  f"- ngspice_candidate: {sim.get('ngspice_candidate')}",
+                  f"- si_candidate: {sim.get('si_candidate')}",
+                  "- Heuristic hints cannot verify impedance, return paths, plane splits, thermal, or EMI.",
+                  "- KiCad groups in imported_kicad_groups are metadata only; do not use them for placement.",
+                  ""])
+    lines.extend(["## Output", "",
+                  "Write a complete `board.pln` (YAML). Resolve every hint into an explicit",
+                  "decision or drop it with a rationale. Prefer encoding intent in `board.pln`",
+                  "over later `placement.ppl` overrides. Validate with `pcb-plan check`.", ""])
+    return "\n".join(lines) + "\n"
+
+
+def ai_placement_review_markdown(hints: Mapping[str, Any]) -> str:
+    """ai-placement-review.md: a checklist for reviewing board.pln against the hints."""
+
+    lines = [
+        "# AI placement review checklist", "",
+        "Use this after generating `board.pln` to confirm the design intent captures the",
+        "hints from `pcb-plan inspect`. Hints are candidates; this checklist drives the",
+        "review/optimization loop, not automated placement.", "",
+        "## Confirm", "",
+        "- [ ] Board geometry matches Edge.Cuts / mechanical drawing",
+        "- [ ] Every edge connector has a confirmed access_side, rotation, and edge_required",
+        "- [ ] Mounting holes are at intended corners/locations",
+        "- [ ] Each high-speed path has a corridor and flow-through protection ordering",
+        "- [ ] Power islands reflect electrical topology, not type piles",
+        "- [ ] Every ref has exactly one placement owner (groups are metadata only)",
+        "- [ ] Routing classes / SI constraints set for high-speed and differential nets",
+        "- [ ] Stackup assumptions confirmed with the fabricator for controlled impedance",
+        "- [ ] Simulation triggers (OpenEMS / ngspice / SI) reviewed", "",
+        "## Candidate items requiring a decision", "",
+    ]
+    edges = _as_list(hints.get("candidate_edge_connectors"))
+    for item in edges:
+        item = _as_mapping(item)
+        lines.append(f"- edge connector {item.get('ref')}: access {item.get('candidate_access_side')}, "
+                     f"edge_required hint {item.get('candidate_edge_required')}")
+    for name, path in sorted(_as_mapping(hints.get("candidate_high_speed_paths")).items()):
+        path = _as_mapping(path)
+        lines.append(f"- high-speed path {name}: {' -> '.join(_as_list(path.get('sequence')))}")
+    for island in _as_list(hints.get("candidate_power_islands")):
+        island = _as_mapping(island)
+        lines.append(f"- power island {island.get('name')}: regulator {island.get('regulator')}")
+    groups = _as_list(hints.get("imported_kicad_groups"))
+    if groups:
+        lines.append("")
+        lines.append("## KiCad groups (metadata only; must not drive placement)")
+        lines.append("")
+        for group in groups:
+            group = _as_mapping(group)
+            lines.append(f"- {group.get('name')!r}: {', '.join(_as_list(group.get('members'))) or '(no resolved members)'}")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def write_planning_hints(out_dir: Path, hints: Mapping[str, Any],
+                         components: Mapping[str, PlanComponent],
+                         nets: Mapping[str, PlanNet],
+                         board: BoardGeometry) -> List[str]:
+    """Write every planning-hints/ artifact and return the list of files written."""
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _json(name: str, payload: Any) -> str:
+        (out_dir / name).write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return name
+
+    def _text(name: str, text: str) -> str:
+        (out_dir / name).write_text(text, encoding="utf-8")
+        return name
+
+    written = [
+        _json("board-hints.json", hints),
+        _text("board-hints.md", board_hints_markdown(hints)),
+        _text("component-table.csv", inspect_component_table_csv(components, nets)),
+        _json("connectivity-graph.json", inspect_connectivity_graph(components, nets)),
+        _json("footprint-bboxes.json", inspect_footprint_bboxes(board, components)),
+        _json("pad-locations.json", inspect_pad_locations(components)),
+        _json("candidate-functional-paths.json", hints.get("candidate_functional_paths")),
+        _json("candidate-power-islands.json", hints.get("candidate_power_islands")),
+        _json("candidate-high-speed-paths.json", hints.get("candidate_high_speed_paths")),
+        _json("candidate-edge-connectors.json", hints.get("candidate_edge_connectors")),
+        _json("candidate-mechanicals.json", hints.get("candidate_mechanicals")),
+        _json("candidate-rf-zones.json", hints.get("candidate_rf_zones")),
+        _json("routing-classes.json", hints.get("routing_classes")),
+        _text("ai-pln-prompt.md", ai_pln_prompt_markdown(hints)),
+        _text("ai-placement-review.md", ai_placement_review_markdown(hints)),
+    ]
+    return written
+
+
+def run_inspect(args: argparse.Namespace) -> int:
+    _ensure_exists(args.board, "Board")
+    _ensure_exists(args.netlist, "Netlist")
+    board_text = args.board.read_text(encoding="utf-8")
+    board, components, nets, warnings = parse_board(args.board)
+    aliases, alias_diag, net_warnings = import_netlist(args.netlist, components, nets)
+    warnings.extend(net_warnings)
+    override = _board_override_from_init_args(args)
+    if override is not None:
+        board = BoardGeometry(
+            origin_x=float(override.get("origin_x", board.origin_x)),
+            origin_y=float(override.get("origin_y", board.origin_y)),
+            width=float(override["width"]),
+            height=float(override["height"]),
+            source="cli",
+        )
+        warnings = [w for w in warnings if "footprint extents" not in w]
+    _validate_board_geometry(board)
+    infer_roles(components, {})
+    hints = build_planning_hints(
+        board, components, nets, aliases, alias_diag, board_text, warnings,
+        board_path=args.board, netlist_path=args.netlist,
+        stackup_layers=getattr(args, "stackup_layers", None),
+    )
+    written = write_planning_hints(args.out, hints, components, nets, board)
+    sys.stderr.write(f"pcb-plan inspect: wrote {len(written)} planning-hints files to {args.out}\n")
+    return 0
+
+
 def run_emit(args: argparse.Namespace, *, legacy: bool = False) -> int:
     pln_path = getattr(args, "pln", None) or getattr(args, "intent", None)
     _ensure_exists(args.board, "Board")
@@ -4185,6 +4938,8 @@ def run_explain(args: argparse.Namespace) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     command = args.command or "legacy_emit"
+    if command == "inspect":
+        return run_inspect(args)
     if command == "init":
         return run_init(args)
     if command == "update":

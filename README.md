@@ -1,20 +1,40 @@
 # pcb-place repository
 
 This repository contains two complementary command-line tools for reviewable PCB
-planning and placement workflows:
+planning and placement workflows. The architecture separates concerns:
+**`pcb-plan` extracts facts, the AI (Claude) generates design intent, and
+`pcb-place` executes intent.**
 
-- [`pcb-plan`](src/pcb_plan/README.md) owns `board.pln` planning intent. It can
-  initialize, update, review, and explain `board.pln`; infer placement, routing,
-  and simulation intent; and emit deterministic `placement.ppl` files for
-  execution.
-- [`pcb-place`](src/pcb_place/README.md) is the deterministic placement executor.
-  It consumes `placement.ppl`, validates placement rules, applies footprint
-  placement to KiCad `.kicad_pcb` files, and writes placed boards.
+```text
+KiCad PCB + netlist + stackup + board dimensions
+  -> pcb-plan inspect       (extract board intelligence -> planning-hints/)
+  -> Claude generates board.pln   (authoritative design intent, AI-authored)
+  -> pcb-plan check / validate
+  -> pcb-plan emit          (board.pln -> placement.ppl)
+  -> pcb-place              (deterministic execute -> reports)
+  -> Claude optimization loop     (analyze reports, edit board.pln, repeat)
+```
 
-The split is intentional: planning is knowledge-based and heuristic, while
-execution is deterministic, reviewable, and CI-friendly. `pcb-plan` must not move
-footprints or route traces; `pcb-place` must not infer planning strategy from
-netlists or own `board.pln`.
+- [`pcb-plan`](src/pcb_plan/README.md) is a **board-intelligence extractor** and
+  `board.pln` reviewer. Its `inspect` command extracts facts (geometry,
+  connectivity) and *candidate hints* (roles, functional paths, power islands,
+  edge connectors, mechanicals, RF zones) into a `planning-hints/` directory for
+  AI planning. It also reviews, validates (`check`), updates, and emits
+  deterministic `placement.ppl` from `board.pln`.
+- The AI (Claude) is the **primary planning engine**: it turns `planning-hints/`
+  into `board.pln`, the authoritative design-intent document, and iterates on it
+  using placement/routing/simulation reports.
+- [`pcb-place`](src/pcb_place/README.md) is the **deterministic placement
+  executor**. It consumes `placement.ppl`, applies/reflows/optimizes footprint
+  placement, validates placement rules, writes placed KiCad `.kicad_pcb` files,
+  and reports.
+
+The split is intentional. `pcb-plan inspect` must **not** place components,
+create placement ownership, build topology clusters heuristically, or infer a
+final floorplan — those are AI planning problems solved in `board.pln`.
+`pcb-plan` must not move footprints or route traces; `pcb-place` must not infer
+planning strategy, power islands, or a final floorplan. KiCad groups are exported
+as metadata only and must never drive placement.
 
 ## Repository structure
 
@@ -54,19 +74,23 @@ pcb build
     ↓
 pcb layout
     ↓
-pcb-plan init
+pcb-plan inspect        (extract facts -> planning-hints/)
     ↓
-board.pln
+Claude generates board.pln   (AI is the primary planning engine)
     ↓
-Claude AI review/optimization
+pcb-plan check          (validate intent)
     ↓
-pcb-plan check / emit
+Claude review/optimization
+    ↓
+pcb-plan emit
     ↓
 placement.ppl
     ↓
 pcb-place
     ↓
-placed KiCad board
+placed KiCad board + reports
+    ↓
+Claude optimization loop (edit board.pln, repeat)
     ↓
 manual high-speed review / routing / DRC
 ```
@@ -77,6 +101,20 @@ A conservative command-line workflow is:
 pcb build board.zen
 pcb layout board.zen
 
+# 1. Extract board intelligence into planning-hints/ (facts + candidate hints).
+pcb-plan inspect \
+  --board layout.kicad_pcb \
+  --netlist default.net \
+  --width 75 --height 75 \
+  --out planning-hints
+
+# 2. Let Claude generate board.pln from planning-hints/ (see planning-hints/
+#    ai-pln-prompt.md). board.pln is the authoritative design-intent document:
+#    mechanical/edge constraints, regions, power islands, high-speed corridors,
+#    functional paths, ownership, routing/SI, stackup, and simulation triggers.
+#    The pcb-bootstrap Claude skill drives this step.
+
+# (Legacy heuristic alternative: pcb-plan init writes a first-pass board.pln.)
 pcb-plan init \
   --board layout.kicad_pcb \
   --netlist default.net \
@@ -112,12 +150,15 @@ pcbnew layout.placed.kicad_pcb
 
 Concise AI-assisted workflow:
 
-1. Generate `board.pln` with `pcb-plan init`.
-2. Let Claude review/optimize `board.pln` before emit.
-3. Generate `placement.ppl` with `pcb-plan emit` after `pcb-plan check`.
+1. Extract facts and candidate hints with `pcb-plan inspect` into
+   `planning-hints/`.
+2. Let Claude generate `board.pln` from `planning-hints/` (the authoritative,
+   AI-authored design-intent document). The `pcb-bootstrap` skill drives this.
+3. Validate intent with `pcb-plan check`, then generate `placement.ppl` with
+   `pcb-plan emit`.
 4. Apply with `pcb-place` after reviewing the dry-run report.
-5. Iterate using planner, placement, routing, DRC/ERC, OpenEMS, and ngspice
-   reports.
+5. Iterate using placement, routing, DRC/ERC, OpenEMS, and ngspice reports,
+   feeding fixes back into `board.pln` (the optimization surface).
 
 Run `pcb-plan check` after `init`/`update` and before `emit` to catch
 low-confidence plans (missing nets, mostly-singleton clusters, mostly-unplaced
@@ -148,19 +189,72 @@ Legacy one-shot planner invocation is still supported for compatibility:
 pcb-plan --board layout.kicad_pcb --netlist default.net --intent board.pln -o placement.ppl
 ```
 
+## Board intelligence extraction: `pcb-plan inspect`
+
+`pcb-plan inspect` is the entry point of the AI planning workflow. It is a
+board-intelligence **extractor**, not a floorplanner: it reads facts and emits
+*candidate hints* for an AI (or human) to turn into an authoritative
+`board.pln`.
+
+```bash
+pcb-plan inspect \
+  --board layout.kicad_pcb \
+  --netlist default.net \
+  --width 75 --height 75 \
+  --out planning-hints
+```
+
+It writes a `planning-hints/` directory:
+
+```text
+planning-hints/
+  board-hints.json                 # master facts + candidate hints
+  board-hints.md                   # human-readable summary
+  component-table.csv              # per-component facts (role, bbox, nets)
+  connectivity-graph.json          # component/net graph + ownership hints
+  footprint-bboxes.json            # bbox, centroid, area per component
+  pad-locations.json               # absolute/local pad coordinates and nets
+  candidate-functional-paths.json  # connector -> protection -> IC paths
+  candidate-power-islands.json     # regulator + hot-loop topology
+  candidate-high-speed-paths.json  # high-speed subset of functional paths
+  candidate-edge-connectors.json   # access side / auto-rotation / edge_required hints
+  candidate-mechanicals.json       # mounting-hole corner assignments
+  candidate-rf-zones.json          # RF antenna keepout candidates
+  routing-classes.json             # candidate routing classes (impedance needs fab stackup)
+  ai-pln-prompt.md                 # prompt to help Claude generate board.pln
+  ai-placement-review.md           # checklist for reviewing board.pln vs hints
+```
+
+`pcb-plan inspect` must **not** attempt final placement, create topology
+clusters heuristically, create placement ownership automatically, or infer a
+final floorplan. Everything it emits is a candidate hint and is marked as such.
+KiCad groups are exported under `imported_kicad_groups` with `metadata_only:
+true` and **must not drive placement** — they are preserved for information only.
+
+`board.pln` is the authoritative design-intent document. It is generated
+primarily by AI from `planning-hints/` and contains mechanical constraints,
+edge-required components, connector orientation/access sides, placement regions,
+power islands, high-speed corridors, functional paths, ownership, routing
+classes, SI constraints, stackup, and simulation triggers. The AI optimization
+loop primarily edits `board.pln` (preferred), then `placement.ppl` overrides,
+then manual `Anchor()` as a last resort. See the
+[`pcb-bootstrap`](skills/pcb-bootstrap/SKILL.md) skill for generating it.
+
 ## Tool responsibilities
 
-### pcb-plan: own planning intent
+### pcb-plan: extract facts and review intent
 
-`pcb-plan` owns the `board.pln` lifecycle and emits a readable `.ppl` placement
-plan. It may infer roles such as connectors, ICs, decoupling capacitors, ESD
+`pcb-plan` extracts board intelligence (`inspect`), reviews and validates the
+AI-authored `board.pln`, and emits a readable `.ppl` placement plan (`emit`). It
+may infer *candidate* roles such as connectors, ICs, decoupling capacitors, ESD
 devices, high-speed differential interfaces, RF modules, power regulators,
-pullups, and series passives.
+pullups, and series passives — as hints, not authoritative placement decisions.
 
-Planner output is meant to be reviewed, AI-optimized, edited, diffed, and
-re-run after `init` and before `emit`. It does **not** route traces, tune
-differential pairs, validate impedance, certify EMI behavior, or claim
-production readiness.
+`pcb-plan` no longer invents the floorplan: the AI generates `board.pln` from
+the hints. `pcb-plan inspect` output and `board.pln` are meant to be reviewed,
+AI-optimized, edited, diffed, validated with `check`, and emitted. `pcb-plan`
+does **not** place components, route traces, tune differential pairs, validate
+impedance, certify EMI behavior, or claim production readiness.
 
 Planner quality depends on real board geometry and connectivity. Explicit
 `board.pln` geometry overrides KiCad `Edge.Cuts`, and `Edge.Cuts` overrides the
