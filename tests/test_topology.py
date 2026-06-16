@@ -207,6 +207,59 @@ def test_cluster_edge_rotation_rotates_members_rigidly(tmp_path):
     assert round(placements["C9"]["y"] - placements["J1"]["y"], 6) == -2.0
 
 
+def test_edge_connector_cluster_places_connector_alone(tmp_path):
+    # An edge-locked, rotated connector must carry only itself in its rigid Edge
+    # placement; its nearby support passive is placed interior by its own
+    # pad-relative rule, never rotated off-board inside the connector cluster.
+    board = _board(50, 30, "\n".join([
+        _footprint("J1", 4, 15, rot=0, value="HDMI_IN", footprint="Connector_HDMI:HDMI_A",
+                   pads=_pad("1", -1, 0, 1, "DDC_SCL") + _pad("2", 1, 0, 2, "GND")),
+        _footprint("R1", 9, 15, rot=0, value="2k2",
+                   pads=_pad("1", -0.4, 0, 1, "DDC_SCL") + _pad("2", 0.4, 0, 3, "3V3")),
+    ]))
+    intent = (
+        "board: { width: 50, height: 30, origin_x: 0, origin_y: 0 }\n"
+        "components:\n"
+        "  J1: { role: hdmi_connector, edge_required: true, access_side: left, rotation: auto }\n"
+    )
+    plan = _plan_for(board, tmp_path, intent)
+    edge_clusters = [r for r in plan.rules if r.kind == "cluster" and "placement=Edge(" in r.text
+                     and 'anchor="J1"' in r.text]
+    assert edge_clusters, "expected an edge cluster for J1"
+    rule = edge_clusters[0]
+    assert 'members=["J1"]' in rule.text  # connector alone; R1 is not rigidly carried
+    assert "R1" not in rule.refs
+    # The support resistor still has its own placement rule (pad-relative).
+    assert any("R1" in r.refs and r.kind != "cluster" for r in plan.rules)
+
+
+def test_esd_attaches_to_declared_functional_path_not_nearest(tmp_path):
+    # An ESD device named in a functional path must attach to that path's
+    # connector/IC even when a different connector is physically nearer.
+    board = _board(60, 40, "\n".join([
+        _footprint("J3", 4, 4, value="USB_C", footprint="Connector_USB:USB_C",
+                   pads=_pad("1", 0, 0, 1, "USB_DP") + _pad("2", 0.5, 0, 2, "USB_DM")),
+        _footprint("J9", 30, 4, value="HDR", footprint="Connector:Hdr",
+                   pads=_pad("1", 0, 0, 3, "OTHER")),
+        # U11 (USB ESD) sits right next to the unrelated header J9, far from J3.
+        _footprint("U11", 31, 4, value="ESD", footprint="Package_TO_SOT:SOT-23",
+                   pads=_pad("1", 0, 0, 1, "USB_DP") + _pad("2", 0.4, 0, 2, "USB_DM")),
+        _footprint("U6", 30, 30, value="MCU", footprint="Package_QFP:TQFP-32",
+                   pads=_pad("1", 0, 0, 1, "USB_DP") + _pad("2", 0.4, 0, 2, "USB_DM")),
+    ]))
+    intent = (
+        "board: { width: 60, height: 40, origin_x: 0, origin_y: 0 }\n"
+        "roles: { U11: esd_protection, U6: mcu }\n"
+        "functional_paths:\n"
+        "  USB_FS: { type: high_speed_diff, sequence: [J3, U11, U6], protect_first: true }\n"
+    )
+    plan = _plan_for(board, tmp_path, intent)
+    esd_rules = [r for r in plan.rules if r.kind == "esd" and '"U11"' in r.text]
+    assert esd_rules, "expected an ESD rule for U11"
+    assert 'connector="J3"' in esd_rules[0].text  # path connector, not nearest J9
+    assert 'protected="U6"' in esd_rules[0].text
+
+
 def test_connector_body_outside_board_flagged_when_not_allowed(tmp_path):
     wide_pads = _pad("1", -4, 0, 1, "SIG") + _pad("2", 4, 0, 1, "SIG")
     pcb = _board(50, 30, _footprint("J1", 2, 15, rot=0, value="CONN", pads=wide_pads))

@@ -663,11 +663,47 @@ def load_intent(path: Optional[Path]) -> Dict[str, Any]:
     return _parse_simple_yaml(text)
 
 
+def _split_top_level(inner: str) -> List[str]:
+    """Split on top-level commas only, ignoring commas nested in [] / {} / quotes.
+
+    The dependency-free inline parser must not break an inline value such as
+    ``{ between: [F.Cu, In1.GND], material: FR4 }`` on the comma inside the
+    nested list; a naive ``split(',')`` would corrupt ``between`` into ``[F.Cu``.
+    """
+    parts: List[str] = []
+    depth = 0
+    quote: Optional[str] = None
+    buf: List[str] = []
+    for ch in inner:
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            buf.append(ch)
+        elif ch in "[{":
+            depth += 1
+            buf.append(ch)
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
 def _parse_inline_list(value: str) -> List[Any]:
     inner = value.strip()[1:-1].strip()
     if not inner:
         return []
-    return [_parse_scalar(part.strip()) for part in inner.split(",")]
+    return [_parse_scalar(part.strip()) for part in _split_top_level(inner) if part.strip()]
 
 
 def _parse_inline_map(value: str) -> Dict[str, Any]:
@@ -675,7 +711,7 @@ def _parse_inline_map(value: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
     if not inner:
         return result
-    for part in inner.split(","):
+    for part in _split_top_level(inner):
         if ":" not in part:
             continue
         key, val = part.split(":", 1)
@@ -1360,14 +1396,87 @@ def _alias_groups(aliases: Mapping[str, str]) -> Dict[str, set[str]]:
     return groups
 
 
-def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanComponent], nets: Optional[Mapping[str, PlanNet]] = None, aliases: Optional[Mapping[str, str]] = None, radius: float = 12.0, proximity_any_role: bool = True) -> List[str]:
+# Roles whose placement is owned by a parent IC/connector rather than being a
+# cluster anchor in their own right.
+_CLUSTER_SUPPORT_ROLES = {
+    "decoupling", "esd_protection", "pullup_pulldown", "series", "clock",
+    "testpoint", "inductor", "ferrite", "capacitor", "resistor",
+}
+
+# Roles that can anchor a cluster and therefore own support parts.
+_CLUSTER_ANCHOR_ROLES = {
+    "ic", "mcu", "hdmi_retimer", "rf_module", "power_regulator",
+    "high_speed_connector", "connector", "debug_header",
+}
+
+# Owner-selection priority for a support part's *signal* parent (lower wins):
+# the part follows the signal off-board (connector) or to its controller before a
+# generic peripheral or regulator.
+_SUPPORT_OWNER_PRIORITY = {
+    "high_speed_connector": 0, "connector": 0, "debug_header": 0,
+    "mcu": 1, "hdmi_retimer": 2, "rf_module": 2, "ic": 3, "power_regulator": 4,
+}
+
+
+def assign_support_owners(components: Mapping[str, PlanComponent],
+                          nets: Optional[Mapping[str, PlanNet]] = None) -> Dict[str, str]:
+    """Assign each support part a single owning anchor by connectivity, not geometry.
+
+    A support passive (decoupling cap, pull-up, test point, ESD, series element,
+    ...) is owned by the IC/connector it is electrically tied to, so the coarse
+    cluster pass does not sweep it into a physically-adjacent but unrelated IC
+    (which would then drag it off-board when that IC reflows). Ownership prefers a
+    real-signal parent (the connector/controller the part actually serves); a part
+    that only shares power/ground — e.g. a decoupling cap — falls back to its
+    nearest power-sharing anchor, matching where its decoupling array will land.
+    Returns a ``ref -> owner_ref`` map for support parts only.
+    """
+
+    nets = nets or {}
+    anchors = [c for c in components.values() if c.role in _CLUSTER_ANCHOR_ROLES]
+    owners: Dict[str, str] = {}
+    if not anchors:
+        return owners
+    graph = ConnectivityGraph(components, nets)
+    for comp in components.values():
+        if comp.role not in _CLUSTER_SUPPORT_ROLES:
+            continue
+        # 1) Real-signal parents: anchors sharing a non-power/ground net.
+        signal_anchors: List[PlanComponent] = []
+        for net_name in comp.nets:
+            if is_ground(net_name) or is_power(net_name):
+                continue
+            for ref in graph.peers(comp.ref, net_name):
+                a = components.get(ref)
+                if a is not None and a.role in _CLUSTER_ANCHOR_ROLES and a not in signal_anchors:
+                    signal_anchors.append(a)
+        if signal_anchors:
+            signal_anchors.sort(key=lambda a: (_SUPPORT_OWNER_PRIORITY.get(a.role, 9),
+                                               math.hypot(comp.x - a.x, comp.y - a.y), a.ref))
+            owners[comp.ref] = signal_anchors[0].ref
+            continue
+        # 2) Power/ground-only parts (decoupling): nearest anchor that shares the
+        # same non-ground power rail, so a 3V3 decoupler is not assigned to a 5V
+        # IC merely because they share ground.
+        comp_nets = set(comp.nets)
+        comp_power = {n for n in comp_nets if is_power(n) and not is_ground(n)}
+        power_anchors = [a for a in anchors if (comp_power & set(a.nets))
+                         and a.role not in {"high_speed_connector", "connector", "debug_header"}]
+        pool = power_anchors or anchors
+        pool.sort(key=lambda a: (math.hypot(comp.x - a.x, comp.y - a.y),
+                                 _SUPPORT_OWNER_PRIORITY.get(a.role, 9), a.ref))
+        owners[comp.ref] = pool[0].ref
+    return owners
+
+
+def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanComponent], nets: Optional[Mapping[str, PlanNet]] = None, aliases: Optional[Mapping[str, str]] = None, radius: float = 12.0, proximity_any_role: bool = True, support_owner: Optional[Mapping[str, str]] = None) -> List[str]:
     shared = set(anchor.nets)
     connected = _connected_refs(anchor, nets or {}) if nets else set()
     alias_refs = set()
     for refs in _alias_groups(aliases or {}).values():
         if anchor.ref in refs:
             alias_refs |= refs
-    support_roles = {"decoupling", "esd_protection", "pullup_pulldown", "series", "clock", "testpoint", "inductor", "ferrite", "capacitor", "resistor"}
+    support_roles = _CLUSTER_SUPPORT_ROLES
     members = [anchor.ref]
     for comp in components.values():
         if comp.ref == anchor.ref or comp.role == "mechanical":
@@ -1375,11 +1484,21 @@ def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanCompone
         dist = math.hypot(anchor.x - comp.x, anchor.y - comp.y)
         if dist > radius and comp.ref not in alias_refs:
             continue
+        # Connectivity-aware ownership: when a global owner map is supplied, a
+        # support part joins exactly one cluster — its assigned owner's. Gate this
+        # before every membership path (signal, alias, proximity) so a part on a
+        # connector-to-MCU signal is not also swept into the MCU cluster and
+        # reflowed there, defeating single-owner placement.
+        if (support_owner is not None and comp.role in support_roles
+                and support_owner.get(comp.ref) != anchor.ref):
+            continue
         has_shared_signal = bool((shared & set(comp.nets)) - {n for n in shared if is_ground(n) or is_power(n)})
         is_support = comp.role in support_roles and dist <= radius
         if not proximity_any_role:
             is_support = is_support and (has_shared_signal or comp.ref in connected)
-        is_nearby_any_role = proximity_any_role and dist <= radius / 2.0 and comp.role != "unknown"
+        is_nearby_any_role = (proximity_any_role and dist <= radius / 2.0
+                              and comp.role != "unknown"
+                              and comp.role not in support_roles)
         if comp.ref in connected or comp.ref in alias_refs or has_shared_signal or is_support or is_nearby_any_role:
             members.append(comp.ref)
     return sorted(set(members), key=lambda r: (r != anchor.ref, r))
@@ -2568,6 +2687,10 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
 
     clusters: List[Dict[str, Any]] = []
     edge_rotation_plan: List[Dict[str, Any]] = []
+    # Resolve each support passive to one electrical owner so the coarse cluster
+    # passes group by connectivity, not by where the source layout happened to
+    # drop the part. Keeps one placement owner per ref and avoids off-board rides.
+    support_owner = assign_support_owners(components, nets)
     # Connector/high-speed clusters. Edge-required connectors are mechanically
     # edge-locked, rotated by access side, and may extend their body outside
     # the board outline; their support parts are optimized around them later.
@@ -2575,7 +2698,7 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
         if "connector" not in comp.role and comp.role != "debug_header":
             continue
         cfg = _component_intent(intent, comp.ref)
-        members = _cluster_members(comp, components, nets, aliases, radius=18.0, proximity_any_role=False)
+        members = _cluster_members(comp, components, nets, aliases, radius=18.0, proximity_any_role=False, support_owner=support_owner)
         local_x = max(0.0, min(board.width, comp.x - board.origin_x))
         local_y = max(0.0, min(board.height, comp.y - board.origin_y))
         distances = {
@@ -2619,13 +2742,23 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
                 rot_kw = ""
                 rotation_label = "keep existing"
             locked = bool(cfg.get("locked", True))
-            text = (f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(members)}, '
+            # Edge-locked connectors are rotated to their access side, which makes
+            # the source-relative geometry of their support parts invalid (a part
+            # that sat to the connector's right ends up off-board after a 90/270
+            # deg rotation). So the rigid edge placement carries the connector
+            # alone; its support parts (ESD, pull-up arrays, decoupling, near-pad
+            # passives) are placed interior by their own pad-relative rules against
+            # the connector's final pads. The full neighbourhood is still recorded
+            # as cluster metadata below (clusters are metadata, not atomic units).
+            placement_members = [comp.ref]
+            text = (f'Cluster({_q(name)}, anchor={_q(comp.ref)}, members={_q(placement_members)}, '
                     f'placement=Edge(edge={_q(access_side)}, {placement_kw}={along:.3f}, inset={inset}, '
                     f'{rot_kw}locked={str(locked)}, edge_required={str(edge_required)}, mechanical=True, '
                     f'access_side={_q(access_side)}, allow_body_outside_board={str(allow_outside)}), '
                     f'role={_q(comp.role)})')
-            rules.append(PlanRule("cluster", text, members,
-                                  f"{comp.ref} connector cluster preserves local geometry and reserves edge access; "
+            rules.append(PlanRule("cluster", text, placement_members,
+                                  f"{comp.ref} edge connector placed alone and rotated to {access_side}; support parts "
+                                  f"placed interior by pad-relative rules so rotation cannot strand them off-board. "
                                   f"edge_required={edge_required}, access_side={access_side}, "
                                   f"rotation={rotation_label}, "
                                   f"allow_body_outside_board={allow_outside}."))
@@ -2659,9 +2792,26 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
                         best_d = d
                         endpoints = [a_ref, b_ref]
             rules.append(PlanRule("corridor", f'Corridor({_q(pair.name + "_CORRIDOR")}, a={_q(endpoints[0])}, b={_q(endpoints[1])}, width=3.0, role="high_speed_diff_pair")', pair.components, f"Differential pair {pair.p}/{pair.n}: reserve short symmetric routing corridor; do not route here automatically."))
+    # Declared functional paths (connector -> protection -> IC) are authoritative
+    # for ESD endpoints: an ESD on USB_FS (J3 -> U11 -> U6) must attach to its own
+    # connector/IC, not to whatever connector happens to be nearest in a messy
+    # source layout. Map each ESD ref in a path to that path's connector and IC.
+    esd_path_endpoints: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    for path in functional_paths.values():
+        seq = [r for r in path.get("sequence", []) if r in components]
+        path_conn = next((r for r in seq if "connector" in components[r].role
+                          or components[r].role == "debug_header"), None)
+        path_ic = next((r for r in reversed(seq)
+                        if components[r].role in {"ic", "mcu", "hdmi_retimer", "rf_module"}), None)
+        for r in seq:
+            if components[r].role == "esd_protection":
+                esd_path_endpoints[r] = (path_conn, path_ic)
     for esd in [c for c in components.values() if c.role == "esd_protection"]:
-        connector = _nearest_parent(esd, hs_connectors) or _nearest_parent(esd, [c for c in components.values() if "connector" in c.role])
-        protected = _nearest_parent(esd, hs_ics) or _nearest_parent(esd, [c for c in components.values() if c.role in {"ic", "mcu", "hdmi_retimer"}])
+        path_conn, path_ic = esd_path_endpoints.get(esd.ref, (None, None))
+        connector = (components.get(path_conn) if path_conn else None) \
+            or _nearest_parent(esd, hs_connectors) or _nearest_parent(esd, [c for c in components.values() if "connector" in c.role])
+        protected = (components.get(path_ic) if path_ic else None) \
+            or _nearest_parent(esd, hs_ics) or _nearest_parent(esd, [c for c in components.values() if c.role in {"ic", "mcu", "hdmi_retimer"}])
         if connector and protected:
             text = f'ESD({_q(esd.ref)}, connector={_q(connector.ref)}, protected={_q(protected.ref)}, t=0.18, offset=0, role="esd")'
             rules.append(PlanRule("esd", text, [esd.ref, connector.ref, protected.ref], f"{esd.ref} inferred as ESD/protection between {connector.ref} and {protected.ref}; place close to connector with short ground return."))
@@ -2682,7 +2832,7 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
     # IC and power clusters.
     for comp in components.values():
         if comp.role in {"ic", "mcu", "power_regulator", "rf_module", "hdmi_retimer"}:
-            members = _cluster_members(comp, components, nets, aliases, radius=12.0)
+            members = _cluster_members(comp, components, nets, aliases, radius=12.0, support_owner=support_owner)
             region = "POWER" if comp.role == "power_regulator" and "POWER" in regions else "RF" if comp.role == "rf_module" and "RF" in regions else "CONTROL" if comp.role != "rf_module" and "CONTROL" in regions else None
             name = re.sub(r"[^A-Za-z0-9_]+", "_", (("IC" if comp.role == "mcu" else comp.role.upper()) + "_" + comp.ref))
             anchor_x, anchor_y = floorplan.core_xy.get(comp.ref, (comp.x - board.origin_x, comp.y - board.origin_y))
