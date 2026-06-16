@@ -886,6 +886,48 @@ def test_cluster_members_keeps_nearby_signal_connected_and_support_parts():
     assert "U4" in members
 
 
+def test_inline_map_preserves_nested_list_values():
+    # A nested inline list must not be split on its inner comma (regression: the
+    # dielectric `between: [F.Cu, In1.GND]` was being mangled into "[F.Cu").
+    m = pcb_plan._parse_inline_map("{ between: [F.Cu, In1.GND], material: FR4, er: 4.2 }")
+    assert m["between"] == ["F.Cu", "In1.GND"]
+    assert m["material"] == "FR4"
+    assert m["er"] == 4.2
+    nested = pcb_plan._parse_inline_list("[[a, b], [c, d]]")
+    assert nested == [["a", "b"], ["c", "d"]]
+
+
+def test_assign_support_owners_power_rail_not_just_ground():
+    # A 3V3 decoupling cap sitting next to a 5V-only IC must still be owned by the
+    # (more distant) IC it actually shares 3V3 with, not the adjacent 5V IC that
+    # only shares ground.
+    components = {
+        "U5V": _plan_component("U5V", 0.0, 0.0, "ic", ["5V", "GND", "SIG_A"]),
+        "U3V3": _plan_component("U3V3", 8.0, 0.0, "ic", ["3V3", "GND", "SIG_B"]),
+        "C1": _plan_component("C1", 1.0, 0.0, "decoupling", ["3V3", "GND"]),
+    }
+    nets = _plan_nets(components)
+    owners = pcb_plan.assign_support_owners(components, nets)
+    assert owners["C1"] == "U3V3"
+
+
+def test_cluster_members_owner_gate_excludes_signal_shared_support():
+    # A pull-up that shares a real signal with this IC but is owned (by the owner
+    # map) by another anchor must be fully excluded, not admitted via the
+    # shared-signal path.
+    components = {
+        "U6": _plan_component("U6", 0.0, 0.0, "mcu", ["DDC_SCL", "GND"]),
+        "R1": _plan_component("R1", 2.0, 0.0, "pullup_pulldown", ["DDC_SCL", "3V3"]),
+    }
+    nets = _plan_nets(components)
+    # Without an owner map R1 is admitted (shares DDC_SCL with U6).
+    assert "R1" in pcb_plan._cluster_members(components["U6"], components, nets, {}, radius=12.0)
+    # With R1 owned by a connector, the MCU cluster must not also claim it.
+    owned = pcb_plan._cluster_members(components["U6"], components, nets, {}, radius=12.0,
+                                      support_owner={"R1": "J1"})
+    assert "R1" not in owned
+
+
 def test_assign_support_owners_prefers_signal_parent_over_adjacent_ic():
     # A pull-up that biases a connector's signal but sits physically next to an
     # unrelated regulator (as messy auto-layouts often place it) must be owned by

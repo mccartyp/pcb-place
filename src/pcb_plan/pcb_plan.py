@@ -663,11 +663,47 @@ def load_intent(path: Optional[Path]) -> Dict[str, Any]:
     return _parse_simple_yaml(text)
 
 
+def _split_top_level(inner: str) -> List[str]:
+    """Split on top-level commas only, ignoring commas nested in [] / {} / quotes.
+
+    The dependency-free inline parser must not break an inline value such as
+    ``{ between: [F.Cu, In1.GND], material: FR4 }`` on the comma inside the
+    nested list; a naive ``split(',')`` would corrupt ``between`` into ``[F.Cu``.
+    """
+    parts: List[str] = []
+    depth = 0
+    quote: Optional[str] = None
+    buf: List[str] = []
+    for ch in inner:
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            buf.append(ch)
+        elif ch in "[{":
+            depth += 1
+            buf.append(ch)
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
 def _parse_inline_list(value: str) -> List[Any]:
     inner = value.strip()[1:-1].strip()
     if not inner:
         return []
-    return [_parse_scalar(part.strip()) for part in inner.split(",")]
+    return [_parse_scalar(part.strip()) for part in _split_top_level(inner) if part.strip()]
 
 
 def _parse_inline_map(value: str) -> Dict[str, Any]:
@@ -675,7 +711,7 @@ def _parse_inline_map(value: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
     if not inner:
         return result
-    for part in inner.split(","):
+    for part in _split_top_level(inner):
         if ":" not in part:
             continue
         key, val = part.split(":", 1)
@@ -1419,9 +1455,12 @@ def assign_support_owners(components: Mapping[str, PlanComponent],
                                                math.hypot(comp.x - a.x, comp.y - a.y), a.ref))
             owners[comp.ref] = signal_anchors[0].ref
             continue
-        # 2) Power/ground-only parts (decoupling): nearest power-sharing anchor.
+        # 2) Power/ground-only parts (decoupling): nearest anchor that shares the
+        # same non-ground power rail, so a 3V3 decoupler is not assigned to a 5V
+        # IC merely because they share ground.
         comp_nets = set(comp.nets)
-        power_anchors = [a for a in anchors if comp_nets & set(a.nets)
+        comp_power = {n for n in comp_nets if is_power(n) and not is_ground(n)}
+        power_anchors = [a for a in anchors if (comp_power & set(a.nets))
                          and a.role not in {"high_speed_connector", "connector", "debug_header"}]
         pool = power_anchors or anchors
         pool.sort(key=lambda a: (math.hypot(comp.x - a.x, comp.y - a.y),
@@ -1445,16 +1484,18 @@ def _cluster_members(anchor: PlanComponent, components: Mapping[str, PlanCompone
         dist = math.hypot(anchor.x - comp.x, anchor.y - comp.y)
         if dist > radius and comp.ref not in alias_refs:
             continue
+        # Connectivity-aware ownership: when a global owner map is supplied, a
+        # support part joins exactly one cluster — its assigned owner's. Gate this
+        # before every membership path (signal, alias, proximity) so a part on a
+        # connector-to-MCU signal is not also swept into the MCU cluster and
+        # reflowed there, defeating single-owner placement.
+        if (support_owner is not None and comp.role in support_roles
+                and support_owner.get(comp.ref) != anchor.ref):
+            continue
         has_shared_signal = bool((shared & set(comp.nets)) - {n for n in shared if is_ground(n) or is_power(n)})
         is_support = comp.role in support_roles and dist <= radius
         if not proximity_any_role:
             is_support = is_support and (has_shared_signal or comp.ref in connected)
-        # Connectivity-aware ownership: when a global owner map is supplied, a
-        # support part only joins the cluster of its assigned owner. This stops a
-        # geometrically-adjacent but electrically-unrelated passive from being
-        # swept into the wrong cluster and dragged off-board on reflow.
-        if support_owner is not None and comp.role in support_roles:
-            is_support = is_support and support_owner.get(comp.ref) == anchor.ref
         is_nearby_any_role = (proximity_any_role and dist <= radius / 2.0
                               and comp.role != "unknown"
                               and comp.role not in support_roles)
@@ -2751,9 +2792,26 @@ def generate_plan(board: BoardGeometry, components: Dict[str, PlanComponent], ne
                         best_d = d
                         endpoints = [a_ref, b_ref]
             rules.append(PlanRule("corridor", f'Corridor({_q(pair.name + "_CORRIDOR")}, a={_q(endpoints[0])}, b={_q(endpoints[1])}, width=3.0, role="high_speed_diff_pair")', pair.components, f"Differential pair {pair.p}/{pair.n}: reserve short symmetric routing corridor; do not route here automatically."))
+    # Declared functional paths (connector -> protection -> IC) are authoritative
+    # for ESD endpoints: an ESD on USB_FS (J3 -> U11 -> U6) must attach to its own
+    # connector/IC, not to whatever connector happens to be nearest in a messy
+    # source layout. Map each ESD ref in a path to that path's connector and IC.
+    esd_path_endpoints: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    for path in functional_paths.values():
+        seq = [r for r in path.get("sequence", []) if r in components]
+        path_conn = next((r for r in seq if "connector" in components[r].role
+                          or components[r].role == "debug_header"), None)
+        path_ic = next((r for r in reversed(seq)
+                        if components[r].role in {"ic", "mcu", "hdmi_retimer", "rf_module"}), None)
+        for r in seq:
+            if components[r].role == "esd_protection":
+                esd_path_endpoints[r] = (path_conn, path_ic)
     for esd in [c for c in components.values() if c.role == "esd_protection"]:
-        connector = _nearest_parent(esd, hs_connectors) or _nearest_parent(esd, [c for c in components.values() if "connector" in c.role])
-        protected = _nearest_parent(esd, hs_ics) or _nearest_parent(esd, [c for c in components.values() if c.role in {"ic", "mcu", "hdmi_retimer"}])
+        path_conn, path_ic = esd_path_endpoints.get(esd.ref, (None, None))
+        connector = (components.get(path_conn) if path_conn else None) \
+            or _nearest_parent(esd, hs_connectors) or _nearest_parent(esd, [c for c in components.values() if "connector" in c.role])
+        protected = (components.get(path_ic) if path_ic else None) \
+            or _nearest_parent(esd, hs_ics) or _nearest_parent(esd, [c for c in components.values() if c.role in {"ic", "mcu", "hdmi_retimer"}])
         if connector and protected:
             text = f'ESD({_q(esd.ref)}, connector={_q(connector.ref)}, protected={_q(protected.ref)}, t=0.18, offset=0, role="esd")'
             rules.append(PlanRule("esd", text, [esd.ref, connector.ref, protected.ref], f"{esd.ref} inferred as ESD/protection between {connector.ref} and {protected.ref}; place close to connector with short ground return."))
