@@ -1,9 +1,12 @@
 # pcb-place repository
 
-This repository contains two complementary command-line tools for reviewable PCB
+This repository contains complementary command-line tools for reviewable PCB
 planning and placement workflows. The architecture separates concerns:
 **`pcb-plan` extracts facts, the AI (Claude) generates design intent, and
-`pcb-place` executes intent.**
+`pcb-place` executes intent.** A third tool, **`pcb-schgen`**, generates a
+readable KiCad schematic (`.kicad_sch`) from a netlist, `board.pln`, and a placed
+board — closing the gap where Zener/pcb produces a netlist and PCB but no
+schematic.
 
 ```text
 KiCad PCB + netlist + stackup + board dimensions
@@ -28,6 +31,12 @@ KiCad PCB + netlist + stackup + board dimensions
   executor**. It consumes `placement.ppl`, applies/reflows/optimizes footprint
   placement, validates placement rules, writes placed KiCad `.kicad_pcb` files,
   and reports.
+- [`pcb-schgen`](docs/pcb-schgen.md) is the **deterministic schematic
+  generator**. It consumes the netlist, the placed board, and `board.pln`, and
+  writes a connectivity-correct, readable `.kicad_sch` (local circuits wired,
+  rails as power symbols/labels, parts grouped by functional intent) plus a
+  generation report and symbol map. It never modifies `pcb-plan`, `pcb-place`,
+  or the PCB.
 
 The split is intentional. `pcb-plan inspect` must **not** place components,
 create placement ownership, build topology clusters heuristically, or infer a
@@ -48,10 +57,15 @@ as metadata only and must never drive placement.
 │   │   ├── __init__.py        # Import package for console scripts
 │   │   ├── pcb_plan.py        # pcb-plan implementation
 │   │   └── pcb_plan_facades/  # Internal migration/facade modules
-│   └── pcb_place/
-│       ├── README.md          # pcb-place DSL and executor documentation
+│   ├── pcb_place/
+│   │   ├── README.md          # pcb-place DSL and executor documentation
+│   │   ├── __init__.py        # Import package for console scripts
+│   │   └── pcb_place.py       # pcb-place implementation
+│   └── pcb_schgen/
 │       ├── __init__.py        # Import package for console scripts
-│       └── pcb_place.py       # pcb-place implementation
+│       └── pcb_schgen.py      # pcb-schgen implementation
+├── docs/
+│   └── pcb-schgen.md          # pcb-schgen documentation
 ├── examples/                  # Example placement workflows and inputs
 └── tests/                     # Unit and CLI integration tests
 ```
@@ -565,6 +579,7 @@ The installed console scripts are:
 ```bash
 pcb-plan --help
 pcb-place --help
+pcb-schgen --help
 ```
 
 ## Safety model
@@ -590,6 +605,8 @@ Both tools are sidecars around KiCad files:
   simulation hooks, reports, and `.ppl` generation.
 - [`src/pcb_place/README.md`](src/pcb_place/README.md): executor-specific
   documentation for applying `.ppl` files to KiCad boards.
+- [`docs/pcb-schgen.md`](docs/pcb-schgen.md): `pcb-schgen` schematic-generation
+  CLI, inputs, wire-vs-label policy, reports, and KiCad compatibility.
 - [`examples/`](examples): example placement workflows and input files.
 - [`tests/`](tests): unit and CLI integration tests for both tools.
 

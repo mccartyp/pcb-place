@@ -1,0 +1,19 @@
+# Minimal design intent for the connector -> ESD -> IC path fixture.
+board:
+  width: 50
+  height: 50
+  units: mm
+
+roles:
+  J1: hdmi_connector
+  U1: esd_protection
+  U2: hdmi_retimer
+
+functional_paths:
+  HDMI_IN:
+    type: high_speed_diff
+    sequence: [J1, U1, U2]
+    protect_first: true
+
+differential_pairs:
+  TMDS_IN_D0: { p: TMDS_IN_D0_P, n: TMDS_IN_D0_N, class: high_speed_diff }

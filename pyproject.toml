@@ -32,6 +32,7 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 pcb-place = "pcb_place:main"
 pcb-plan = "pcb_plan:main"
+pcb-schgen = "pcb_schgen:main"
 
 
 [tool.hatch.build.targets.sdist]
@@ -45,7 +46,7 @@ include = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pcb_place", "src/pcb_plan"]
+packages = ["src/pcb_place", "src/pcb_plan", "src/pcb_schgen"]
 
 
 [tool.pytest.ini_options]

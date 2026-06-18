@@ -1,0 +1,29 @@
+# Design intent for the comprehensive zener_board fixture.
+board:
+  width: 80
+  height: 60
+  units: mm
+
+roles:
+  J1: hdmi_connector
+  U3: esd_protection
+  U4: hdmi_retimer
+  U1: regulator
+  U2: mcu
+
+functional_paths:
+  HDMI_IN:
+    type: high_speed_diff
+    sequence: [J1, U3, U4]
+    protect_first: true
+
+power_islands:
+  BUCK_3V3:
+    regulator: U1
+    inductor: L1
+    input_caps: [C1]
+    output_caps: [C2]
+    feedback: [R1, R2]
+
+differential_pairs:
+  TMDS_IN_D0: { p: TMDS_IN_D0_P, n: TMDS_IN_D0_N, class: high_speed_diff }
