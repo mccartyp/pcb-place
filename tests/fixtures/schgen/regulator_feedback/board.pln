@@ -1,0 +1,15 @@
+# Design intent for the regulator + feedback divider fixture.
+board:
+  width: 40
+  height: 40
+  units: mm
+
+roles:
+  U1: regulator
+
+power_islands:
+  REG_3V3:
+    regulator: U1
+    input_caps: [C1]
+    output_caps: [C2]
+    feedback: [R1, R2]

@@ -34,6 +34,10 @@ KiCad PCB + netlist + stackup + board dimensions
   deterministically and interpret placement/reflow/congestion reports to
   recommend `board.pln` edits (the optimization surface), rather than
   hand-placing components.
+- [`pcb-schgen/SKILL.md`](pcb-schgen/SKILL.md) — generate a readable KiCad
+  `.kicad_sch` from the netlist, placed board, and `board.pln` with the
+  deterministic `pcb-schgen` CLI, and interpret its generation/symbol-map
+  reports. Use when a Zener/pcb flow produced a netlist and PCB but no schematic.
 - [`pcb-automation-orchestrator/SKILL.md`](pcb-automation-orchestrator/SKILL.md) —
   coordinate the full inspect -> bootstrap board.pln -> validate -> place ->
   analyze -> update loop across `pcb-plan`, `pcb-place`, KiCadRoutingTools,
