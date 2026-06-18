@@ -21,6 +21,7 @@ def _gen(name: str, **kwargs):
         None,
         pln if pln.exists() else None,
         project=name,
+        root_name=f"{name}.kicad_sch",
         **kwargs,
     )
 
@@ -56,14 +57,17 @@ def test_pln_parse_extracts_intent():
 @pytest.mark.parametrize("name", FIXTURES)
 def test_generated_sch_parses_structurally(name):
     res = _gen(name)
-    text = res.sch_text
-    assert text.count("(") == text.count(")"), "unbalanced parentheses"
-    tree = schgen._parse_sexp(schgen._sexp_tokens(text))
-    assert tree[0] == "kicad_sch"
-    keys = [c[0] for c in tree if isinstance(c, list)]
-    assert "lib_symbols" in keys
-    assert "sheet_instances" in keys
-    assert keys.count("uuid") == 1
+    # Every generated file (root + sub-sheets) must parse with balanced parens.
+    for fname, text in res.files.items():
+        assert text.count("(") == text.count(")"), f"unbalanced parens in {fname}"
+        tree = schgen._parse_sexp(schgen._sexp_tokens(text))
+        assert tree[0] == "kicad_sch"
+        keys = [c[0] for c in tree if isinstance(c, list)]
+        assert "lib_symbols" in keys
+        assert keys.count("uuid") == 1
+    # The root sheet always carries the sheet_instances table.
+    root = schgen._parse_sexp(schgen._sexp_tokens(res.sch_text))
+    assert "sheet_instances" in [c[0] for c in root if isinstance(c, list)]
 
 
 @pytest.mark.parametrize("name", FIXTURES)
@@ -73,6 +77,28 @@ def test_all_refs_emitted(name):
     assert emitted == set(res.netlist.components)
     assert res.report["refs_emitted"] == res.report["refs_total"]
     assert res.report["missing_refs"] == []
+    for ref in res.netlist.components:
+        assert f'(reference "{ref}")' in res.all_text
+
+
+@pytest.mark.parametrize("name", FIXTURES)
+def test_hierarchical_sheets_emitted(name):
+    res = _gen(name)
+    nblocks = len({s.sheet for s in res.model.symbols})
+    if nblocks > 1:
+        # Root references each sub-sheet file; sub-sheet files exist.
+        assert len(res.files) == nblocks + 1
+        for fname in res.files:
+            if fname != res.root_name:
+                assert f'(property "Sheetfile" "{fname}"' in res.sch_text
+    else:
+        assert len(res.files) == 1  # single block -> flat sheet
+
+
+def test_single_sheet_mode_is_flat():
+    res = _gen("zener_board", multi_sheet=False)
+    assert len(res.files) == 1
+    assert res.report["connectivity_ok"]
     for ref in res.netlist.components:
         assert f'(reference "{ref}")' in res.sch_text
 
@@ -128,13 +154,15 @@ def test_regulator_feedback_drawn_locally():
 
 
 def test_esd_placed_between_connector_and_ic():
-    res = _gen("connector_esd_ic")
+    # Single-sheet view makes the connector -> ESD -> IC ordering globally
+    # observable in X (in hierarchical mode each block sits on its own sheet).
+    res = _gen("connector_esd_ic", multi_sheet=False)
     x = {s.ref: s.x for s in res.model.symbols}
     assert x["J1"] < x["U1"] < x["U2"], x  # connector -> ESD -> IC
 
 
 def test_esd_between_connector_and_retimer_zener():
-    res = _gen("zener_board")
+    res = _gen("zener_board", multi_sheet=False)
     x = {s.ref: s.x for s in res.model.symbols}
     assert x["J1"] < x["U3"] < x["U4"], x
 
@@ -173,7 +201,7 @@ def test_unknown_ic_uses_generic_fallback_with_review():
     retimer = res.mappings["U2"].symbol
     nums = {p.number for p in retimer.pins}
     assert {"1", "2", "39", "40"} <= nums
-    assert "schgen_review" in res.sch_text
+    assert "schgen_review" in res.all_text
 
 
 def test_generation_never_fails_on_unknown_symbols():

@@ -100,8 +100,9 @@ inputs will regenerate the schematic deterministically.
 
 ## Limitations / review
 
-- MVP emits a single sheet; the design supports hierarchical sheets as a
-  follow-up.
+- Emits hierarchical sheets by default (one sub-sheet per functional block,
+  cross-sheet nets carried by global labels/power); `--single-sheet` forces one
+  flat page.
 - Generic symbols require pinout review.
 - Connectivity is guaranteed; layout aesthetics are best-effort — some local
   nets fall back to labels rather than risk an incorrect wire. The generated

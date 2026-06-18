@@ -51,10 +51,23 @@ pcb-schgen \
 
 ### Options
 
-- `--paper {A0..A4}` — sheet size (default `A3`).
+- `--paper {A0..A4}` — minimum sheet size; each sheet is grown to the smallest
+  paper that fits its content (default floor `A3`).
 - `--label-fanout N` — nets with `N`+ nodes use labels instead of wires (default `6`).
+- `--single-sheet` — emit one flat sheet instead of hierarchical per-block sheets.
 - `--random-uuids` — use random `uuid4` instead of deterministic `uuid5`.
 - `--strict` — exit non-zero if connectivity validation fails.
+
+### Output: hierarchical sheets
+
+By default `pcb-schgen` emits a **hierarchical schematic**: a root sheet (the
+`-o` file) containing one sub-sheet symbol per functional block, plus a
+`<root-stem>-<block>.kicad_sch` file for each block, written next to the root.
+Each block (HDMI in/out, retimer, MCU, Wi-Fi, power, …) becomes its own readable
+page sized to fit inside its outline. Cross-sheet connectivity is carried by
+**global labels and power symbols** (which are global across the whole KiCad
+hierarchy); local circuits are wired within their sheet. A design with a single
+functional block, or `--single-sheet`, produces one flat file.
 
 ## What it does
 
@@ -70,10 +83,11 @@ pcb-schgen \
    pin-perfect symbols.
 5. **Group into functional blocks** — connectors, ESD, retimer, MCU, Wi-Fi,
    power, etc., driven by `board.pln` intent (with netlist sheetpath and ref
-   prefixes as fallbacks).
+   prefixes as fallbacks). Each block becomes a hierarchical sub-sheet.
 6. **Lay out deterministically** — connector→ESD→IC ordered along a functional
-   path, components packed without overlap, related parts clustered so local
-   wiring stays short.
+   path, components packed without overlap, and **support passives clustered
+   next to their parent IC** (decoupling caps follow their owner via shared
+   nets/sheet path) so a block reads as a circuit, not an anonymous line of caps.
 7. **Wire vs label** — local circuits (feedback dividers, LED chains, reset
    circuits, connector→ESD→IC chains) are drawn with **real orthogonal wires**;
    ground/power rails use **power symbols**; high-fanout/global/cross-block nets
@@ -95,6 +109,10 @@ pcb-schgen \
   short orthogonal wires (two-pin doglegs and daisy-chains). When no
   collision-free route exists in a dense area, the net is *demoted to a label* —
   the schematic stays connectivity-correct, and the demotion is reported.
+
+A single-node net is handled by its name: a real named net (a test point, a
+spare connector signal) keeps its name via a label, while an explicit
+no-connect (`<sheet>.NC_…`, `unconnected-…`) gets a `no_connect` marker.
 
 ## Reports
 
@@ -119,9 +137,9 @@ part, footprint, fallback flag, and review reason.
 
 ## Design notes / limitations
 
-- **MVP is single-sheet.** The architecture (functional blocks, symbol map,
-  connectivity model) is designed for hierarchical sheets
-  (`power.kicad_sch`, `hdmi_in.kicad_sch`, …) as a follow-up.
+- **Hierarchical by default.** Each functional block is emitted as its own
+  sub-sheet (`<root>-power.kicad_sch`, `<root>-hdmi_in.kicad_sch`, …) under a
+  root sheet; use `--single-sheet` for one flat page.
 - **Generic symbols require review.** Where an exact KiCad symbol is unknown a
   generic rectangle is generated with the real pin names/numbers; verify the
   pinout/gate assignment before manufacturing.

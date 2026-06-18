@@ -840,6 +840,67 @@ def _priority_key(ref: str, comp: Component, path_index: Mapping[str, int], pln:
     return (10.0 + rank, comp.number, ref)
 
 
+def _nets_of(netlist: Netlist) -> Dict[str, frozenset]:
+    acc: Dict[str, set] = {}
+    for net in netlist.nets:
+        for ref, _ in net.nodes:
+            acc.setdefault(ref, set()).add(net.name)
+    return {ref: frozenset(names) for ref, names in acc.items()}
+
+
+def _is_anchor(comp: Component, nets: frozenset) -> bool:
+    """Anchors own a locality: ICs, connectors, regulators, multi-pin parts."""
+
+    if comp.prefix in ("U", "J", "Y", "X"):
+        return True
+    return len(comp.pins) > 2 or len(nets) > 2
+
+
+def _sheet_prefix_match(a: str, b: str) -> int:
+    ta = a.split(".")
+    tb = b.split(".")
+    n = 0
+    for x, y in zip(ta, tb):
+        if x == y:
+            n += 1
+        else:
+            break
+    return n
+
+
+def _parent_anchor(
+    ref: str,
+    comp: Component,
+    anchors: Sequence[str],
+    netlist: Netlist,
+    nets_of: Mapping[str, frozenset],
+) -> Optional[str]:
+    """Pick the anchor a support part belongs to (shared sheet path, then nets)."""
+
+    if not anchors:
+        return None
+    my_nets = nets_of.get(ref, frozenset())
+    my_sheet = comp.sheetpath
+    best = None
+    best_key: Tuple[int, int, int] = (-1, -1, 1 << 30)
+    for a in anchors:
+        if a == ref:
+            continue
+        ac = netlist.components[a]
+        shared = len(my_nets & nets_of.get(a, frozenset()))
+        if shared == 0:
+            continue
+        key = (
+            _sheet_prefix_match(my_sheet, ac.sheetpath),
+            shared,
+            -abs(comp.number - ac.number),
+        )
+        if key > best_key:
+            best_key = key
+            best = a
+    return best
+
+
 def _order_within_blocks(
     netlist: Netlist,
     block_of: Mapping[str, str],
@@ -865,6 +926,22 @@ def _order_within_blocks(
                 if block_of.get(a) == block_of.get(b):
                     adj[a].add(b)
                     adj[b].add(a)
+
+    # Locality: attach each support passive to its parent anchor (the IC/
+    # connector it belongs to) so decoupling caps and support resistors cluster
+    # next to their owner instead of forming an anonymous "line of caps".
+    nets_of = _nets_of(netlist)
+    anchors_by_block: Dict[str, List[str]] = {}
+    for ref, comp in netlist.components.items():
+        if _is_anchor(comp, nets_of.get(ref, frozenset())):
+            anchors_by_block.setdefault(block_of[ref], []).append(ref)
+    for ref, comp in netlist.components.items():
+        if _is_anchor(comp, nets_of.get(ref, frozenset())):
+            continue
+        parent = _parent_anchor(ref, comp, anchors_by_block.get(block_of[ref], []), netlist, nets_of)
+        if parent is not None:
+            adj[ref].add(parent)
+            adj[parent].add(ref)
 
     blocks: Dict[str, List[str]] = {}
     for ref in netlist.components:
@@ -903,6 +980,23 @@ def _order_within_blocks(
 
 def net_is_ground(name: str) -> bool:
     return bool(_GROUND_RE.match(name.strip()))
+
+
+def _is_nc_net(name: str) -> bool:
+    """True when a net name denotes a deliberate no-connect / unnamed pin.
+
+    Zener/pcb emits explicit no-connects as ``<sheet>.NC_<...>`` (and KiCad uses
+    ``unconnected-...``).  Any other named single-node net (a test point, a spare
+    connector signal) is a real net whose name must be preserved with a label.
+    """
+
+    n = name.strip()
+    if not n:
+        return True
+    if n.lower().startswith("unconnected-"):
+        return True
+    last = n.split(".")[-1]
+    return bool(re.search(r"(^|[._])NC(_|$)", n, re.I)) or last.upper() == "NC"
 
 
 def net_is_power(name: str) -> bool:
@@ -952,6 +1046,7 @@ class PlacedSymbol:
     x: float
     y: float
     pin_points: Dict[str, Point]  # pin number -> abs connection point
+    sheet: str = ""
 
 
 @dataclasses.dataclass
@@ -959,6 +1054,7 @@ class Wire:
     a: Point
     b: Point
     seed: str
+    sheet: str = ""
 
 
 @dataclasses.dataclass
@@ -968,6 +1064,7 @@ class LabelObj:
     justify: str
     glob: bool
     seed: str
+    sheet: str = ""
 
 
 @dataclasses.dataclass
@@ -977,18 +1074,21 @@ class PowerObj:
     kind: str  # "ground" or "power"
     direction: str  # "up" / "down"
     seed: str
+    sheet: str = ""
 
 
 @dataclasses.dataclass
 class JunctionObj:
     at: Point
     seed: str
+    sheet: str = ""
 
 
 @dataclasses.dataclass
 class NoConnectObj:
     at: Point
     seed: str
+    sheet: str = ""
 
 
 @dataclasses.dataclass
@@ -1085,7 +1185,16 @@ def layout(
     mappings: Mapping[str, SymbolMapping],
     positions: Mapping[str, Point],
     cfg: LayoutConfig,
+    per_sheet: bool = False,
 ) -> List[PlacedSymbol]:
+    """Place every component.
+
+    per_sheet=False packs all functional blocks onto one sheet in a meta-grid.
+    per_sheet=True lays each block out at the sheet origin independently (each
+    block becomes its own hierarchical sub-sheet), which keeps each page small
+    and inside the page outline.
+    """
+
     # Bucket refs by block, ordered deterministically.
     buckets: Dict[str, List[str]] = {}
     for ref in netlist.components:
@@ -1101,7 +1210,6 @@ def layout(
         refs.sort(key=lambda r: (grouping.order_in_block[r], netlist.components[r].number, r))
         packed[block] = _pack_block(refs, mappings, cfg)
 
-    # Second pass: arrange blocks into meta-rows so no two blocks overlap.
     placed: List[PlacedSymbol] = []
     meta_x = cfg.origin_x
     meta_y = cfg.origin_y
@@ -1109,12 +1217,15 @@ def layout(
     in_row = 0
     for block in blocks_present:
         block_w, block_h, comps = packed[block]
-        if in_row >= cfg.block_cols and in_row > 0:
-            meta_x = cfg.origin_x
-            meta_y += row_h + cfg.block_gap_y
-            row_h = 0.0
-            in_row = 0
-        bx, by = meta_x, meta_y
+        if per_sheet:
+            bx, by = cfg.origin_x, cfg.origin_y
+        else:
+            if in_row >= cfg.block_cols and in_row > 0:
+                meta_x = cfg.origin_x
+                meta_y += row_h + cfg.block_gap_y
+                row_h = 0.0
+                in_row = 0
+            bx, by = meta_x, meta_y
         for ref, rx, ry in comps:
             px = _snap(bx + rx)
             py = _snap(by + ry)
@@ -1122,10 +1233,11 @@ def layout(
             pin_points: Dict[str, Point] = {}
             for pin in mapping.symbol.pins:
                 pin_points[pin.number] = _pin_abs(px, py, pin)
-            placed.append(PlacedSymbol(ref=ref, mapping=mapping, x=px, y=py, pin_points=pin_points))
-        meta_x += block_w + cfg.block_gap_x
-        row_h = max(row_h, block_h)
-        in_row += 1
+            placed.append(PlacedSymbol(ref=ref, mapping=mapping, x=px, y=py, pin_points=pin_points, sheet=block))
+        if not per_sheet:
+            meta_x += block_w + cfg.block_gap_x
+            row_h = max(row_h, block_h)
+            in_row += 1
     return placed
 
 
@@ -1141,32 +1253,39 @@ class _NetGeom:
 
 
 class _Occupancy:
-    """Records emitted points/segments so wiring never touches a foreign net."""
+    """Records emitted points/segments so wiring never touches a foreign net.
+
+    Keyed per sheet: objects on different hierarchical sub-sheets may share XY
+    without colliding, so collision checks are scoped to one sheet.
+    """
 
     def __init__(self) -> None:
-        self.points: List[Tuple[Tuple[int, int], str]] = []
-        self.segments: List[Tuple[Tuple[int, int], Tuple[int, int], str]] = []
+        self.points: Dict[str, List[Tuple[Tuple[int, int], str]]] = {}
+        self.segments: Dict[str, List[Tuple[Tuple[int, int], Tuple[int, int], str]]] = {}
 
-    def add_point(self, pt: Point, owner: str) -> None:
-        self.points.append((_key(pt), owner))
+    def add_point(self, pt: Point, owner: str, sheet: str = "") -> None:
+        self.points.setdefault(sheet, []).append((_key(pt), owner))
 
-    def add_segment(self, a: Point, b: Point, owner: str) -> None:
-        self.segments.append((_key(a), _key(b), owner))
+    def add_segment(self, a: Point, b: Point, owner: str, sheet: str = "") -> None:
+        self.segments.setdefault(sheet, []).append((_key(a), _key(b), owner))
 
-    def conflicts(self, cand_points: Sequence[Point], cand_segments: Sequence[Tuple[Point, Point]], owner: str) -> bool:
+    def conflicts(self, cand_points: Sequence[Point], cand_segments: Sequence[Tuple[Point, Point]],
+                  owner: str, sheet: str = "") -> bool:
         cpts = [_key(p) for p in cand_points]
         csegs = [(_key(a), _key(b)) for a, b in cand_segments]
+        points = self.points.get(sheet, ())
+        segments = self.segments.get(sheet, ())
         # A candidate point landing on a foreign point or foreign segment connects.
         for cp in cpts:
-            for op, oown in self.points:
+            for op, oown in points:
                 if oown != owner and op == cp:
                     return True
-            for sa, sb, oown in self.segments:
+            for sa, sb, oown in segments:
                 if oown != owner and _on_seg(cp, sa, sb):
                     return True
         # A foreign point landing on a candidate segment connects (T-junction).
         for ca, cb in csegs:
-            for op, oown in self.points:
+            for op, oown in points:
                 if oown != owner and _on_seg(op, ca, cb):
                     return True
         return False
@@ -1189,6 +1308,7 @@ def build_model(
     random_uuids: bool,
 ) -> Tuple[SchModel, List[NetPolicy]]:
     by_ref = {p.ref: p for p in placed}
+    block_of = grouping.block_of
     wires: List[Wire] = []
     labels: List[LabelObj] = []
     powers: List[PowerObj] = []
@@ -1216,9 +1336,9 @@ def build_model(
     # Register every pin coordinate first so stubs never land on a foreign pin.
     for g in geoms:
         for ref, pin, pin_pt, out in g.endpoints:
-            occ.add_point(pin_pt, g.net.name)
+            occ.add_point(pin_pt, g.net.name, block_of.get(ref, "MISC"))
 
-    def alloc_stub(pin_pt: Point, out: Point, owner: str) -> Point:
+    def alloc_stub(pin_pt: Point, out: Point, owner: str, sheet: str) -> Point:
         """Return a collision-free stub endpoint and register the stub wire."""
 
         for length, direction in _stub_candidates(out):
@@ -1226,32 +1346,33 @@ def build_model(
                     _snap(pin_pt[1] + direction[1] * STUB * length))
             if cand == pin_pt:
                 continue
-            if not occ.conflicts([cand], [(pin_pt, cand)], owner):
-                wires.append(Wire(pin_pt, cand, f"stub:{owner}:{_key(pin_pt)}"))
-                occ.add_point(cand, owner)
-                occ.add_segment(pin_pt, cand, owner)
+            if not occ.conflicts([cand], [(pin_pt, cand)], owner, sheet):
+                wires.append(Wire(pin_pt, cand, f"stub:{owner}:{_key(pin_pt)}", sheet))
+                occ.add_point(cand, owner, sheet)
+                occ.add_segment(pin_pt, cand, owner, sheet)
                 return cand
         # Fallback: accept the natural stub even if imperfect (validation reports).
         cand = (_snap(pin_pt[0] + out[0] * STUB), _snap(pin_pt[1] + out[1] * STUB))
-        wires.append(Wire(pin_pt, cand, f"stub:{owner}:{_key(pin_pt)}"))
-        occ.add_point(cand, owner)
-        occ.add_segment(pin_pt, cand, owner)
+        wires.append(Wire(pin_pt, cand, f"stub:{owner}:{_key(pin_pt)}", sheet))
+        occ.add_point(cand, owner, sheet)
+        occ.add_segment(pin_pt, cand, owner, sheet)
         return cand
 
     def emit_global(g: _NetGeom) -> None:
         net, policy = g.net, g.policy
         for ref, pin, pin_pt, out in g.endpoints:
-            stub_end = alloc_stub(pin_pt, out, net.name)
+            sheet = block_of.get(ref, "MISC")
+            stub_end = alloc_stub(pin_pt, out, net.name, sheet)
             sdir = _outward(pin_pt, stub_end)
             if policy.kind == "ground":
-                powers.append(PowerObj(net.name, stub_end, "ground", _vdir(sdir), f"pwr:{net.name}:{ref}:{pin}"))
+                powers.append(PowerObj(net.name, stub_end, "ground", _vdir(sdir), f"pwr:{net.name}:{ref}:{pin}", sheet))
                 power_symbol_names[net.name] = _power_symbol_name(net.name)
             elif policy.kind == "power":
-                powers.append(PowerObj(net.name, stub_end, "power", _vdir(sdir), f"pwr:{net.name}:{ref}:{pin}"))
+                powers.append(PowerObj(net.name, stub_end, "power", _vdir(sdir), f"pwr:{net.name}:{ref}:{pin}", sheet))
                 power_symbol_names[net.name] = _power_symbol_name(net.name)
             else:
                 justify = "left" if sdir[0] >= 0 else "right"
-                labels.append(LabelObj(net.name, stub_end, justify, True, f"glabel:{net.name}:{ref}:{pin}"))
+                labels.append(LabelObj(net.name, stub_end, justify, True, f"glabel:{net.name}:{ref}:{pin}", sheet))
 
     # Phase 1: global rails / labels (stable backbone), registered first.
     for g in geoms:
@@ -1264,28 +1385,42 @@ def build_model(
         if not g.endpoints or g.policy.kind != "wire":
             continue
         net = g.net
+        sheet = block_of.get(g.endpoints[0][0], "MISC")
         if len(g.endpoints) == 1:
-            # A single-node net is an intentional no-connect, not a wire.
             ref, pin, pin_pt, out = g.endpoints[0]
-            no_connects.append(NoConnectObj(pin_pt, f"nc:{net.name}:{ref}:{pin}"))
-            g.policy.kind = "noconnect"
+            if _is_nc_net(net.name):
+                # Truly unconnected/spare pin: mark it no-connect (suppress ERC).
+                no_connects.append(NoConnectObj(pin_pt, f"nc:{net.name}:{ref}:{pin}", sheet))
+                g.policy.kind = "noconnect"
+            else:
+                # A named one-node net (test point, spare signal) must keep its
+                # name so re-exporting from KiCad reproduces the source net.
+                stub_end = alloc_stub(pin_pt, out, net.name, sheet)
+                sdir = _outward(pin_pt, stub_end)
+                justify = "left" if sdir[0] >= 0 else "right"
+                labels.append(LabelObj(net.name, stub_end, justify, True, f"glabel:{net.name}:{ref}:{pin}", sheet))
+                g.policy.kind = "label"
             continue
-        stub_ends = [alloc_stub(pin_pt, out, net.name) for _, _, pin_pt, out in g.endpoints]
-        chosen = _route_net(net, stub_ends, occ)
+        stub_ends = [alloc_stub(pin_pt, out, net.name, sheet) for _, _, pin_pt, out in g.endpoints]
+        chosen = _route_net(net, stub_ends, occ, sheet)
         if chosen is None:
             g.policy.kind = "label"  # demote -> drawn as labels for correctness
             for (ref, pin, pin_pt, out), stub_end in zip(g.endpoints, stub_ends):
                 sdir = _outward(pin_pt, stub_end)
                 justify = "left" if sdir[0] >= 0 else "right"
-                labels.append(LabelObj(net.name, stub_end, justify, True, f"glabel:{net.name}:{ref}:{pin}"))
+                labels.append(LabelObj(net.name, stub_end, justify, True, f"glabel:{net.name}:{ref}:{pin}", sheet))
             continue
         cw, cj, cp, cs = chosen
+        for w in cw:
+            w.sheet = sheet
+        for j in cj:
+            j.sheet = sheet
         wires.extend(cw)
         junctions.extend(cj)
         for pt in cp:
-            occ.add_point(pt, net.name)
+            occ.add_point(pt, net.name, sheet)
         for a, b in cs:
-            occ.add_segment(a, b, net.name)
+            occ.add_segment(a, b, net.name, sheet)
 
     return (
         SchModel(
@@ -1304,7 +1439,7 @@ def build_model(
 _RouteCand = Tuple[List["Wire"], List["JunctionObj"], List[Point], List[Tuple[Point, Point]]]
 
 
-def _route_net(net: Net, stub_ends: List[Point], occ: "_Occupancy") -> Optional[_RouteCand]:
+def _route_net(net: Net, stub_ends: List[Point], occ: "_Occupancy", sheet: str = "") -> Optional[_RouteCand]:
     """Return the first collision-free local route for a net, or None to demote."""
 
     owner = net.name
@@ -1312,22 +1447,22 @@ def _route_net(net: Net, stub_ends: List[Point], occ: "_Occupancy") -> Optional[
         for vi, segs in enumerate(_two_pin_routes(stub_ends[0], stub_ends[1])):
             cw = [Wire(s[0], s[1], f"link:{owner}:{vi}:{i}") for i, s in enumerate(segs)]
             pts = list(stub_ends) + [p for s in segs for p in s]
-            if not occ.conflicts(pts, segs, owner):
+            if not occ.conflicts(pts, segs, owner, sheet):
                 return cw, [], pts, list(segs)
         return None
     # Multi-pin: prefer a daisy chain (handles dense dividers), then fall back to
     # a single trunk/bus line.
-    daisy = _daisy_chain(net, stub_ends, occ)
+    daisy = _daisy_chain(net, stub_ends, occ, sheet)
     if daisy is not None:
         return daisy
     for cand in _trunk_bus_variants(net, stub_ends):
         cw, cj, cp, cs = cand
-        if not occ.conflicts(cp, cs, owner):
+        if not occ.conflicts(cp, cs, owner, sheet):
             return cand
     return None
 
 
-def _daisy_chain(net: Net, stub_ends: List[Point], occ: "_Occupancy") -> Optional[_RouteCand]:
+def _daisy_chain(net: Net, stub_ends: List[Point], occ: "_Occupancy", sheet: str = "") -> Optional[_RouteCand]:
     """Connect pins in spatial order, routing each hop with a clear dogleg."""
 
     owner = net.name
@@ -1340,7 +1475,7 @@ def _daisy_chain(net: Net, stub_ends: List[Point], occ: "_Occupancy") -> Optiona
     for hop, (a, b) in enumerate(zip(chain, chain[1:])):
         routed = None
         for segvariant in _two_pin_routes(a, b):
-            if occ.conflicts([p for s in segvariant for p in s], segvariant, owner):
+            if occ.conflicts([p for s in segvariant for p in s], segvariant, owner, sheet):
                 continue
             routed = segvariant
             break
@@ -1499,23 +1634,32 @@ class _UnionFind:
 
 
 def extract_connectivity(model: SchModel) -> Dict[Tuple[str, str], Any]:
-    """Reconstruct net groups the way KiCad would: shared endpoints + labels."""
+    """Reconstruct net groups the way KiCad would.
+
+    Coordinate-based connections (wires, junctions, pins) only join objects on
+    the SAME sheet -- two sub-sheets may reuse the same XY without touching.
+    Global labels and power symbols connect by name across the whole hierarchy.
+    """
 
     uf = _UnionFind()
-    # Wire endpoints share a coordinate -> same node.
+
+    def cnode(sheet: str, pt: Point) -> Tuple[str, Tuple[int, int]]:
+        return (sheet, _key(pt))
+
+    # Wire endpoints share a coordinate on the same sheet -> same node.
     for wire in model.wires:
-        uf.union(_key(wire.a), _key(wire.b))
-    # Pins anchor to their coordinate node.
+        uf.union(cnode(wire.sheet, wire.a), cnode(wire.sheet, wire.b))
+    # Pins anchor to their (sheet, coordinate) node.
     pin_node: Dict[Tuple[str, str], Any] = {}
     for sym in model.symbols:
         for pin, pt in sym.pin_points.items():
-            uf.union((sym.ref, pin), _key(pt))
+            uf.union((sym.ref, pin), cnode(sym.sheet, pt))
             pin_node[(sym.ref, pin)] = (sym.ref, pin)
-    # Labels and power symbols bind a coordinate to a named global node.
+    # Labels and power symbols bind a coordinate to a hierarchy-global named node.
     for label in model.labels:
-        uf.union(_key(label.at), ("LABEL", label.name))
+        uf.union(cnode(label.sheet, label.at), ("LABEL", label.name))
     for power in model.powers:
-        uf.union(_key(power.at), ("NET", power.net))
+        uf.union(cnode(power.sheet, power.at), ("NET", power.net))
     groups: Dict[Tuple[str, str], Any] = {}
     for key in pin_node:
         groups[key] = uf.find(key)
@@ -1622,7 +1766,49 @@ def _power_symbol_def(name: str, net: str, ground: bool) -> SymbolDef:
     )
 
 
-def render_sch(
+_PAPER_DIMS = {
+    "A4": (297.0, 210.0), "A3": (420.0, 297.0), "A2": (594.0, 420.0),
+    "A1": (841.0, 594.0), "A0": (1189.0, 841.0),
+}
+_PAPER_ORDER = ["A4", "A3", "A2", "A1", "A0"]
+
+
+def _slug(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower() or "sheet"
+
+
+def _content_extent(model: SchModel, sheet: Optional[str]) -> Tuple[float, float]:
+    """Right/bottom extent of a sheet's content, for paper sizing."""
+
+    max_x = max_y = 0.0
+    for sym in model.symbols:
+        if sheet is None or sym.sheet == sheet:
+            hx, hy = _symbol_half_extents(sym.mapping.symbol)
+            max_x = max(max_x, sym.x + hx)
+            max_y = max(max_y, sym.y + hy)
+    for coll in (model.labels, model.powers, model.no_connects):
+        for obj in coll:
+            if sheet is None or obj.sheet == sheet:
+                max_x = max(max_x, obj.at[0] + 12.7)
+                max_y = max(max_y, obj.at[1] + 6.35)
+    for w in model.wires:
+        if sheet is None or w.sheet == sheet:
+            max_x = max(max_x, w.a[0], w.b[0])
+            max_y = max(max_y, w.a[1], w.b[1])
+    return max_x, max_y
+
+
+def _choose_paper(max_x: float, max_y: float, preferred: str) -> str:
+    need_x, need_y = max_x + 15.0, max_y + 15.0
+    start = _PAPER_ORDER.index(preferred) if preferred in _PAPER_ORDER else 0
+    for name in _PAPER_ORDER[start:]:
+        w, h = _PAPER_DIMS[name]
+        if need_x <= w and need_y <= h:
+            return name
+    return "A0"
+
+
+def render(
     model: SchModel,
     netlist: Netlist,
     mappings: Mapping[str, SymbolMapping],
@@ -1630,79 +1816,160 @@ def render_sch(
     title: str,
     paper: str,
     random_uuids: bool,
-) -> str:
-    root_uuid = _det_uuid("root", random_uuids)
-    out: List[str] = []
-    out.append("(kicad_sch")
-    out.append("\t(version 20231120)")
-    out.append('\t(generator "pcb-schgen")')
-    out.append(f'\t(generator_version "{__version__}")')
-    out.append(f'\t(uuid "{root_uuid}")')
-    out.append(f'\t(paper "{paper}")')
-    out.append("\t(title_block")
-    out.append(f'\t\t(title "{_esc(title)}")')
-    out.append('\t\t(comment 1 "Generated by pcb-schgen from netlist + board.pln + placed PCB")')
-    out.append("\t)")
+    multi_sheet: bool,
+    root_name: str,
+) -> Dict[str, str]:
+    """Render the schematic. Returns {filename: text}; root_name is the -o file."""
 
-    # lib_symbols: unique symbol defs + power symbols.
-    out.append("\t(lib_symbols")
+    root_uuid = _det_uuid("root", random_uuids)
+    sheets = _ordered_sheets(model)
+    pwr_counter = [0]
+
+    if not multi_sheet or len(sheets) <= 1:
+        # Flat single sheet: everything on the root file.
+        mx, my = _content_extent(model, None)
+        chosen = _choose_paper(mx, my, paper)
+        body = _emit_sheet_body(model, None, netlist, mappings, project,
+                                f"/{root_uuid}", pwr_counter, random_uuids)
+        text = _wrap_sheet(root_uuid, title, chosen, _all_lib_symbols(model, netlist, mappings, None),
+                           body, sheet_instances=[("/", "1")])
+        return {root_name: text}
+
+    # Hierarchical: root sheet of sub-sheet symbols + one file per block.
+    root_stem = Path(root_name).stem
+    sheet_uuid = {s: _det_uuid(f"sheet:{s}", random_uuids) for s in sheets}
+    file_uuid = {s: _det_uuid(f"sheetfile:{s}", random_uuids) for s in sheets}
+    file_name = {s: f"{root_stem}-{_slug(s)}.kicad_sch" for s in sheets}
+
+    files: Dict[str, str] = {}
+    # Sub-sheet files (pages 2..N).
+    sheet_instances = [("/", "1")]
+    for i, s in enumerate(sheets):
+        page = i + 2
+        inst_path = f"/{root_uuid}/{sheet_uuid[s]}"
+        mx, my = _content_extent(model, s)
+        chosen = _choose_paper(mx, my, paper)
+        body = _emit_sheet_body(model, s, netlist, mappings, project, inst_path, pwr_counter, random_uuids)
+        files[file_name[s]] = _wrap_sheet(file_uuid[s], f"{title} — {s}", chosen,
+                                          _all_lib_symbols(model, netlist, mappings, s), body,
+                                          sheet_instances=None)
+        sheet_instances.append((f"/{sheet_uuid[s]}", str(page)))
+
+    # Root file (page 1): sheet symbols only.
+    files[root_name] = _emit_root(root_uuid, project, title, paper, sheets,
+                                  sheet_uuid, file_name, sheet_instances, random_uuids)
+    return files
+
+
+def _ordered_sheets(model: SchModel) -> List[str]:
+    present = {s.sheet for s in model.symbols}
+    ordered = [b for b in _BLOCK_ORDER if b in present]
+    ordered += sorted(b for b in present if b not in _BLOCK_ORDER)
+    return ordered
+
+
+def _all_lib_symbols(model: SchModel, netlist: Netlist, mappings: Mapping[str, SymbolMapping],
+                     sheet: Optional[str]) -> List[str]:
+    out: List[str] = ["\t(lib_symbols"]
     seen: Dict[str, SymbolDef] = {}
-    for ref in sorted(mappings, key=lambda r: (netlist.components[r].prefix, netlist.components[r].number)):
-        sym = mappings[ref].symbol
-        seen.setdefault(sym.lib_id, sym)
+    for sym in model.symbols:
+        if sheet is None or sym.sheet == sheet:
+            d = sym.mapping.symbol
+            seen.setdefault(d.lib_id, d)
     for lib_id in sorted(seen):
         out.extend(_emit_lib_symbol(seen[lib_id]))
     power_defs: Dict[str, SymbolDef] = {}
-    for net, pname in model.power_symbol_names.items():
-        ground = net_is_ground(net)
-        power_defs[pname] = _power_symbol_def(pname, net, ground)
+    used_power_nets = {p.net for p in model.powers if sheet is None or p.sheet == sheet}
+    for net in used_power_nets:
+        pname = model.power_symbol_names.get(net)
+        if pname:
+            power_defs[pname] = _power_symbol_def(pname, net, net_is_ground(net))
     for pname in sorted(power_defs):
         out.extend(_emit_lib_symbol(power_defs[pname]))
     out.append("\t)")
+    return out
 
-    # Placed component symbols (stable order).
-    for sym in sorted(model.symbols, key=lambda s: (netlist.components[s.ref].prefix, netlist.components[s.ref].number, s.ref)):
-        out.extend(_emit_instance(sym, netlist.components[sym.ref], project, root_uuid, random_uuids))
 
-    # Power symbols.
-    pwr_counter = [0]
-    for power in sorted(model.powers, key=lambda p: (p.net, _key(p.at))):
-        out.extend(_emit_power(power, model.power_symbol_names[power.net], project, root_uuid, pwr_counter, random_uuids))
-
-    # Wires.
-    for wire in sorted(model.wires, key=lambda w: (_key(w.a), _key(w.b))):
+def _emit_sheet_body(model: SchModel, sheet: Optional[str], netlist: Netlist,
+                     mappings: Mapping[str, SymbolMapping], project: str, inst_path: str,
+                     pwr_counter: List[int], random_uuids: bool) -> List[str]:
+    out: List[str] = []
+    syms = [s for s in model.symbols if sheet is None or s.sheet == sheet]
+    for sym in sorted(syms, key=lambda s: (netlist.components[s.ref].prefix, netlist.components[s.ref].number, s.ref)):
+        out.extend(_emit_instance(sym, netlist.components[sym.ref], project, inst_path, random_uuids))
+    powers = [p for p in model.powers if sheet is None or p.sheet == sheet]
+    for power in sorted(powers, key=lambda p: (p.net, _key(p.at))):
+        out.extend(_emit_power(power, model.power_symbol_names[power.net], project, inst_path, pwr_counter, random_uuids))
+    for wire in sorted((w for w in model.wires if sheet is None or w.sheet == sheet), key=lambda w: (_key(w.a), _key(w.b))):
         if _key(wire.a) == _key(wire.b):
             continue
         out.append(
             f"\t(wire (pts (xy {_fmt(wire.a[0])} {_fmt(wire.a[1])}) (xy {_fmt(wire.b[0])} {_fmt(wire.b[1])})) "
             f'(stroke (width 0) (type default)) (uuid "{_det_uuid("wire:" + wire.seed, random_uuids)}"))'
         )
-
-    # Junctions.
-    for junc in sorted(model.junctions, key=lambda j: _key(j.at)):
+    for junc in sorted((j for j in model.junctions if sheet is None or j.sheet == sheet), key=lambda j: _key(j.at)):
         out.append(
             f"\t(junction (at {_fmt(junc.at[0])} {_fmt(junc.at[1])}) (diameter 0) (color 0 0 0 0) "
             f'(uuid "{_det_uuid("junc:" + junc.seed, random_uuids)}"))'
         )
-
-    # No-connect markers (single-node nets).
-    for nc in sorted(model.no_connects, key=lambda n: _key(n.at)):
+    for nc in sorted((n for n in model.no_connects if sheet is None or n.sheet == sheet), key=lambda n: _key(n.at)):
         out.append(
             f"\t(no_connect (at {_fmt(nc.at[0])} {_fmt(nc.at[1])}) "
             f'(uuid "{_det_uuid("nc:" + nc.seed, random_uuids)}"))'
         )
-
-    # Global labels.
-    for label in sorted(model.labels, key=lambda l: (l.name, _key(l.at))):
+    for label in sorted((l for l in model.labels if sheet is None or l.sheet == sheet), key=lambda l: (l.name, _key(l.at))):
         angle = 0 if label.justify == "left" else 180
         out.append(
             f'\t(global_label "{_esc(label.name)}" (shape bidirectional) (at {_fmt(label.at[0])} {_fmt(label.at[1])} {angle}) '
             f"(fields_autoplaced) (effects (font (size 1.27 1.27)) (justify {label.justify})) "
             f'(uuid "{_det_uuid("glabel:" + label.seed, random_uuids)}"))'
         )
+    return out
 
-    out.append('\t(sheet_instances')
-    out.append('\t\t(path "/" (page "1"))')
+
+def _wrap_sheet(file_uuid: str, title: str, paper: str, lib_symbols: List[str],
+                body: List[str], sheet_instances: Optional[List[Tuple[str, str]]]) -> str:
+    out: List[str] = ["(kicad_sch", "\t(version 20231120)", '\t(generator "pcb-schgen")',
+                      f'\t(generator_version "{__version__}")', f'\t(uuid "{file_uuid}")',
+                      f'\t(paper "{paper}")', "\t(title_block", f'\t\t(title "{_esc(title)}")',
+                      '\t\t(comment 1 "Generated by pcb-schgen from netlist + board.pln + placed PCB")', "\t)"]
+    out.extend(lib_symbols)
+    out.extend(body)
+    if sheet_instances is not None:
+        out.append("\t(sheet_instances")
+        for path, page in sheet_instances:
+            out.append(f'\t\t(path "{path}" (page "{page}"))')
+        out.append("\t)")
+    out.append(")")
+    return "\n".join(out) + "\n"
+
+
+def _emit_root(root_uuid: str, project: str, title: str, paper: str, sheets: List[str],
+               sheet_uuid: Mapping[str, str], file_name: Mapping[str, str],
+               sheet_instances: List[Tuple[str, str]], random_uuids: bool) -> str:
+    out: List[str] = ["(kicad_sch", "\t(version 20231120)", '\t(generator "pcb-schgen")',
+                      f'\t(generator_version "{__version__}")', f'\t(uuid "{root_uuid}")',
+                      f'\t(paper "{paper}")', "\t(title_block", f'\t\t(title "{_esc(title)}")',
+                      '\t\t(comment 1 "Generated by pcb-schgen — hierarchical root")', "\t)",
+                      "\t(lib_symbols)"]
+    # Lay sheet symbols out in a tidy grid.
+    per_row = 3
+    sw, sh = 60.0, 30.0
+    gx, gy = 25.4, 22.86
+    x0, y0 = 25.4, 31.75
+    for i, s in enumerate(sheets):
+        col, row = i % per_row, i // per_row
+        x = x0 + col * (sw + gx)
+        y = y0 + row * (sh + gy)
+        out.append(f"\t(sheet (at {_fmt(x)} {_fmt(y)}) (size {_fmt(sw)} {_fmt(sh)}) (fields_autoplaced)")
+        out.append("\t\t(stroke (width 0.1524) (type solid)) (fill (color 0 0 0 0.0))")
+        out.append(f'\t\t(uuid "{sheet_uuid[s]}")')
+        out.append(f'\t\t(property "Sheetname" "{_esc(s)}" (at {_fmt(x)} {_fmt(y - 1.0)} 0) (effects (font (size 1.6 1.6)) (justify left bottom)))')
+        out.append(f'\t\t(property "Sheetfile" "{_esc(file_name[s])}" (at {_fmt(x)} {_fmt(y + sh + 1.0)} 0) (effects (font (size 1.2 1.2)) (justify left top)))')
+        out.append(f'\t\t(instances (project "{_esc(project)}" (path "/{root_uuid}" (page "{i + 2}")))))')
+    out.append("\t(sheet_instances")
+    for path, page in sheet_instances:
+        out.append(f'\t\t(path "{path}" (page "{page}"))')
     out.append("\t)")
     out.append(")")
     return "\n".join(out) + "\n"
@@ -1712,7 +1979,7 @@ def _esc(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _emit_instance(sym: PlacedSymbol, comp: Component, project: str, root_uuid: str, random_uuids: bool) -> List[str]:
+def _emit_instance(sym: PlacedSymbol, comp: Component, project: str, inst_path: str, random_uuids: bool) -> List[str]:
     suid = _det_uuid(f"sym:{sym.ref}", random_uuids)
     lib_id = sym.mapping.lib_id
     out: List[str] = []
@@ -1741,13 +2008,13 @@ def _emit_instance(sym: PlacedSymbol, comp: Component, project: str, root_uuid: 
     for pin in sym.mapping.symbol.pins:
         out.append(f'\t\t(pin "{pin.number}" (uuid "{_det_uuid(f"pin:{sym.ref}:{pin.number}", random_uuids)}"))')
     out.append(
-        f'\t\t(instances (project "{_esc(project)}" (path "/{root_uuid}" (reference "{_esc(sym.ref)}") (unit 1))))'
+        f'\t\t(instances (project "{_esc(project)}" (path "{inst_path}" (reference "{_esc(sym.ref)}") (unit 1))))'
     )
     out.append("\t)")
     return out
 
 
-def _emit_power(power: PowerObj, pname: str, project: str, root_uuid: str, counter: List[int], random_uuids: bool) -> List[str]:
+def _emit_power(power: PowerObj, pname: str, project: str, inst_path: str, counter: List[int], random_uuids: bool) -> List[str]:
     counter[0] += 1
     ref = f"#PWR{counter[0]:04d}"
     suid = _det_uuid("power:" + power.seed, random_uuids)
@@ -1762,7 +2029,7 @@ def _emit_power(power: PowerObj, pname: str, project: str, root_uuid: str, count
     out.append(f'\t\t(property "Footprint" "" (at {_fmt(power.at[0])} {_fmt(power.at[1])} 0) (effects (font (size 1.27 1.27)) hide))')
     out.append(f'\t\t(property "Datasheet" "" (at {_fmt(power.at[0])} {_fmt(power.at[1])} 0) (effects (font (size 1.27 1.27)) hide))')
     out.append(f'\t\t(pin "1" (uuid "{_det_uuid("powerpin:" + power.seed, random_uuids)}"))')
-    out.append(f'\t\t(instances (project "{_esc(project)}" (path "/{root_uuid}" (reference "{ref}") (unit 1))))')
+    out.append(f'\t\t(instances (project "{_esc(project)}" (path "{inst_path}" (reference "{ref}") (unit 1))))')
     out.append("\t)")
     return out
 
@@ -1852,11 +2119,24 @@ def build_report(
 
 @dataclasses.dataclass
 class GenResult:
-    sch_text: str
+    files: Dict[str, str]          # filename -> .kicad_sch text (one key is the root)
+    root_name: str                 # filename of the root sheet (the -o file)
     report: Dict[str, Any]
     model: SchModel
     mappings: Dict[str, SymbolMapping]
     netlist: Netlist
+
+    @property
+    def sch_text(self) -> str:
+        """Text of the root sheet (the -o file)."""
+
+        return self.files[self.root_name]
+
+    @property
+    def all_text(self) -> str:
+        """Concatenation of every generated sheet (handy for tests/search)."""
+
+        return "\n".join(self.files[k] for k in sorted(self.files))
 
 
 def generate(
@@ -1869,6 +2149,8 @@ def generate(
     paper: str = "A3",
     fanout_threshold: int = 6,
     random_uuids: bool = False,
+    multi_sheet: bool = True,
+    root_name: str = "schematic.kicad_sch",
     cfg: Optional[LayoutConfig] = None,
 ) -> GenResult:
     cfg = cfg or LayoutConfig()
@@ -1878,13 +2160,15 @@ def generate(
 
     mappings = map_symbols(netlist, pln)
     grouping = group_components(netlist, pln)
-    placed = layout(netlist, grouping, mappings, positions, cfg)
+    placed = layout(netlist, grouping, mappings, positions, cfg, per_sheet=multi_sheet)
     model, policies = build_model(netlist, grouping, mappings, placed, fanout_threshold, random_uuids)
 
     validation = validate(model, netlist)
-    sch_text = render_sch(model, netlist, mappings, project, title, paper, random_uuids)
+    files = render(model, netlist, mappings, project, title, paper, random_uuids, multi_sheet, root_name)
     report = build_report(netlist, mappings, model, policies, validation)
-    return GenResult(sch_text=sch_text, report=report, model=model, mappings=mappings, netlist=netlist)
+    report["sheets"] = sorted(f for f in files)
+    return GenResult(files=files, root_name=root_name, report=report, model=model,
+                     mappings=mappings, netlist=netlist)
 
 
 # ---------------------------------------------------------------------------
@@ -1909,6 +2193,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--title", default=None, help="Schematic title block title")
     parser.add_argument("--paper", default="A3", choices=["A0", "A1", "A2", "A3", "A4"], help="Sheet size")
     parser.add_argument("--label-fanout", type=int, default=6, help="Fanout at/above which a net uses labels instead of wires")
+    parser.add_argument("--single-sheet", action="store_true", help="Emit one flat sheet instead of hierarchical per-block sheets")
     parser.add_argument("--random-uuids", action="store_true", help="Use random uuid4 instead of deterministic uuid5")
     parser.add_argument("--strict", action="store_true", help="Exit non-zero if connectivity validation fails")
     parser.add_argument("--quiet", action="store_true", help="Suppress the human-readable summary")
@@ -1936,10 +2221,15 @@ def _main(argv: Optional[List[str]]) -> int:
         paper=args.paper,
         fanout_threshold=args.label_fanout,
         random_uuids=args.random_uuids,
+        multi_sheet=not args.single_sheet,
+        root_name=args.output.name,
     )
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(result.sch_text, encoding="utf-8")
+    out_dir = args.output.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, text in result.files.items():
+        path = args.output if name == result.root_name else out_dir / name
+        path.write_text(text, encoding="utf-8")
 
     if args.symbol_map is not None:
         args.symbol_map.parent.mkdir(parents=True, exist_ok=True)
@@ -1951,7 +2241,9 @@ def _main(argv: Optional[List[str]]) -> int:
 
     if not args.quiet:
         r = result.report
-        print(f"pcb-schgen: wrote {args.output}")
+        nsheets = len(result.files)
+        suffix = f" (+{nsheets - 1} sub-sheet{'s' if nsheets - 1 != 1 else ''})" if nsheets > 1 else ""
+        print(f"pcb-schgen: wrote {args.output}{suffix}")
         print(f"  refs:  {r['refs_emitted']}/{r['refs_total']} emitted")
         print(f"  nets:  {r['nets_matched']}/{r['nets_total']} connectivity-matched")
         print(f"  wired: {len(r['wired_nets'])}  labeled/power: {len(r['global_label_nets'])}")
